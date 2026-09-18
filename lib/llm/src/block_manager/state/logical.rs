@@ -61,9 +61,7 @@ impl<R: LogicalResources> LogicalBlockFactories<R> {
             // storage_type() for the backing DevbarAllocator selects: Device
             // (devbar is GPU memory) when a devbar region is configured,
             // Pinned for the standard fallback (default deployments unchanged).
-            let host_storage_type = DevbarAllocator::from_env()
-                .expect("devbar allocator config")
-                .host_storage_type();
+            let host_storage_type = DevbarAllocator::from_env()?.host_storage_type();
             let factory = LogicalBlockFactory::new(
                 config,
                 next_block_set_idx,

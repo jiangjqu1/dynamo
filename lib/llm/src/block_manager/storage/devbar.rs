@@ -97,15 +97,16 @@ impl DevbarStorage {
         if !offset.is_multiple_of(unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64) {
             unsafe { libc::close(fd) };
             return Err(StorageError::InvalidConfig(format!(
-                "devbar offset {offset} is not page-aligned; sysfs resource mmap requires \
-                 a page-aligned offset of {}.",
+                "devbar offset {offset} is not page-aligned; sysfs resource mmap of {} \
+                 requires a page-aligned offset.",
                 path.display()
             )));
         }
         let Some(request_end) = offset.checked_add(size as u64) else {
             unsafe { libc::close(fd) };
             return Err(StorageError::InvalidConfig(format!(
-                "devbar request (offset {offset} + {size} bytes) overflows of {}.",
+                "devbar request (offset {offset} + {size} bytes) overflows u64; \
+                 cannot mmap {}.",
                 path.display()
             )));
         };
@@ -250,7 +251,12 @@ impl Storage for DevbarStorage {
 
 impl StorageMemset for DevbarStorage {
     fn memset(&mut self, value: u8, offset: usize, size: usize) -> Result<(), StorageError> {
-        if offset + size > self.len {
+        let Some(end) = offset.checked_add(size) else {
+            return Err(StorageError::OperationFailed(
+                "memset: offset + size overflows usize".into(),
+            ));
+        };
+        if end > self.len {
             return Err(StorageError::OperationFailed(
                 "memset: offset + size > storage size".into(),
             ));
@@ -501,6 +507,11 @@ mod tests {
         // guidance error.
         let err = DevbarStorage::from_bar(file.path().to_path_buf(), 0, 2048, 7)
             .expect_err("aperture overflow must be rejected");
+        assert!(matches!(err, StorageError::InvalidConfig(_)));
+
+        // Unaligned offsets must be rejected with a clear error.
+        let err = DevbarStorage::from_bar(file.path().to_path_buf(), 1, 512, 7)
+            .expect_err("unaligned offset must be rejected");
         assert!(matches!(err, StorageError::InvalidConfig(_)));
     }
 }
