@@ -282,6 +282,23 @@ pub mod kvbm {
             "DYN_KVBM_CPU_CACHE_OVERRIDE_NUM_BLOCKS";
     }
 
+    /// Devbar region configuration (BAR-mapped tier-2 KV storage)
+    pub mod devbar {
+        /// PCI BDF of the device whose BAR aperture backs the tier-2 host pool
+        /// (e.g. "0000:1f:00.0" -> /sys/bus/pci/devices/0000:1f:00.0/resource0)
+        pub const DYN_KVBM_DEVBAR_BDF: &str = "DYN_KVBM_DEVBAR_BDF";
+
+        /// Byte offset into the BAR aperture
+        pub const DYN_KVBM_DEVBAR_OFFSET: &str = "DYN_KVBM_DEVBAR_OFFSET";
+
+        /// GPU device id carried in the NIXL descriptor (default 0)
+        pub const DYN_KVBM_DEVBAR_DEVICE_ID: &str = "DYN_KVBM_DEVBAR_DEVICE_ID";
+
+        /// Set to "1" to back the tier-2 pool with an anonymous mock mapping
+        /// (plumbing tests on machines without BAR-mapped device memory)
+        pub const DYN_KVBM_DEVBAR_MOCK: &str = "DYN_KVBM_DEVBAR_MOCK";
+    }
+
     /// Disk cache configuration
     pub mod disk_cache {
         /// Disk cache size in GB
@@ -1046,6 +1063,10 @@ mod tests {
             kvbm::DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER,
             kvbm::cpu_cache::DYN_KVBM_CPU_CACHE_GB,
             kvbm::cpu_cache::DYN_KVBM_CPU_CACHE_OVERRIDE_NUM_BLOCKS,
+            kvbm::devbar::DYN_KVBM_DEVBAR_BDF,
+            kvbm::devbar::DYN_KVBM_DEVBAR_OFFSET,
+            kvbm::devbar::DYN_KVBM_DEVBAR_DEVICE_ID,
+            kvbm::devbar::DYN_KVBM_DEVBAR_MOCK,
             kvbm::disk_cache::DYN_KVBM_DISK_CACHE_GB,
             kvbm::disk_cache::DYN_KVBM_DISK_CACHE_OVERRIDE_NUM_BLOCKS,
             kvbm::leader::DYN_KVBM_LEADER_WORKER_INIT_TIMEOUT_SECS,

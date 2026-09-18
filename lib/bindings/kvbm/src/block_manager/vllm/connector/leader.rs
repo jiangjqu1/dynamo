@@ -16,7 +16,7 @@ use crate::block_manager::{
 use crate::get_current_tokio_handle;
 
 use dynamo_llm::block_manager::{
-    BasicMetadata, DiskStorage, ImmutableBlock, PinnedStorage,
+    BasicMetadata, DevbarStorage, DiskStorage, ImmutableBlock,
     block::{
         data::logical::distributed_leader_worker::DistributedLeaderWorkerResources,
         locality::Logical,

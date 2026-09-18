@@ -17,7 +17,7 @@ use crate::block_manager::{
     connector::scheduler::TransferSchedulerClient,
     layout::LayoutType,
     offload::{max_concurrent_transfers, max_transfer_batch_size},
-    storage::{DeviceAllocator, DeviceStorage, DiskAllocator, PinnedAllocator, torch::TorchTensor},
+    storage::{DevbarAllocator, DeviceAllocator, DeviceStorage, DiskAllocator, torch::TorchTensor},
 };
 
 use derive_builder::Builder;
@@ -177,9 +177,11 @@ async fn perform_allocation_and_build_handler(
         worker_id,
     )?);
 
-    // host (G2) - only allocated if should_allocate_offload
+    // host (G2 / tier-2) - only allocated if should_allocate_offload.
+    // Backed by a BAR-mapped devbar region when DYN_KVBM_DEVBAR_* is configured,
+    // otherwise standard pinned host memory (default deployments unchanged).
     let host_blocks = if should_allocate_offload && leader_meta.num_host_blocks > 0 {
-        let host_allocator = Arc::new(PinnedAllocator::default());
+        let host_allocator = Arc::new(DevbarAllocator::from_env()?);
         let host_layout = layout_builder
             .num_blocks(leader_meta.num_host_blocks)
             .build()?

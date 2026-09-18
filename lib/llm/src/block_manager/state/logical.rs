@@ -3,7 +3,9 @@
 
 use super::*;
 
-use crate::block_manager::{block::factory::logical::LogicalBlockFactory, storage::StorageType};
+use crate::block_manager::{
+    DevbarAllocator, block::factory::logical::LogicalBlockFactory, storage::StorageType,
+};
 
 /// The local block factories for the block manager
 ///
@@ -14,7 +16,7 @@ use crate::block_manager::{block::factory::logical::LogicalBlockFactory, storage
 #[derive(Dissolve)]
 pub struct LogicalBlockFactories<R: LogicalResources> {
     disk_factory: Option<LogicalBlockFactory<DiskStorage, R>>,
-    host_factory: Option<LogicalBlockFactory<PinnedStorage, R>>,
+    host_factory: Option<LogicalBlockFactory<DevbarStorage, R>>,
     device_factory: Option<LogicalBlockFactory<DeviceStorage, R>>,
 }
 
@@ -55,12 +57,19 @@ impl<R: LogicalResources> LogicalBlockFactories<R> {
 
             let mut builder = layout_builder.clone();
             let config = Arc::new(builder.num_blocks(config.num_blocks).build()?);
+            // The host factory's StorageType must match DevbarStorage's
+            // storage_type() for the backing DevbarAllocator selects: Device
+            // (devbar is GPU memory) when a devbar region is configured,
+            // Pinned for the standard fallback (default deployments unchanged).
+            let host_storage_type = DevbarAllocator::from_env()
+                .expect("devbar allocator config")
+                .host_storage_type();
             let factory = LogicalBlockFactory::new(
                 config,
                 next_block_set_idx,
                 resources.worker_id,
                 logical_resources.clone(),
-                StorageType::Pinned,
+                host_storage_type,
                 offload_filter,
             );
 

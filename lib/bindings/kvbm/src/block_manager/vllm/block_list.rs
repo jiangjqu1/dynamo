@@ -12,7 +12,7 @@ use dynamo_llm::block_manager::block::locality::Logical;
 use crate::to_pyerr;
 
 type DeviceStorageType = bm::storage::DeviceStorage;
-type HostStorageType = bm::storage::PinnedStorage;
+type HostStorageType = bm::storage::DevbarStorage;
 type DiskStorageType = bm::storage::DiskStorage;
 
 #[derive(Debug)]

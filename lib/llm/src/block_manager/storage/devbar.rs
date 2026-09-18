@@ -25,6 +25,7 @@ use super::{
     CudaAccessible, Local, RegistationHandle, RegisterableStorage, RegistrationHandles, Storage,
     StorageAllocator, StorageError, StorageMemset, StorageType, SystemAccessible,
 };
+use dynamo_runtime::config::environment_names::kvbm::devbar as env_devbar;
 
 /// How the devbar region is provisioned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,12 +340,12 @@ enum DevbarRegion {
 impl DevbarAllocator {
     /// Build an allocator from the `DYN_KVBM_DEVBAR_*` environment variables.
     pub fn from_env() -> Result<Self, StorageError> {
-        let device_id = std::env::var("DYN_KVBM_DEVBAR_DEVICE_ID")
+        let device_id = std::env::var(env_devbar::DYN_KVBM_DEVBAR_DEVICE_ID)
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(0);
 
-        if std::env::var("DYN_KVBM_DEVBAR_MOCK").is_ok_and(|v| v == "1") {
+        if std::env::var(env_devbar::DYN_KVBM_DEVBAR_MOCK).is_ok_and(|v| v == "1") {
             tracing::info!("Using mock devbar region (anonymous mapping) as tier-2 storage");
             return Ok(Self {
                 region: Some(DevbarRegion::Mock),
@@ -352,9 +353,9 @@ impl DevbarAllocator {
             });
         }
 
-        if let Ok(bdf) = std::env::var("DYN_KVBM_DEVBAR_BDF") {
+        if let Ok(bdf) = std::env::var(env_devbar::DYN_KVBM_DEVBAR_BDF) {
             let path = PathBuf::from(format!("/sys/bus/pci/devices/{bdf}/resource0"));
-            let offset = std::env::var("DYN_KVBM_DEVBAR_OFFSET")
+            let offset = std::env::var(env_devbar::DYN_KVBM_DEVBAR_OFFSET)
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
@@ -390,6 +391,20 @@ impl DevbarAllocator {
         Self {
             region: Some(DevbarRegion::Bar { path, offset }),
             device_id,
+        }
+    }
+
+    /// The [`StorageType`] that blocks of this allocator's backing carry:
+    /// `Device(device_id)` for a BAR-mapped or mock devbar region (devbar is
+    /// still GPU memory), `Pinned` for the standard pinned fallback (identical
+    /// to today's host tier). Matches [`DevbarStorage::storage_type`] for
+    /// every backing this allocator can produce; host-tier block factories
+    /// stamp this so block-level NIXL mem types stay consistent with the
+    /// pool-level registration.
+    pub fn host_storage_type(&self) -> StorageType {
+        match &self.region {
+            Some(_) => StorageType::Device(self.device_id),
+            None => StorageType::Pinned,
         }
     }
 }

@@ -118,6 +118,55 @@ impl WriteToStrategy<DeviceStorage> for DeviceStorage {
     }
 }
 
+impl WriteToStrategy<DevbarStorage> for DiskStorage {
+    #[inline(always)]
+    fn write_to_strategy() -> TransferStrategy {
+        TransferStrategy::Nixl(NixlTransfer::Read)
+    }
+}
+
+impl WriteToStrategy<DiskStorage> for DevbarStorage {
+    #[inline(always)]
+    fn write_to_strategy() -> TransferStrategy {
+        TransferStrategy::Nixl(NixlTransfer::Write)
+    }
+}
+
+impl WriteToStrategy<SystemStorage> for DevbarStorage {
+    #[inline(always)]
+    fn write_to_strategy() -> TransferStrategy {
+        TransferStrategy::Memcpy
+    }
+}
+
+impl WriteToStrategy<DevbarStorage> for SystemStorage {
+    #[inline(always)]
+    fn write_to_strategy() -> TransferStrategy {
+        TransferStrategy::Memcpy
+    }
+}
+
+impl WriteToStrategy<DevbarStorage> for DevbarStorage {
+    #[inline(always)]
+    fn write_to_strategy() -> TransferStrategy {
+        TransferStrategy::Memcpy
+    }
+}
+
+impl WriteToStrategy<DeviceStorage> for DevbarStorage {
+    #[inline(always)]
+    fn write_to_strategy() -> TransferStrategy {
+        TransferStrategy::CudaAsyncH2D
+    }
+}
+
+impl WriteToStrategy<DevbarStorage> for DeviceStorage {
+    #[inline(always)]
+    fn write_to_strategy() -> TransferStrategy {
+        TransferStrategy::CudaAsyncD2H
+    }
+}
+
 impl<S: Storage + Local> WriteToStrategy<NixlStorage> for S {
     #[inline(always)]
     fn write_to_strategy() -> TransferStrategy {
@@ -148,6 +197,16 @@ where
 impl<S> ReadFromStrategy<S> for DeviceStorage
 where
     S: WriteToStrategy<DeviceStorage> + Storage + Local,
+{
+    #[inline(always)]
+    fn read_from_strategy() -> TransferStrategy {
+        S::write_to_strategy()
+    }
+}
+
+impl<S> ReadFromStrategy<S> for DevbarStorage
+where
+    S: WriteToStrategy<DevbarStorage> + Storage + Local,
 {
     #[inline(always)]
     fn read_from_strategy() -> TransferStrategy {

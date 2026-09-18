@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use dynamo_llm::block_manager::{DiskStorage, PinnedStorage};
+use dynamo_llm::block_manager::{DevbarStorage, DiskStorage};
 
 use super::*;
 
@@ -39,7 +39,7 @@ pub struct Slot<S: Storage, L: LocalityProvider> {
 
     /// Blocks to be onboarded from the host
     /// We must hold these blocks in the slot state until the scheduler trigger the onboarding.
-    onboard_from_host: Option<Vec<ImmutableBlock<PinnedStorage, L, BasicMetadata>>>,
+    onboard_from_host: Option<Vec<ImmutableBlock<DevbarStorage, L, BasicMetadata>>>,
 
     /// Blocks to be onboarded from the disk
     /// We must hold these blocks in the slot state until the scheduler trigger the onboarding.
@@ -448,7 +448,7 @@ impl<L: LocalityProvider> Slot<DeviceStorage, L> {
 
     pub fn store_onboard_blocks(
         &mut self,
-        host_blocks: Vec<ImmutableBlock<PinnedStorage, L, BasicMetadata>>,
+        host_blocks: Vec<ImmutableBlock<DevbarStorage, L, BasicMetadata>>,
         disk_blocks: Vec<ImmutableBlock<DiskStorage, L, BasicMetadata>>,
     ) {
         self.onboard_from_host = Some(host_blocks);

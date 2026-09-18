@@ -13,7 +13,7 @@ use super::*;
 pub struct LocalBlockDataFactories {
     block_set: NixlBlockSet,
     disk_factory: Option<LocalBlockDataFactory<DiskStorage>>,
-    host_factory: Option<LocalBlockDataFactory<PinnedStorage>>,
+    host_factory: Option<LocalBlockDataFactory<DevbarStorage>>,
     device_factory: Option<LocalBlockDataFactory<DeviceStorage>>,
 }
 

@@ -20,7 +20,7 @@ use crate::block_manager::{
     },
     connector::scheduler::{SchedulingDecision, TransferSchedulerClient},
     offload::max_transfer_batch_size,
-    storage::{DeviceStorage, DiskStorage, Local, PinnedStorage},
+    storage::{DevbarStorage, DeviceStorage, DiskStorage, Local},
 };
 
 use anyhow::Result;
@@ -237,7 +237,7 @@ impl ConnectorTransferBatcher {
 #[derive(Clone)]
 pub struct BlockTransferHandler {
     device: Option<LocalBlockDataList<DeviceStorage>>,
-    host: Option<LocalBlockDataList<PinnedStorage>>,
+    host: Option<LocalBlockDataList<DevbarStorage>>,
     disk: Option<LocalBlockDataList<DiskStorage>>,
     context: Arc<TransferContext>,
     scheduler_client: Option<TransferSchedulerClient>,
@@ -252,7 +252,7 @@ pub struct BlockTransferHandler {
 impl BlockTransferHandler {
     pub fn new(
         device_blocks: Option<Vec<LocalBlock<DeviceStorage, BasicMetadata>>>,
-        host_blocks: Option<Vec<LocalBlock<PinnedStorage, BasicMetadata>>>,
+        host_blocks: Option<Vec<LocalBlock<DevbarStorage, BasicMetadata>>>,
         disk_blocks: Option<Vec<LocalBlock<DiskStorage, BasicMetadata>>>,
         context: Arc<TransferContext>,
         scheduler_client: Option<TransferSchedulerClient>,

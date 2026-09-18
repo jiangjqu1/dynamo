@@ -186,9 +186,11 @@ pub struct KvBlockManagerConfig {
 
     /// Specific configuration for the host layout
     ///
-    /// This includes the number of blocks and the layout of the data into the host memory/storage.
+    /// This includes the number of blocks and the layout of the data into the
+    /// host-tier storage (pinned host memory, or a devbar region when one is
+    /// configured via `DYN_KVBM_DEVBAR_*`).
     #[builder(default, setter(strip_option))]
-    pub host_layout: Option<KvManagerLayoutConfig<PinnedStorage>>,
+    pub host_layout: Option<KvManagerLayoutConfig<DevbarStorage>>,
 
     // Specific configuration for the disk layout
     #[builder(default, setter(strip_option))]

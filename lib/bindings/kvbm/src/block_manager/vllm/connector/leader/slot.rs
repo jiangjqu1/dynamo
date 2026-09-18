@@ -358,7 +358,7 @@ pub struct VllmConnectorSlot {
 
     /// Blocks to be onboarded from the host
     /// We must hold these blocks in the slot state until the scheduler trigger the onboarding.
-    staging_from_host: Option<Vec<ImmutableBlock<PinnedStorage, VllmLocality, BasicMetadata>>>,
+    staging_from_host: Option<Vec<ImmutableBlock<DevbarStorage, VllmLocality, BasicMetadata>>>,
 
     /// Blocks to be onboarded from the disk
     /// We must hold these blocks in the slot state until the scheduler trigger the onboarding.
@@ -1213,7 +1213,7 @@ impl Slot for VllmConnectorSlot {
             debug_assert_eq!(dst_block_ids.len(), num_host_blocks);
 
             // construct offload requests - transfer engine + worker
-            let src_blocks = Box::new(AnyImmutableBlocks::<PinnedStorage, _, _>::new(host_blocks));
+            let src_blocks = Box::new(AnyImmutableBlocks::<DevbarStorage, _, _>::new(host_blocks));
 
             self.onboard_blocks(src_blocks, dst_block_ids)?;
 
@@ -1881,8 +1881,8 @@ struct AnyImmutableBlocks<S: Storage, L: LocalityProvider, M: BlockMetadata> {
     storage_pool: BlockTransferPool,
 }
 
-impl<L: LocalityProvider, M: BlockMetadata> AnyImmutableBlocks<PinnedStorage, L, M> {
-    pub fn new(blocks: Vec<ImmutableBlock<PinnedStorage, L, M>>) -> Self {
+impl<L: LocalityProvider, M: BlockMetadata> AnyImmutableBlocks<DevbarStorage, L, M> {
+    pub fn new(blocks: Vec<ImmutableBlock<DevbarStorage, L, M>>) -> Self {
         Self {
             blocks,
             storage_pool: BlockTransferPool::Host,

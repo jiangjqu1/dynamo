@@ -53,7 +53,7 @@ pub struct KvBlockManagerState<Locality: LocalityProvider, Metadata: BlockMetada
     resources: Arc<Resources>,
 
     disk_pool: Option<Arc<dyn BlockPool<DiskStorage, Locality, Metadata>>>,
-    host_pool: Option<Arc<dyn BlockPool<PinnedStorage, Locality, Metadata>>>,
+    host_pool: Option<Arc<dyn BlockPool<DevbarStorage, Locality, Metadata>>>,
     device_pool: Option<Arc<dyn BlockPool<DeviceStorage, Locality, Metadata>>>,
 
     local_block_set: NixlBlockSet,
@@ -66,7 +66,7 @@ impl<Locality: LocalityProvider, Metadata: BlockMetadata> KvBlockManagerState<Lo
         self.disk_pool.as_ref().map(|pool| pool.as_ref())
     }
 
-    pub fn host(&self) -> Option<&dyn BlockPool<PinnedStorage, Locality, Metadata>> {
+    pub fn host(&self) -> Option<&dyn BlockPool<DevbarStorage, Locality, Metadata>> {
         self.host_pool.as_ref().map(|pool| pool.as_ref())
     }
 

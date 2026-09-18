@@ -408,6 +408,18 @@ fn expected_strategy<Source: Storage, Dest: Storage>() -> TransferStrategy {
             TransferStrategy::CudaAsyncD2H
         }
         (src, dst)
+            if src == std::any::TypeId::of::<DevbarStorage>()
+                && dst == std::any::TypeId::of::<DeviceStorage>() =>
+        {
+            TransferStrategy::CudaAsyncH2D
+        }
+        (src, dst)
+            if src == std::any::TypeId::of::<DeviceStorage>()
+                && dst == std::any::TypeId::of::<DevbarStorage>() =>
+        {
+            TransferStrategy::CudaAsyncD2H
+        }
+        (src, dst)
             if src == std::any::TypeId::of::<DeviceStorage>()
                 && dst == std::any::TypeId::of::<DeviceStorage>() =>
         {

@@ -128,7 +128,7 @@ impl<Locality: LocalityProvider, Metadata: BlockMetadata> KvBlockManager<Localit
     }
 
     /// Get a reference to the host block pool
-    pub fn host(&self) -> Option<&dyn BlockPool<PinnedStorage, Locality, Metadata>> {
+    pub fn host(&self) -> Option<&dyn BlockPool<DevbarStorage, Locality, Metadata>> {
         self.state.host()
     }
 
@@ -295,7 +295,7 @@ mod tests {
             builder.host_layout(
                 KvManagerLayoutConfig::builder()
                     .num_blocks(host)
-                    .allocator(storage::PinnedAllocator::default())
+                    .allocator(storage::DevbarAllocator::default())
                     .build()
                     .unwrap(),
             )

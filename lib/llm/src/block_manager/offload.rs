@@ -39,7 +39,7 @@ use super::block::{
 };
 use super::pool::{BlockPool, BlockPoolError};
 use super::storage::{Cuda, Storage};
-use super::{DeviceStorage, DiskStorage, KvManagerModelConfig, PinnedStorage};
+use super::{DevbarStorage, DeviceStorage, DiskStorage, KvManagerModelConfig};
 use nixl_sys::Agent as NixlAgent;
 use std::sync::{
     Arc,
@@ -136,12 +136,12 @@ pub struct OffloadManagerConfig {
 pub struct OffloadManager<Locality: LocalityProvider, Metadata: BlockMetadata> {
     // Handles to the device, host, and disk pools.
     disk: Option<Arc<dyn BlockPool<DiskStorage, Locality, Metadata>>>,
-    host: Option<Arc<dyn BlockPool<PinnedStorage, Locality, Metadata>>>,
+    host: Option<Arc<dyn BlockPool<DevbarStorage, Locality, Metadata>>>,
     device: Option<Arc<dyn BlockPool<DeviceStorage, Locality, Metadata>>>,
 
     /// Queue of offloading requests.
     device_offload_tx: mpsc::UnboundedSender<OffloadRequest<DeviceStorage, Locality, Metadata>>,
-    host_offload_tx: mpsc::UnboundedSender<OffloadRequest<PinnedStorage, Locality, Metadata>>,
+    host_offload_tx: mpsc::UnboundedSender<OffloadRequest<DevbarStorage, Locality, Metadata>>,
 
     /// Queue of device-to-disk direct offloading requests (bypass CPU memory)
     device_to_disk_offload_tx:
@@ -149,7 +149,7 @@ pub struct OffloadManager<Locality: LocalityProvider, Metadata: BlockMetadata> {
 
     /// Queue of pending onboarding requests.
     host_onboard_tx:
-        mpsc::UnboundedSender<OnboardRequest<PinnedStorage, DeviceStorage, Locality, Metadata>>,
+        mpsc::UnboundedSender<OnboardRequest<DevbarStorage, DeviceStorage, Locality, Metadata>>,
     disk_onboard_tx:
         mpsc::UnboundedSender<OnboardRequest<DiskStorage, DeviceStorage, Locality, Metadata>>,
 
@@ -166,7 +166,7 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         disk: Option<Arc<dyn BlockPool<DiskStorage, Locality, Metadata>>>,
-        host: Option<Arc<dyn BlockPool<PinnedStorage, Locality, Metadata>>>,
+        host: Option<Arc<dyn BlockPool<DevbarStorage, Locality, Metadata>>>,
         device: Option<Arc<dyn BlockPool<DeviceStorage, Locality, Metadata>>>,
         filters: OffloadFilters,
         config: OffloadManagerConfig,
@@ -616,7 +616,7 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                 self.device_offload_tx.send(request).unwrap();
             }
         } else if let Some(host_block) =
-            any_block.downcast_ref::<ImmutableBlock<PinnedStorage, Locality, Metadata>>()
+            any_block.downcast_ref::<ImmutableBlock<DevbarStorage, Locality, Metadata>>()
         {
             // Host (G2) -> Disk (G3) offload
             if self.host_offload_tx.is_closed() {
@@ -673,14 +673,14 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
 
         // TODO: This is really ugly.
         if any_block
-            .downcast_ref::<ImmutableBlock<PinnedStorage, Locality, Metadata>>()
+            .downcast_ref::<ImmutableBlock<DevbarStorage, Locality, Metadata>>()
             .is_some()
         {
             let host_blocks = blocks
                 .iter()
                 .map(|b| {
                     (b as &dyn Any)
-                        .downcast_ref::<ImmutableBlock<PinnedStorage, Locality, Metadata>>()
+                        .downcast_ref::<ImmutableBlock<DevbarStorage, Locality, Metadata>>()
                         .unwrap()
                         .clone()
                 })
@@ -780,8 +780,8 @@ mod tests {
         layout::{FullyContiguous, LayerSeparate, LayoutType, nixl::NixlLayout},
         pool::{BlockRegistrationDuplicationSetting, ManagedBlockPool},
         storage::{
-            DeviceAllocator, DeviceStorage, DiskAllocator, DiskStorage, PinnedAllocator,
-            PinnedStorage, StorageAllocator, StorageType,
+            DevbarAllocator, DevbarStorage, DeviceAllocator, DeviceStorage, DiskAllocator,
+            DiskStorage, StorageAllocator, StorageType,
         },
     };
     use crate::tokens::{TokenBlockSequence, Tokens};
@@ -799,7 +799,7 @@ mod tests {
     const NUM_LAYERS: usize = 8;
 
     type DevicePool = Option<Arc<dyn BlockPool<DeviceStorage, Local, BasicMetadata>>>;
-    type HostPool = Option<Arc<dyn BlockPool<PinnedStorage, Local, BasicMetadata>>>;
+    type HostPool = Option<Arc<dyn BlockPool<DevbarStorage, Local, BasicMetadata>>>;
     type DiskPool = Option<Arc<dyn BlockPool<DiskStorage, Local, BasicMetadata>>>;
 
     lazy_static::lazy_static! {
@@ -914,7 +914,7 @@ mod tests {
                 config.clone(),
                 layout_type,
                 agent,
-                &PinnedAllocator::default(),
+                &DevbarAllocator::default(),
                 duplication_setting,
             )?)
         } else {
