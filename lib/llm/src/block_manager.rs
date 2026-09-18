@@ -38,7 +38,7 @@ pub use layout::{LayoutConfig, LayoutConfigBuilder, LayoutError, LayoutType, nix
 pub use offload::{filter::OffloadFilter, request::BlockResult};
 pub use pool::{BlockPool, ManagedBlockPool};
 pub use storage::{
-    DeviceStorage, DiskStorage, DevbarAllocator, DevbarStorage, PinnedStorage, Storage,
+    DevbarAllocator, DevbarStorage, DeviceStorage, DiskStorage, PinnedStorage, Storage,
     StorageAllocator, nixl::NixlRegisterableStorage,
 };
 pub use tokio_util::sync::CancellationToken;

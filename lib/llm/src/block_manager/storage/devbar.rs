@@ -20,11 +20,11 @@
 
 use std::{path::PathBuf, ptr::NonNull};
 
+use super::nixl::{MemType, MemoryRegion, NixlAccessible, NixlDescriptor, NixlRegisterableStorage};
 use super::{
-    CudaAccessible, Local, RegistationHandle, RegistrationHandles, RegisterableStorage, Storage,
+    CudaAccessible, Local, RegistationHandle, RegisterableStorage, RegistrationHandles, Storage,
     StorageAllocator, StorageError, StorageMemset, StorageType, SystemAccessible,
 };
-use super::nixl::{MemType, MemoryRegion, NixlDescriptor, NixlRegisterableStorage};
 
 /// How the devbar region is provisioned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +50,7 @@ pub struct DevbarStorage {
     backing: DevbarBacking,
     handles: RegistrationHandles,
     /// Present only in Pinned fallback mode; owns the pinned allocation.
-    _pinned: Option<dynamo_memory::PinnedStorage>,
+    pinned: Option<dynamo_memory::PinnedStorage>,
 }
 
 // SAFETY: DevbarStorage owns its mapping exclusively; raw-pointer access is
@@ -93,7 +93,22 @@ impl DevbarStorage {
             )));
         }
         let aperture_size = stat.st_size as u64;
-        if offset + size as u64 > aperture_size {
+        if !offset.is_multiple_of(unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64) {
+            unsafe { libc::close(fd) };
+            return Err(StorageError::InvalidConfig(format!(
+                "devbar offset {offset} is not page-aligned; sysfs resource mmap requires \
+                 a page-aligned offset of {}.",
+                path.display()
+            )));
+        }
+        let Some(request_end) = offset.checked_add(size as u64) else {
+            unsafe { libc::close(fd) };
+            return Err(StorageError::InvalidConfig(format!(
+                "devbar request (offset {offset} + {size} bytes) overflows of {}.",
+                path.display()
+            )));
+        };
+        if request_end > aperture_size {
             unsafe { libc::close(fd) };
             return Err(StorageError::InvalidConfig(format!(
                 "devbar request (offset {offset} + {size} bytes) exceeds aperture size \
@@ -130,7 +145,7 @@ impl DevbarStorage {
             device_id,
             backing: DevbarBacking::Bar,
             handles: RegistrationHandles::new(),
-            _pinned: None,
+            pinned: None,
         })
     }
 
@@ -161,14 +176,14 @@ impl DevbarStorage {
             device_id,
             backing: DevbarBacking::Mock,
             handles: RegistrationHandles::new(),
-            _pinned: None,
+            pinned: None,
         })
     }
 
     /// Create a devbar storage backed by standard pinned host allocation (fallback).
     pub fn pinned_fallback(size: usize, device_id: Option<u32>) -> Result<Self, StorageError> {
         let mut inner = dynamo_memory::PinnedStorage::new_for_device(size, device_id)?;
-        let ptr = NonNull::new(unsafe { inner.as_mut_ptr() as *mut u8 }).ok_or_else(|| {
+        let ptr = NonNull::new(unsafe { inner.as_mut_ptr() }).ok_or_else(|| {
             StorageError::AllocationFailed("pinned allocation returned null".into())
         })?;
         Ok(Self {
@@ -177,7 +192,7 @@ impl DevbarStorage {
             device_id: device_id.unwrap_or(0),
             backing: DevbarBacking::Pinned,
             handles: RegistrationHandles::new(),
-            _pinned: Some(inner),
+            pinned: Some(inner),
         })
     }
 
@@ -190,22 +205,29 @@ impl DevbarStorage {
 impl Drop for DevbarStorage {
     fn drop(&mut self) {
         self.handles.release();
-        if self._pinned.is_none() {
+        if self.pinned.is_none() {
             unsafe {
                 libc::munmap(self.ptr.as_ptr() as *mut libc::c_void, self.len);
             }
         }
-        // _pinned Drop frees the pinned allocation
+        // pinned Drop frees the pinned allocation
     }
 }
 
 impl Storage for DevbarStorage {
     fn storage_type(&self) -> StorageType {
-        // Devbar is device memory (BAR-mapped, host-accessible). Using the
-        // Device variant keeps nixl_mem_type() => MemType::Vram consistent with
-        // NixlDescriptor below, and avoids adding a new serialized StorageType
-        // variant on the worker->peer layout wire (N-2 compatibility).
-        StorageType::Device(self.device_id)
+        match self.backing {
+            // Devbar (BAR-mapped / mock) is device memory: the Device variant
+            // keeps nixl_mem_type() => MemType::Vram consistent with the
+            // NixlDescriptor below, and avoids adding a new serialized
+            // StorageType variant on the worker->peer layout wire.
+            DevbarBacking::Bar | DevbarBacking::Mock => StorageType::Device(self.device_id),
+            // Pinned fallback is byte-for-byte identical to the existing
+            // PinnedStorage host tier: StorageType::Pinned keeps
+            // nixl_mem_type() => MemType::Dram consistent with the pool-level
+            // Dram registration.
+            DevbarBacking::Pinned => StorageType::Pinned,
+        }
     }
 
     fn addr(&self) -> u64 {
@@ -260,7 +282,7 @@ impl RegisterableStorage for DevbarStorage {
 
 // DevbarStorage — NIXL support
 
-impl super::nixl::NixlAccessible for DevbarStorage {}
+impl NixlAccessible for DevbarStorage {}
 impl NixlRegisterableStorage for DevbarStorage {}
 
 impl MemoryRegion for DevbarStorage {
@@ -296,6 +318,7 @@ impl NixlDescriptor for DevbarStorage {
 /// - `DYN_KVBM_DEVBAR_BDF=<bdf>` — mmap the BAR aperture of that PCI device
 ///   (e.g. `0000:1f:00.0` -> `/sys/bus/pci/devices/0000:1f:00.0/resource0`)
 /// - `DYN_KVBM_DEVBAR_MOCK=1` — anonymous mapping (plumbing tests without hardware)
+/// - When both `DYN_KVBM_DEVBAR_MOCK=1` and `DYN_KVBM_DEVBAR_BDF` are set, the mock region wins.
 /// - otherwise — standard pinned host allocation (default deployments unaffected)
 ///
 /// The tier-2 sizing still comes from `DYN_KVBM_CPU_CACHE_GB` /
@@ -419,12 +442,17 @@ mod tests {
         }
     }
 
+    /// Requires CUDA (pinned allocation); fails with a cudarc libcuda load
+    /// error on machines without a GPU or driver.
     #[test]
     fn test_devbar_pinned_fallback_descriptor() {
         let allocator = DevbarAllocator::default();
-        let storage = allocator.allocate(8192).expect("pinned fallback allocation");
+        let storage = allocator
+            .allocate(8192)
+            .expect("pinned fallback allocation");
 
         assert!(!storage.is_devbar_backed());
+        assert_eq!(storage.storage_type(), StorageType::Pinned);
         assert_eq!(storage.device_id(), 0);
         assert_eq!(storage.mem_type(), MemType::Dram);
     }
@@ -434,12 +462,38 @@ mod tests {
         let storage = DevbarStorage::mock(1024, 0).unwrap();
         assert!(unsafe { storage.as_nixl_descriptor() }.is_none());
     }
+
+    #[test]
+    fn test_devbar_from_bar_roundtrip_and_aperture_validation() {
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        use std::io::{Seek as _, Write as _};
+        file.write_all(&[0x5A; 1024]).expect("write pattern");
+        file.flush().expect("flush");
+        file.rewind().expect("rewind");
+
+        let storage = DevbarStorage::from_bar(file.path().to_path_buf(), 0, 1024, 7)
+            .expect("mmap of ordinary file as devbar region");
+        assert!(storage.is_devbar_backed());
+        assert_eq!(storage.storage_type(), StorageType::Device(7));
+        assert_eq!(storage.device_id(), 7);
+        assert_eq!(storage.mem_type(), MemType::Vram);
+        unsafe {
+            assert_eq!(std::ptr::read_volatile(Storage::as_ptr(&storage)), 0x5A);
+        }
+        drop(storage);
+
+        // Requesting past the aperture must be rejected with the sizing
+        // guidance error.
+        let err = DevbarStorage::from_bar(file.path().to_path_buf(), 0, 2048, 7)
+            .expect_err("aperture overflow must be rejected");
+        assert!(matches!(err, StorageError::InvalidConfig(_)));
+    }
 }
 
 #[cfg(all(test, feature = "testing-nixl"))]
 mod nixl_tests {
-    use super::*;
     use super::super::nixl::NixlAgent;
+    use super::*;
 
     /// Runs only where NIXL + the UCX plugin are installed. Uses the pinned
     /// fallback (Dram) because Vram registration requires a CUDA context.
