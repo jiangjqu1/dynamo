@@ -23,7 +23,7 @@ use tokio::sync::oneshot;
 
 pub use crate::block_manager::storage::{CudaAccessible, Local, Remote};
 pub use async_trait::async_trait;
-pub use context::{PoolConfig, TransferContext};
+pub use context::{HostTransferSemantics, PoolConfig, TransferContext};
 
 #[cfg(feature = "nccl")]
 pub use nccl::{NcclGroup, bcast_block, bcast_layer};
@@ -200,7 +200,12 @@ where
 
     let (tx, rx) = oneshot::channel();
 
-    match RB::write_to_strategy() {
+    // The compile-time strategy, adjusted for a device-aliased host tier:
+    // when the host tier is a VMM device-alias, its H2D/D2H copies must run
+    // D2D (see `TransferContext::host_transfer_adjust`).
+    let strategy = ctx.host_transfer_adjust(RB::write_to_strategy());
+
+    match strategy {
         TransferStrategy::Memcpy => {
             for (src, dst) in sources.iter().zip(targets.iter_mut()) {
                 // TODO: Unlike all other transfer strategies, this is fully blocking.
@@ -214,18 +219,14 @@ where
         TransferStrategy::CudaAsyncH2D
         | TransferStrategy::CudaAsyncD2H
         | TransferStrategy::CudaAsyncD2D => {
-            tracing::debug!(
-                "Transfer: Using CUDA strategy: {:?}",
-                RB::write_to_strategy()
-            );
+            tracing::debug!("Transfer: Using CUDA strategy: {:?}", strategy);
 
-            if RB::write_to_strategy() == TransferStrategy::CudaAsyncH2D
-                || RB::write_to_strategy() == TransferStrategy::CudaAsyncD2H
+            if strategy == TransferStrategy::CudaAsyncH2D
+                || strategy == TransferStrategy::CudaAsyncD2H
             {
                 let is_contiguous = sources[0].block_data().is_fully_contiguous()
                     && targets[0].block_data().is_fully_contiguous();
-                let transfer_mode =
-                    resolve_cuda_transfer_mode(RB::write_to_strategy(), is_contiguous);
+                let transfer_mode = resolve_cuda_transfer_mode(strategy, is_contiguous);
 
                 match transfer_mode {
                     CudaTransferMode::Custom => {
@@ -239,12 +240,7 @@ where
                     }
                     CudaTransferMode::Default => {
                         for (src, dst) in sources.iter().zip(targets.iter_mut()) {
-                            cuda::copy_block(
-                                src,
-                                dst,
-                                ctx.stream().as_ref(),
-                                RB::write_to_strategy(),
-                            )?;
+                            cuda::copy_block(src, dst, ctx.stream().as_ref(), strategy)?;
                         }
                     }
                 };
@@ -254,7 +250,7 @@ where
             } else {
                 // Fall back to individual copy for D2Dblocks
                 for (src, dst) in sources.iter().zip(targets.iter_mut()) {
-                    cuda::copy_block(src, dst, ctx.stream().as_ref(), RB::write_to_strategy())?;
+                    cuda::copy_block(src, dst, ctx.stream().as_ref(), strategy)?;
                 }
                 ctx.cuda_event(tx)?;
                 Ok(rx)
@@ -271,7 +267,7 @@ where
         }
         _ => Err(TransferError::IncompatibleTypes(format!(
             "Unsupported copy strategy: {:?}",
-            RB::write_to_strategy()
+            strategy
         ))),
     }
 }

@@ -312,9 +312,29 @@ where
 
     #[cfg(debug_assertions)]
     {
-        let expected_strategy =
-            expected_strategy::<Source::StorageType, Destination::StorageType>();
-        assert_eq!(strategy, expected_strategy);
+        // Backing-dependent: host-pointer devbar backings (Pinned/Mock/Bar)
+        // use H2D/D2H; the Vmm device-alias uses D2D (see
+        // `TransferContext::host_transfer_adjust`). The executor asserts
+        // membership, not the exact variant.
+        let devbar_pair = std::any::TypeId::of::<Source::StorageType>()
+            == std::any::TypeId::of::<DevbarStorage>()
+            || std::any::TypeId::of::<Destination::StorageType>()
+                == std::any::TypeId::of::<DevbarStorage>();
+        if devbar_pair {
+            assert!(
+                matches!(
+                    strategy,
+                    TransferStrategy::CudaAsyncH2D
+                        | TransferStrategy::CudaAsyncD2H
+                        | TransferStrategy::CudaAsyncD2D
+                ),
+                "devbar pair strategy must be H2D/D2H/D2D, got {strategy:?}"
+            );
+        } else {
+            let expected_strategy =
+                expected_strategy::<Source::StorageType, Destination::StorageType>();
+            assert_eq!(strategy, expected_strategy);
+        }
     }
 
     if src_data.is_fully_contiguous() && dst_data.is_fully_contiguous() {
@@ -362,9 +382,29 @@ where
 
     #[cfg(debug_assertions)]
     {
-        let expected_strategy =
-            expected_strategy::<Source::StorageType, Destination::StorageType>();
-        assert_eq!(strategy, expected_strategy);
+        // Backing-dependent: host-pointer devbar backings (Pinned/Mock/Bar)
+        // use H2D/D2H; the Vmm device-alias uses D2D (see
+        // `TransferContext::host_transfer_adjust`). The executor asserts
+        // membership, not the exact variant.
+        let devbar_pair = std::any::TypeId::of::<Source::StorageType>()
+            == std::any::TypeId::of::<DevbarStorage>()
+            || std::any::TypeId::of::<Destination::StorageType>()
+                == std::any::TypeId::of::<DevbarStorage>();
+        if devbar_pair {
+            assert!(
+                matches!(
+                    strategy,
+                    TransferStrategy::CudaAsyncH2D
+                        | TransferStrategy::CudaAsyncD2H
+                        | TransferStrategy::CudaAsyncD2D
+                ),
+                "devbar pair strategy must be H2D/D2H/D2D, got {strategy:?}"
+            );
+        } else {
+            let expected_strategy =
+                expected_strategy::<Source::StorageType, Destination::StorageType>();
+            assert_eq!(strategy, expected_strategy);
+        }
     }
 
     for layer_idx in layer_range {
@@ -408,16 +448,16 @@ fn expected_strategy<Source: Storage, Dest: Storage>() -> TransferStrategy {
             TransferStrategy::CudaAsyncD2H
         }
         (src, dst)
-            if src == std::any::TypeId::of::<DevbarStorage>()
-                && dst == std::any::TypeId::of::<DeviceStorage>() =>
+            if (src == std::any::TypeId::of::<DevbarStorage>()
+                && dst == std::any::TypeId::of::<DeviceStorage>())
+                || (src == std::any::TypeId::of::<DeviceStorage>()
+                    && dst == std::any::TypeId::of::<DevbarStorage>()) =>
         {
-            TransferStrategy::CudaAsyncH2D
-        }
-        (src, dst)
-            if src == std::any::TypeId::of::<DeviceStorage>()
-                && dst == std::any::TypeId::of::<DevbarStorage>() =>
-        {
-            TransferStrategy::CudaAsyncD2H
+            // Backing-dependent: host-pointer backings (Pinned/Mock/Bar) use
+            // H2D/D2H; the Vmm device-alias uses D2D (see
+            // `TransferContext::host_transfer_adjust`). The executor asserts
+            // membership, not the exact variant.
+            TransferStrategy::CudaAsyncD2D
         }
         (src, dst)
             if src == std::any::TypeId::of::<DeviceStorage>()

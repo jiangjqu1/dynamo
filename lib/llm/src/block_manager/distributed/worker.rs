@@ -12,7 +12,7 @@ use crate::block_manager::{
     BasicMetadata, BlockMetadata, LayoutConfigBuilder, NixlLayout, Storage,
     block::{
         Block, layout_to_blocks, locality,
-        transfer::{PoolConfig, TransferContext},
+        transfer::{HostTransferSemantics, PoolConfig, TransferContext},
     },
     connector::scheduler::TransferSchedulerClient,
     layout::LayoutType,
@@ -150,24 +150,34 @@ async fn perform_allocation_and_build_handler(
         num_outer_components: device_layout.config().outer_dim,
         num_layers: device_layout.config().num_layers,
     };
-    let transfer_context = Arc::new(
-        TransferContext::new(
-            Arc::new(Some(agent)),
-            DeviceAllocator::new(device_id)?.ctx().new_stream()?,
-            Handle::current(),
-            Some(pool_config),
+    // Host (G2 / tier-2) allocator, built before the transfer context so its
+    // backing can set the context's host-transfer semantics (a VMM
+    // device-alias devbar region transfers via D2D). The pool itself is only
+    // allocated below when should_allocate_offload.
+    let host_allocator = Arc::new(DevbarAllocator::from_env()?);
+    let host_transfer_semantics = if host_allocator.is_device_aliased() {
+        HostTransferSemantics::DeviceAlias
+    } else {
+        HostTransferSemantics::HostPointer
+    };
+    let mut transfer_context = TransferContext::new(
+        Arc::new(Some(agent)),
+        DeviceAllocator::new(device_id)?.ctx().new_stream()?,
+        Handle::current(),
+        Some(pool_config),
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to create transfer context for worker {} with CUDA memory pool: {}. \
+             This is a critical error - the worker cannot start without CUDA memory pools. \
+             Please ensure sufficient GPU memory is available on device {}.",
+            worker_id,
+            e,
+            device_id
         )
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to create transfer context for worker {} with CUDA memory pool: {}. \
-                 This is a critical error - the worker cannot start without CUDA memory pools. \
-                 Please ensure sufficient GPU memory is available on device {}.",
-                worker_id,
-                e,
-                device_id
-            )
-        })?,
-    );
+    })?;
+    transfer_context.set_host_transfer_semantics(host_transfer_semantics);
+    let transfer_context = Arc::new(transfer_context);
 
     // device - always allocated on all ranks
     let device_blocks = Some(KvbmWorker::make_layout::<_, BasicMetadata>(
@@ -181,7 +191,6 @@ async fn perform_allocation_and_build_handler(
     // Backed by a BAR-mapped devbar region when DYN_KVBM_DEVBAR_* is configured,
     // otherwise standard pinned host memory (default deployments unchanged).
     let host_blocks = if should_allocate_offload && leader_meta.num_host_blocks > 0 {
-        let host_allocator = Arc::new(DevbarAllocator::from_env()?);
         let host_layout = layout_builder
             .num_blocks(leader_meta.num_host_blocks)
             .build()?

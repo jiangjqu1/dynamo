@@ -35,11 +35,11 @@
 use super::block::{
     BlockError, BlockMetadata, BlockState, ImmutableBlock, MutableBlock,
     locality::LocalityProvider,
-    transfer::{PoolConfig, TransferContext},
+    transfer::{HostTransferSemantics, PoolConfig, TransferContext},
 };
 use super::pool::{BlockPool, BlockPoolError};
 use super::storage::{Cuda, Storage};
-use super::{DevbarStorage, DeviceStorage, DiskStorage, KvManagerModelConfig};
+use super::{DevbarAllocator, DevbarStorage, DeviceStorage, DiskStorage, KvManagerModelConfig};
 use nixl_sys::Agent as NixlAgent;
 use std::sync::{
     Arc,
@@ -210,9 +210,19 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
             num_layers: config.model_config.num_layers,
         };
 
+        // The host pool in this path is always a DevbarStorage-backed pool;
+        // derive the host-transfer semantics from the same env selection the
+        // host factory uses (a VMM device-alias devbar region transfers via
+        // D2D).
+        let host_transfer_semantics = if DevbarAllocator::from_env()?.is_device_aliased() {
+            HostTransferSemantics::DeviceAlias
+        } else {
+            HostTransferSemantics::HostPointer
+        };
+
         // We want cuda offloads to happen in parallel with host onboards, so we need to use a different stream.
-        let device_offload_transfer_ctx = Arc::new(
-            TransferContext::new(
+        let device_offload_transfer_ctx = {
+            let mut ctx = TransferContext::new(
                 config.nixl_agent.clone(),
                 cuda_ctx.new_stream()?,
                 config.async_rt_handle.clone(),
@@ -225,8 +235,10 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                      Please ensure sufficient GPU memory is available.",
                     e
                 )
-            })?,
-        );
+            })?;
+            ctx.set_host_transfer_semantics(host_transfer_semantics);
+            Arc::new(ctx)
+        };
 
         // Device -> Host offload
         let device_to_host_task = OffloadManager::offload_worker(
@@ -259,8 +271,8 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
         )?
         .detach();
 
-        let transfer_ctx = Arc::new(
-            TransferContext::new(
+        let transfer_ctx = {
+            let mut ctx = TransferContext::new(
                 config.nixl_agent.clone(),
                 cuda_ctx.new_stream()?,
                 config.async_rt_handle.clone(),
@@ -271,8 +283,10 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                     "Failed to create transfer context for host onboard operations: {}",
                     e
                 )
-            })?,
-        );
+            })?;
+            ctx.set_host_transfer_semantics(host_transfer_semantics);
+            Arc::new(ctx)
+        };
 
         // Host -> Disk offload
         let host_to_disk_task = OffloadManager::offload_worker(

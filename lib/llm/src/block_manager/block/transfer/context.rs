@@ -170,6 +170,17 @@ pub struct PoolConfig {
     pub num_layers: usize,
 }
 
+/// How the host-tier pool's memory is accessed by transfers. Decides the
+/// CUDA copy kind for (host-tier ↔ Device) pairs:
+/// - `HostPointer` (default; Pinned/Mock/Bar-direct): ordinary H2D/D2H.
+/// - `DeviceAlias` (Vmm backing): the "host" pointer is a device VA — D2D.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HostTransferSemantics {
+    #[default]
+    HostPointer,
+    DeviceAlias,
+}
+
 pub struct TransferContext {
     nixl_agent: Arc<Option<NixlAgent>>,
     stream: Arc<CudaStream>,
@@ -184,6 +195,10 @@ pub struct TransferContext {
     cuda_event_tx: mpsc::UnboundedSender<(CudaEvent, oneshot::Sender<()>)>,
     cuda_event_worker: Option<JoinHandle<()>>,
     cancel_token: CancellationToken,
+
+    /// How the host-tier pool's memory is accessed by transfers (see
+    /// [`HostTransferSemantics`]).
+    host_transfer_semantics: HostTransferSemantics,
 }
 
 impl TransferContext {
@@ -254,6 +269,7 @@ impl TransferContext {
             cuda_event_tx,
             cuda_event_worker: Some(cuda_event_worker),
             cancel_token,
+            host_transfer_semantics: HostTransferSemantics::default(),
         })
     }
 
@@ -300,6 +316,31 @@ impl TransferContext {
     /// Get the CUDA memory pool for stream-ordered allocations
     pub fn cuda_mem_pool(&self) -> Option<&Arc<CudaMemPool>> {
         self.cuda_mem_pool.as_ref()
+    }
+
+    /// Set how the host-tier pool's memory is accessed by transfers (see
+    /// [`HostTransferSemantics`]). Set once at construction; defaults to
+    /// [`HostTransferSemantics::HostPointer`].
+    pub fn set_host_transfer_semantics(&mut self, s: HostTransferSemantics) {
+        self.host_transfer_semantics = s;
+    }
+
+    /// Adjust a compile-time transfer strategy for a device-aliased host
+    /// tier: H2D/D2H only arise for (host-tier ↔ Device) pairs; when the
+    /// host tier is a VMM device-alias, those copies must run D2D (the
+    /// region's pointer is a device VA — an H2D/D2H kind would treat it as
+    /// host memory and fault; see the 2026-10-06 Xid 31 record).
+    pub fn host_transfer_adjust(&self, strategy: TransferStrategy) -> TransferStrategy {
+        if self.host_transfer_semantics == HostTransferSemantics::DeviceAlias
+            && matches!(
+                strategy,
+                TransferStrategy::CudaAsyncH2D | TransferStrategy::CudaAsyncD2H
+            )
+        {
+            TransferStrategy::CudaAsyncD2D
+        } else {
+            strategy
+        }
     }
 
     pub fn cuda_event(&self, tx: oneshot::Sender<()>) -> Result<(), TransferError> {
