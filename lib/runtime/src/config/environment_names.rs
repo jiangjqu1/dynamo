@@ -297,6 +297,12 @@ pub mod kvbm {
         /// Set to "1" to back the tier-2 pool with an anonymous mock mapping
         /// (plumbing tests on machines without BAR-mapped device memory)
         pub const DYN_KVBM_DEVBAR_MOCK: &str = "DYN_KVBM_DEVBAR_MOCK";
+
+        /// Set to "1" to back the tier-2 pool with a CUDA-VMM device-alias
+        /// allocation (cuMemCreate + cuMemMap at a reserved GPU VA):
+        /// driver-owned, collision-free, native D2D transfers; works on C2C
+        /// and PCIe GPUs
+        pub const DYN_KVBM_DEVBAR_VMM: &str = "DYN_KVBM_DEVBAR_VMM";
     }
 
     /// Disk cache configuration
@@ -1067,6 +1073,7 @@ mod tests {
             kvbm::devbar::DYN_KVBM_DEVBAR_OFFSET,
             kvbm::devbar::DYN_KVBM_DEVBAR_DEVICE_ID,
             kvbm::devbar::DYN_KVBM_DEVBAR_MOCK,
+            kvbm::devbar::DYN_KVBM_DEVBAR_VMM,
             kvbm::disk_cache::DYN_KVBM_DISK_CACHE_GB,
             kvbm::disk_cache::DYN_KVBM_DISK_CACHE_OVERRIDE_NUM_BLOCKS,
             kvbm::leader::DYN_KVBM_LEADER_WORKER_INIT_TIMEOUT_SECS,
