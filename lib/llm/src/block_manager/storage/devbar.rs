@@ -594,6 +594,14 @@ impl DevbarAllocator {
         }
     }
 
+    /// Allocator over a CUDA-VMM device-alias region (tests / programmatic use).
+    pub fn vmm(device_id: u32) -> Self {
+        Self {
+            region: Some(DevbarRegion::Vmm),
+            device_id,
+        }
+    }
+
     /// The [`StorageType`] that blocks of this allocator's backing carry:
     /// `Device(device_id)` for a BAR-mapped, mock, or VMM device-alias devbar
     /// region, `Pinned` for the standard pinned fallback (identical to
@@ -782,16 +790,20 @@ mod vmm_tests {
     use super::*;
     use cudarc::driver::sys;
 
-    const PATTERN: &[u8; 16] = b"VMM-UNIT-PATTERN"; // 16 bytes
+    const PATTERN: &[u8; 16] = b"VMM-UNIT-PATTERN";
 
-    /// The spike-1b sequence as a unit test: device-alias roundtrip, D2D,
-    /// descriptor triple, device memset, drop-cleanliness.
+    /// Vmm device-alias: descriptor triple, device memset, D2D both
+    /// directions, leak-detected teardown.
     #[test]
     fn test_devbar_vmm_roundtrip_and_descriptor() {
-        let alloc = DevbarAllocator {
-            region: Some(DevbarRegion::Vmm),
-            device_id: 0,
-        };
+        let alloc = DevbarAllocator::vmm(0);
+        let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+        ctx.bind_to_thread().unwrap();
+
+        // Baseline free memory: a leaked cuMemCreate physical handle shows
+        // up as free memory NOT returning to this baseline after teardown.
+        let (free_before, _) = ctx.mem_get_info().unwrap();
+
         let mut storage = alloc.allocate(8 * 1024 * 1024).expect("from_vmm");
 
         // Descriptor triple: Device-stamped, Vram-typed, real device VA.
@@ -814,8 +826,6 @@ mod vmm_tests {
         assert_eq!(probe, [0xCD; 16]);
 
         // D2D both directions: alias <-> a normal device buffer.
-        let ctx = cudarc::driver::CudaContext::new(0).unwrap();
-        ctx.bind_to_thread().unwrap();
         let mut dev: sys::CUdeviceptr = 0;
         unsafe {
             assert_eq!(
@@ -840,18 +850,25 @@ mod vmm_tests {
                 sys::cuMemcpyDtoD_v2(va, dev, 16),
                 sys::CUresult::CUDA_SUCCESS
             );
+            assert_eq!(sys::cuMemFree_v2(dev), sys::CUresult::CUDA_SUCCESS);
             let mut back = [0u8; 16];
             assert_eq!(
                 sys::cuMemcpyDtoH_v2(back.as_mut_ptr() as *mut core::ffi::c_void, va, 16),
                 sys::CUresult::CUDA_SUCCESS
             );
             assert_eq!(&back, PATTERN);
-            assert_eq!(sys::cuMemFree_v2(dev), sys::CUresult::CUDA_SUCCESS);
         }
 
-        // Drop: unmap + address-free + release must not panic or leak (the
-        // re-allocation below proves the physical handle was released).
+        // Drop: unmap + address-free + release must not panic or leak; the
+        // physical handle's release shows up as free memory returning to the
+        // baseline (2 MiB tolerance for accounting jitter). The re-allocation
+        // below additionally proves re-allocation works after release.
         drop(storage);
+        let (free_after, _) = ctx.mem_get_info().unwrap();
+        assert!(
+            free_after + (2 << 20) >= free_before,
+            "VMM region leaked: free went {free_before} -> {free_after}"
+        );
         let again = alloc
             .allocate(8 * 1024 * 1024)
             .expect("re-allocate after drop");
