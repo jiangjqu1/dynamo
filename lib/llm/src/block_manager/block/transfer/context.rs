@@ -181,6 +181,21 @@ pub enum HostTransferSemantics {
     DeviceAlias,
 }
 
+impl HostTransferSemantics {
+    /// The strategy adjustment this semantics implies for a compile-time
+    /// strategy: DeviceAlias turns H2D/D2H into D2D (the "host" pointer is a
+    /// device VA); every other combination is the identity.
+    pub fn adjust(self, strategy: TransferStrategy) -> TransferStrategy {
+        match (self, strategy) {
+            (HostTransferSemantics::DeviceAlias, TransferStrategy::CudaAsyncH2D)
+            | (HostTransferSemantics::DeviceAlias, TransferStrategy::CudaAsyncD2H) => {
+                TransferStrategy::CudaAsyncD2D
+            }
+            _ => strategy,
+        }
+    }
+}
+
 pub struct TransferContext {
     nixl_agent: Arc<Option<NixlAgent>>,
     stream: Arc<CudaStream>,
@@ -321,26 +336,17 @@ impl TransferContext {
     /// Set how the host-tier pool's memory is accessed by transfers (see
     /// [`HostTransferSemantics`]). Set once at construction; defaults to
     /// [`HostTransferSemantics::HostPointer`].
-    pub fn set_host_transfer_semantics(&mut self, s: HostTransferSemantics) {
-        self.host_transfer_semantics = s;
+    pub fn set_host_transfer_semantics(&mut self, semantics: HostTransferSemantics) {
+        self.host_transfer_semantics = semantics;
     }
 
-    /// Adjust a compile-time transfer strategy for a device-aliased host
-    /// tier: H2D/D2H only arise for (host-tier ↔ Device) pairs; when the
-    /// host tier is a VMM device-alias, those copies must run D2D (the
-    /// region's pointer is a device VA — an H2D/D2H kind would treat it as
-    /// host memory and fault; see the 2026-10-06 Xid 31 record).
+    /// Adjust a compile-time transfer strategy for this context's host-tier
+    /// semantics (see [`HostTransferSemantics::adjust`]): H2D/D2H only arise
+    /// for (host-tier ↔ Device) pairs; when the host tier is a VMM
+    /// device-alias, those copies must run D2D (the region's pointer is a
+    /// device VA — an H2D/D2H kind would treat it as host memory and fault).
     pub fn host_transfer_adjust(&self, strategy: TransferStrategy) -> TransferStrategy {
-        if self.host_transfer_semantics == HostTransferSemantics::DeviceAlias
-            && matches!(
-                strategy,
-                TransferStrategy::CudaAsyncH2D | TransferStrategy::CudaAsyncD2H
-            )
-        {
-            TransferStrategy::CudaAsyncD2D
-        } else {
-            strategy
-        }
+        self.host_transfer_semantics.adjust(strategy)
     }
 
     pub fn cuda_event(&self, tx: oneshot::Sender<()>) -> Result<(), TransferError> {
@@ -623,5 +629,39 @@ pub mod v2 {
                 .await
                 .expect("Sync after cleanup failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_transfer_semantics_adjust() {
+        use TransferStrategy as T;
+        assert_eq!(
+            HostTransferSemantics::DeviceAlias.adjust(T::CudaAsyncH2D),
+            T::CudaAsyncD2D
+        );
+        assert_eq!(
+            HostTransferSemantics::DeviceAlias.adjust(T::CudaAsyncD2H),
+            T::CudaAsyncD2D
+        );
+        assert_eq!(
+            HostTransferSemantics::DeviceAlias.adjust(T::CudaAsyncD2D),
+            T::CudaAsyncD2D
+        );
+        assert_eq!(
+            HostTransferSemantics::DeviceAlias.adjust(T::Memcpy),
+            T::Memcpy
+        );
+        assert_eq!(
+            HostTransferSemantics::HostPointer.adjust(T::CudaAsyncH2D),
+            T::CudaAsyncH2D
+        );
+        assert_eq!(
+            HostTransferSemantics::HostPointer.adjust(T::CudaBlockingD2H),
+            T::CudaBlockingD2H
+        );
     }
 }
