@@ -776,3 +776,85 @@ mod nixl_tests {
         assert_eq!(*desc.device_id(), 0);
     }
 }
+
+#[cfg(all(test, feature = "testing-cuda"))]
+mod vmm_tests {
+    use super::*;
+    use cudarc::driver::sys;
+
+    const PATTERN: &[u8; 16] = b"VMM-UNIT-PATTERN"; // 16 bytes
+
+    /// The spike-1b sequence as a unit test: device-alias roundtrip, D2D,
+    /// descriptor triple, device memset, drop-cleanliness.
+    #[test]
+    fn test_devbar_vmm_roundtrip_and_descriptor() {
+        let alloc = DevbarAllocator {
+            region: Some(DevbarRegion::Vmm),
+            device_id: 0,
+        };
+        let mut storage = alloc.allocate(8 * 1024 * 1024).expect("from_vmm");
+
+        // Descriptor triple: Device-stamped, Vram-typed, real device VA.
+        assert_eq!(storage.storage_type(), StorageType::Device(0));
+        assert_eq!(storage.mem_type(), MemType::Vram);
+        assert_eq!(storage.device_id(), 0);
+        assert!(storage.is_devbar_backed());
+        let va = storage.addr();
+        assert_ne!(va, 0);
+
+        // Device-side memset via the Storage API (the Vmm arm).
+        storage.memset(0xCD, 16, 32).unwrap();
+        let mut probe = [0u8; 16];
+        unsafe {
+            assert_eq!(
+                sys::cuMemcpyDtoH_v2(probe.as_mut_ptr() as *mut core::ffi::c_void, va + 16, 16),
+                sys::CUresult::CUDA_SUCCESS
+            );
+        }
+        assert_eq!(probe, [0xCD; 16]);
+
+        // D2D both directions: alias <-> a normal device buffer.
+        let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+        ctx.bind_to_thread().unwrap();
+        let mut dev: sys::CUdeviceptr = 0;
+        unsafe {
+            assert_eq!(
+                sys::cuMemAlloc_v2(&mut dev, 16),
+                sys::CUresult::CUDA_SUCCESS
+            );
+            assert_eq!(
+                sys::cuMemcpyHtoD_v2(va, PATTERN.as_ptr() as *const core::ffi::c_void, 16),
+                sys::CUresult::CUDA_SUCCESS
+            );
+            assert_eq!(
+                sys::cuMemcpyDtoD_v2(dev, va, 16),
+                sys::CUresult::CUDA_SUCCESS
+            );
+            let mut mid = [0u8; 16];
+            assert_eq!(
+                sys::cuMemcpyDtoH_v2(mid.as_mut_ptr() as *mut core::ffi::c_void, dev, 16),
+                sys::CUresult::CUDA_SUCCESS
+            );
+            assert_eq!(&mid, PATTERN);
+            assert_eq!(
+                sys::cuMemcpyDtoD_v2(va, dev, 16),
+                sys::CUresult::CUDA_SUCCESS
+            );
+            let mut back = [0u8; 16];
+            assert_eq!(
+                sys::cuMemcpyDtoH_v2(back.as_mut_ptr() as *mut core::ffi::c_void, va, 16),
+                sys::CUresult::CUDA_SUCCESS
+            );
+            assert_eq!(&back, PATTERN);
+            assert_eq!(sys::cuMemFree_v2(dev), sys::CUresult::CUDA_SUCCESS);
+        }
+
+        // Drop: unmap + address-free + release must not panic or leak (the
+        // re-allocation below proves the physical handle was released).
+        drop(storage);
+        let again = alloc
+            .allocate(8 * 1024 * 1024)
+            .expect("re-allocate after drop");
+        drop(again);
+    }
+}
