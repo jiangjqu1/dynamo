@@ -16,7 +16,11 @@
 //! with the configured device ID for BAR-backed instances (devbar is still GPU
 //! memory), so the serialized descriptor carries the "Device ID + memory type"
 //! triple required by the KVBM design doc's metadata-exchange section. The
-//! pinned fallback reports `MemType::Dram`, matching the existing host tier.
+//! mock region and the pinned fallback report `MemType::Dram` — both are host
+//! memory, and a Vram registration of host memory fails in UCX's cuda
+//! transport on real-GPU hosts. The Vmm backing reports `MemType::Vram` at a
+//! real device VA — semantically correct on every system class (it *is*
+//! device memory), so it needs no per-class probe.
 
 use std::{path::PathBuf, ptr::NonNull};
 
@@ -36,6 +40,10 @@ enum DevbarBacking {
     Mock,
     /// Standard pinned host allocation (fallback when no devbar region is configured).
     Pinned,
+    /// CUDA-VMM device-alias: cuMemCreate'd physical VRAM mapped at a reserved
+    /// GPU VA. Driver-owned (collision-free by construction), native D2D
+    /// transfers; `ptr` is a DEVICE pointer — no CPU access exists.
+    Vmm,
 }
 
 /// BAR-mapped device memory storage for the KVBM tier-2 (host-tier) offloading backend.
@@ -52,6 +60,19 @@ pub struct DevbarStorage {
     handles: RegistrationHandles,
     /// Present only in Pinned fallback mode; owns the pinned allocation.
     pinned: Option<dynamo_memory::PinnedStorage>,
+    /// Present only in Vmm mode; owns the CUDA-VMM allocation and the context
+    /// needed for device-side operations (memset, teardown).
+    vmm: Option<VmmOwn>,
+}
+
+/// Owns the VMM physical handle, the reserved device VA, and the CUDA context
+/// of a Vmm-backed devbar region.
+#[derive(Debug)]
+struct VmmOwn {
+    ctx: std::sync::Arc<cudarc::driver::CudaContext>,
+    handle: cudarc::driver::sys::CUmemGenericAllocationHandle,
+    va: cudarc::driver::sys::CUdeviceptr,
+    size: usize,
 }
 
 // SAFETY: DevbarStorage owns its mapping exclusively; raw-pointer access is
@@ -62,6 +83,16 @@ unsafe impl Sync for DevbarStorage {}
 impl Local for DevbarStorage {}
 impl SystemAccessible for DevbarStorage {}
 impl CudaAccessible for DevbarStorage {}
+
+fn curesult(r: cudarc::driver::sys::CUresult, what: &str) -> Result<(), StorageError> {
+    if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+        Err(StorageError::AllocationFailed(format!(
+            "{what} failed: {r:?}"
+        )))
+    } else {
+        Ok(())
+    }
+}
 
 impl DevbarStorage {
     /// Create a devbar-backed storage by mmapping `size` bytes at `offset` from a
@@ -148,6 +179,7 @@ impl DevbarStorage {
             backing: DevbarBacking::Bar,
             handles: RegistrationHandles::new(),
             pinned: None,
+            vmm: None,
         })
     }
 
@@ -179,6 +211,7 @@ impl DevbarStorage {
             backing: DevbarBacking::Mock,
             handles: RegistrationHandles::new(),
             pinned: None,
+            vmm: None,
         })
     }
 
@@ -195,6 +228,105 @@ impl DevbarStorage {
             backing: DevbarBacking::Pinned,
             handles: RegistrationHandles::new(),
             pinned: Some(inner),
+            vmm: None,
+        })
+    }
+
+    /// Create a devbar-backed storage from a CUDA-VMM device-alias allocation.
+    ///
+    /// `cuMemCreate` reserves physical VRAM that no other cudaMalloc can hand
+    /// out (collision-free by construction); `cuMemMap` maps it at a reserved
+    /// GPU VA. The storage's pointer is a DEVICE pointer — transfers must use
+    /// the D2D strategy (see `TransferContext::host_transfer_adjust`) and
+    /// memset goes device-side; there is no CPU access. Works on C2C and
+    /// PCIe GPUs.
+    pub fn from_vmm(size: usize, device_id: u32) -> Result<Self, StorageError> {
+        if size == 0 {
+            return Err(StorageError::InvalidConfig("vmm size must be > 0".into()));
+        }
+        let ctx = cudarc::driver::CudaContext::new(device_id as usize).map_err(|e| {
+            StorageError::AllocationFailed(format!("CudaContext::new({device_id}) failed: {e}"))
+        })?;
+        ctx.bind_to_thread()
+            .map_err(|e| StorageError::AllocationFailed(format!("bind_to_thread failed: {e}")))?;
+
+        use cudarc::driver::sys;
+        let mut prop: sys::CUmemAllocationProp = unsafe { std::mem::zeroed() };
+        prop.type_ = sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type_ = sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.__bindgen_anon_1.id = device_id as core::ffi::c_int;
+
+        let mut granularity: usize = 0;
+        curesult(
+            unsafe {
+                sys::cuMemGetAllocationGranularity(
+                    &mut granularity,
+                    &prop,
+                    sys::CUmemAllocationGranularity_flags::CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+                )
+            },
+            "cuMemGetAllocationGranularity",
+        )?;
+        let size = size.div_ceil(granularity.max(1)) * granularity.max(1);
+
+        let mut handle: sys::CUmemGenericAllocationHandle = 0;
+        curesult(
+            unsafe { sys::cuMemCreate(&mut handle, size, &prop, 0) },
+            "cuMemCreate",
+        )?;
+        let mut va: sys::CUdeviceptr = 0;
+        if let Err(e) = curesult(
+            unsafe { sys::cuMemAddressReserve(&mut va, size, granularity.max(1), 0, 0) },
+            "cuMemAddressReserve",
+        ) {
+            unsafe { sys::cuMemRelease(handle) };
+            return Err(e);
+        }
+        if let Err(e) = curesult(unsafe { sys::cuMemMap(va, size, 0, handle, 0) }, "cuMemMap") {
+            unsafe {
+                sys::cuMemAddressFree(va, size);
+                sys::cuMemRelease(handle);
+            }
+            return Err(e);
+        }
+        let mut desc: sys::CUmemAccessDesc = unsafe { std::mem::zeroed() };
+        desc.location.type_ = sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+        desc.location.__bindgen_anon_1.id = device_id as core::ffi::c_int;
+        desc.flags = sys::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        if let Err(e) = curesult(
+            unsafe { sys::cuMemSetAccess(va, size, &desc, 1) },
+            "cuMemSetAccess",
+        ) {
+            unsafe {
+                sys::cuMemUnmap(va, size);
+                sys::cuMemAddressFree(va, size);
+                sys::cuMemRelease(handle);
+            }
+            return Err(e);
+        }
+
+        tracing::info!(
+            device_id,
+            size,
+            granularity,
+            va = format!("{va:#x}"),
+            "Using VMM devbar region as tier-2 storage (device-alias, collision-free)"
+        );
+
+        Ok(Self {
+            ptr: NonNull::new(va as *mut u8)
+                .ok_or_else(|| StorageError::AllocationFailed("va was null".into()))?,
+            len: size,
+            device_id,
+            backing: DevbarBacking::Vmm,
+            handles: RegistrationHandles::new(),
+            pinned: None,
+            vmm: Some(VmmOwn {
+                ctx,
+                handle,
+                va,
+                size,
+            }),
         })
     }
 
@@ -207,7 +339,19 @@ impl DevbarStorage {
 impl Drop for DevbarStorage {
     fn drop(&mut self) {
         self.handles.release();
-        if self.pinned.is_none() {
+        if let Some(vmm) = self.vmm.take() {
+            if let Err(e) = vmm.ctx.bind_to_thread() {
+                tracing::error!("vmm drop: bind_to_thread failed: {e}; leaking VMM region");
+                return;
+            }
+            use cudarc::driver::sys;
+            let r = unsafe { sys::cuMemUnmap(vmm.va, vmm.size) };
+            let _ = unsafe { sys::cuMemAddressFree(vmm.va, vmm.size) };
+            let _ = unsafe { sys::cuMemRelease(vmm.handle) };
+            if r != sys::CUresult::CUDA_SUCCESS {
+                tracing::error!("vmm drop: cuMemUnmap failed: {r:?}");
+            }
+        } else if self.pinned.is_none() {
             unsafe {
                 libc::munmap(self.ptr.as_ptr() as *mut libc::c_void, self.len);
             }
@@ -219,11 +363,16 @@ impl Drop for DevbarStorage {
 impl Storage for DevbarStorage {
     fn storage_type(&self) -> StorageType {
         match self.backing {
-            // Devbar (BAR-mapped / mock) is device memory: the Device variant
-            // keeps nixl_mem_type() => MemType::Vram consistent with the
-            // NixlDescriptor below, and avoids adding a new serialized
-            // StorageType variant on the worker->peer layout wire.
-            DevbarBacking::Bar | DevbarBacking::Mock => StorageType::Device(self.device_id),
+            // Devbar (BAR-mapped / mock / VMM) pools stay Device on the
+            // layout wire: no new serialized StorageType variant, and the
+            // TypeId-keyed CUDA transfer arms keep routing devbar D2H/H2D.
+            // For Vmm the Device stamp is additionally literally true (the
+            // memory is device-resident at a real device VA). The registered
+            // NIXL memory type comes from NixlDescriptor::mem_type (Vram for
+            // Bar and Vmm, Dram for mock/pinned).
+            DevbarBacking::Bar | DevbarBacking::Mock | DevbarBacking::Vmm => {
+                StorageType::Device(self.device_id)
+            }
             // Pinned fallback is byte-for-byte identical to the existing
             // PinnedStorage host tier: StorageType::Pinned keeps
             // nixl_mem_type() => MemType::Dram consistent with the pool-level
@@ -261,9 +410,29 @@ impl StorageMemset for DevbarStorage {
                 "memset: offset + size > storage size".into(),
             ));
         }
-        unsafe {
-            let ptr = self.ptr.as_ptr().add(offset);
-            std::ptr::write_bytes(ptr, value, size);
+        match self.backing {
+            DevbarBacking::Vmm => {
+                let Some(vmm) = self.vmm.as_ref() else {
+                    return Err(StorageError::OperationFailed(
+                        "vmm backing without state".into(),
+                    ));
+                };
+                vmm.ctx
+                    .bind_to_thread()
+                    .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
+                use cudarc::driver::sys;
+                let dst = (self.ptr.as_ptr() as u64) + offset as u64;
+                let r = unsafe { sys::cuMemsetD8_v2(dst, value, size) };
+                if r != sys::CUresult::CUDA_SUCCESS {
+                    return Err(StorageError::OperationFailed(format!(
+                        "cuMemsetD8_v2 failed: {r:?}"
+                    )));
+                }
+            }
+            _ => unsafe {
+                let ptr = self.ptr.as_ptr().add(offset);
+                std::ptr::write_bytes(ptr, value, size);
+            },
         }
         Ok(())
     }
@@ -305,10 +474,20 @@ impl MemoryRegion for DevbarStorage {
 impl NixlDescriptor for DevbarStorage {
     fn mem_type(&self) -> MemType {
         match self.backing {
-            // Devbar (BAR-mapped / mock) is still GPU memory; the serialized
-            // descriptor carries "Device ID + memory type" exactly as the KVBM
-            // design doc's metadata-exchange section specifies.
-            DevbarBacking::Bar | DevbarBacking::Mock => MemType::Vram,
+            // The Vmm region IS device memory at a real device VA — Vram is
+            // semantically correct on every system class; no per-class probe.
+            DevbarBacking::Vmm => MemType::Vram,
+            // The BAR-mapped region is GPU memory: the serialized descriptor
+            // carries the "Device ID + memory type" triple of the KVBM design
+            // doc's metadata-exchange section. (PCIe caveat: UCX's cuda
+            // transport cannot map the raw sysfs mmap as Vram on PCIe-only
+            // GPUs — Bar mode is a C2C-targeted mechanism; the Vmm backing
+            // added in this branch is the PCIe answer.)
+            DevbarBacking::Bar => MemType::Vram,
+            // The mock region is an anonymous host mapping, not device
+            // memory: a Vram registration of host memory fails in UCX's
+            // cuda transport on real-GPU hosts ("Backend error occurred").
+            DevbarBacking::Mock => MemType::Dram,
             // Pinned fallback behaves like the existing host tier.
             DevbarBacking::Pinned => MemType::Dram,
         }
@@ -325,6 +504,8 @@ impl NixlDescriptor for DevbarStorage {
 /// - `DYN_KVBM_DEVBAR_BDF=<bdf>` — mmap the BAR aperture of that PCI device
 ///   (e.g. `0000:1f:00.0` -> `/sys/bus/pci/devices/0000:1f:00.0/resource0`)
 /// - `DYN_KVBM_DEVBAR_MOCK=1` — anonymous mapping (plumbing tests without hardware)
+/// - `DYN_KVBM_DEVBAR_VMM=1` — CUDA-VMM device-alias allocation (cuMemCreate +
+///   cuMemMap at a reserved GPU VA); mock wins over VMM, VMM wins over BDF
 /// - When both `DYN_KVBM_DEVBAR_MOCK=1` and `DYN_KVBM_DEVBAR_BDF` are set, the mock region wins.
 /// - otherwise — standard pinned host allocation (default deployments unaffected)
 ///
@@ -341,6 +522,7 @@ pub struct DevbarAllocator {
 enum DevbarRegion {
     Bar { path: PathBuf, offset: u64 },
     Mock,
+    Vmm,
 }
 
 impl DevbarAllocator {
@@ -355,6 +537,17 @@ impl DevbarAllocator {
             tracing::info!("Using mock devbar region (anonymous mapping) as tier-2 storage");
             return Ok(Self {
                 region: Some(DevbarRegion::Mock),
+                device_id,
+            });
+        }
+
+        if std::env::var(env_devbar::DYN_KVBM_DEVBAR_VMM).is_ok_and(|v| v == "1") {
+            tracing::info!(
+                device_id,
+                "Using VMM devbar region (CUDA-managed, collision-free) as tier-2 storage"
+            );
+            return Ok(Self {
+                region: Some(DevbarRegion::Vmm),
                 device_id,
             });
         }
@@ -401,17 +594,26 @@ impl DevbarAllocator {
     }
 
     /// The [`StorageType`] that blocks of this allocator's backing carry:
-    /// `Device(device_id)` for a BAR-mapped or mock devbar region (devbar is
-    /// still GPU memory), `Pinned` for the standard pinned fallback (identical
-    /// to today's host tier). Matches [`DevbarStorage::storage_type`] for
-    /// every backing this allocator can produce; host-tier block factories
-    /// stamp this so block-level NIXL mem types stay consistent with the
-    /// pool-level registration.
+    /// `Device(device_id)` for a BAR-mapped or mock devbar region, `Pinned`
+    /// for the standard pinned fallback (identical to today's host tier).
+    /// Matches [`DevbarStorage::storage_type`] for every backing this
+    /// allocator can produce; host-tier block factories stamp this.
+    /// Exception to block-level/pool-level mem-type consistency: mock blocks
+    /// stamp `Device` (wire semantics) while the pool-level registration is
+    /// deliberately `Dram` (UCX rejects a Vram registration of host memory);
+    /// Bar and pinned-fallback backings are consistent at both levels.
     pub fn host_storage_type(&self) -> StorageType {
         match &self.region {
             Some(_) => StorageType::Device(self.device_id),
             None => StorageType::Pinned,
         }
+    }
+
+    /// True when this allocator's region is a VMM device-alias — the tier-2
+    /// memory is device-resident and its transfers must use the D2D strategy
+    /// (see `TransferContext::host_transfer_adjust`).
+    pub fn is_device_aliased(&self) -> bool {
+        matches!(self.region, Some(DevbarRegion::Vmm))
     }
 }
 
@@ -422,6 +624,7 @@ impl StorageAllocator<DevbarStorage> for DevbarAllocator {
                 DevbarStorage::from_bar(path.clone(), *offset, size, self.device_id)
             }
             Some(DevbarRegion::Mock) => DevbarStorage::mock(size, self.device_id),
+            Some(DevbarRegion::Vmm) => DevbarStorage::from_vmm(size, self.device_id),
             None => DevbarStorage::pinned_fallback(size, Some(self.device_id)),
         }
     }
@@ -439,13 +642,15 @@ mod tests {
         assert_eq!(Storage::size(&storage), 4096);
         assert_ne!(storage.addr(), 0, "Address should be non-zero");
         assert!(storage.is_devbar_backed());
-        // Devbar is device memory: the StorageType stays Device so
-        // nixl_mem_type() => Vram stays consistent with NixlDescriptor.
+        // The mock region is an anonymous HOST mapping: StorageType stays
+        // Device (pool/wire semantics unchanged), but the NIXL descriptor
+        // must report Dram — UCX's cuda transport rejects a Vram
+        // registration of host memory on real-GPU hosts.
         assert_eq!(storage.storage_type(), StorageType::Device(3));
         // The descriptor triple required by the KVBM design doc:
         // address + size, device ID, memory type.
         assert_eq!(storage.device_id(), 3);
-        assert_eq!(storage.mem_type(), MemType::Vram);
+        assert_eq!(storage.mem_type(), MemType::Dram);
 
         unsafe {
             let ptr = storage.as_mut_ptr();
@@ -513,6 +718,31 @@ mod tests {
         let err = DevbarStorage::from_bar(file.path().to_path_buf(), 1, 512, 7)
             .expect_err("unaligned offset must be rejected");
         assert!(matches!(err, StorageError::InvalidConfig(_)));
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `DYN_KVBM_DEVBAR_VMM=1` selects the Vmm region; mock wins over VMM;
+    /// VMM alone (no BDF) selects Vmm; nothing set = pinned fallback.
+    #[test]
+    fn from_env_selects_vmm_region() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: devbar env vars are only read by devbar code and this test;
+        // ENV_LOCK guards against parallel env mutation within this module.
+        unsafe { std::env::set_var("DYN_KVBM_DEVBAR_VMM", "1") };
+        let alloc = DevbarAllocator::from_env().unwrap();
+        assert!(matches!(alloc.region, Some(DevbarRegion::Vmm)));
+        unsafe { std::env::set_var("DYN_KVBM_DEVBAR_MOCK", "1") };
+        let alloc = DevbarAllocator::from_env().unwrap();
+        assert!(matches!(alloc.region, Some(DevbarRegion::Mock)));
+        unsafe { std::env::remove_var("DYN_KVBM_DEVBAR_MOCK") };
+        let alloc = DevbarAllocator::from_env().unwrap();
+        assert!(matches!(alloc.region, Some(DevbarRegion::Vmm)));
+        assert!(alloc.is_device_aliased());
+        unsafe { std::env::remove_var("DYN_KVBM_DEVBAR_VMM") };
+        let alloc = DevbarAllocator::from_env().unwrap();
+        assert!(alloc.region.is_none());
+        assert!(!alloc.is_device_aliased());
     }
 }
 
