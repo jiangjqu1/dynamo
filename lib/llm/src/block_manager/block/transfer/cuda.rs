@@ -557,11 +557,11 @@ where
 }
 
 /// The executor-side strategy check for a copy: host-pointer devbar
-/// backings (Pinned/Mock/Bar) use H2D/D2H; the Vmm device-alias uses D2D
-/// (see `TransferContext::host_transfer_adjust`); raw-MMIO host tiers use
-/// the staged variants (`CudaStagedH2D`/`CudaStagedD2H`), whose CPU legs
-/// hand the window VA to no CUDA call. Asserts membership for devbar
-/// pairs, not the exact variant.
+/// backings (Pinned/Mock) use H2D/D2H; the Vmm device-alias uses D2D
+/// (see `TransferContext::host_transfer_adjust`); raw-MMIO Bar/Bdf host
+/// tiers use the staged variants (`CudaStagedH2D`/`CudaStagedD2H`), whose
+/// CPU legs hand the window VA to no CUDA call. Asserts membership for
+/// devbar pairs, not the exact variant.
 #[cfg(debug_assertions)]
 fn assert_strategy_valid<Source: StorageTypeProvider, Destination: StorageTypeProvider>(
     strategy: TransferStrategy,
@@ -614,7 +614,8 @@ fn expected_strategy<Source: Storage, Dest: Storage>() -> TransferStrategy {
             if src == std::any::TypeId::of::<DevbarStorage>()
                 && dst == std::any::TypeId::of::<DeviceStorage>() =>
         {
-            // Default (host-pointer backings: Pinned/Mock/Bar): H2D. The Vmm
+            // Default (host-pointer backings: Pinned/Mock — Bar/Bdf
+            // raw-MMIO tiers stage via the same adjustment): H2D. The Vmm
             // device-alias runs D2D via `TransferContext::host_transfer_adjust`.
             TransferStrategy::CudaAsyncH2D
         }

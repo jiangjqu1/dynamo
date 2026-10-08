@@ -749,8 +749,15 @@ impl DevbarAllocator {
                     .as_deref()
                     .unwrap_or("auto")
                 {
+                    "auto" | "staged" => S::StagedCpu,
                     "direct" => S::HostPointer,
-                    _ => S::StagedCpu,
+                    other => {
+                        tracing::warn!(
+                            value = other,
+                            "unrecognized DYN_KVBM_DEVBAR_TRANSFERS; using staged (default)"
+                        );
+                        S::StagedCpu
+                    }
                 }
             }
             _ => S::HostPointer,

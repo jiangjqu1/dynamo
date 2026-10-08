@@ -207,9 +207,10 @@ where
 
     let (tx, rx) = oneshot::channel();
 
-    // The compile-time strategy, adjusted for a device-aliased host tier:
-    // when the host tier is a VMM device-alias, its H2D/D2H copies must run
-    // D2D (see `TransferContext::host_transfer_adjust`).
+    // The compile-time strategy, adjusted for the host tier's transfer
+    // semantics: a VMM device-alias runs its H2D/D2H copies D2D; a raw-MMIO
+    // Bar/Bdf tier stages them through a pinned bounce (see
+    // `TransferContext::host_transfer_adjust`).
     let strategy = ctx.host_transfer_adjust(RB::write_to_strategy());
 
     match strategy {
