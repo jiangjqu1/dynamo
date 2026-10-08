@@ -12,7 +12,7 @@ use crate::block_manager::{
     BasicMetadata, BlockMetadata, LayoutConfigBuilder, NixlLayout, Storage,
     block::{
         Block, layout_to_blocks, locality,
-        transfer::{HostTransferSemantics, PoolConfig, TransferContext},
+        transfer::{PoolConfig, TransferContext},
     },
     connector::scheduler::TransferSchedulerClient,
     layout::LayoutType,
@@ -151,15 +151,13 @@ async fn perform_allocation_and_build_handler(
         num_layers: device_layout.config().num_layers,
     };
     // Host (G2 / tier-2) allocator, built before the transfer context so its
-    // backing can set the context's host-transfer semantics (a VMM
-    // device-alias devbar region transfers via D2D). The pool itself is only
-    // allocated below when should_allocate_offload.
+    // backing's transfer_semantics() can set the context's host-transfer
+    // semantics: DeviceAlias for a VMM region, StagedCpu for a Bar/Bdf region
+    // on a raw sysfs MMIO aperture (staged default; `direct` opt-in),
+    // HostPointer otherwise. The pool itself is only allocated below when
+    // should_allocate_offload.
     let host_allocator = Arc::new(DevbarAllocator::from_env()?);
-    let host_transfer_semantics = if host_allocator.is_device_aliased() {
-        HostTransferSemantics::DeviceAlias
-    } else {
-        HostTransferSemantics::HostPointer
-    };
+    let host_transfer_semantics = host_allocator.transfer_semantics();
     let mut transfer_context = TransferContext::new(
         Arc::new(Some(agent)),
         DeviceAllocator::new(device_id)?.ctx().new_stream()?,

@@ -35,7 +35,7 @@
 use super::block::{
     BlockError, BlockMetadata, BlockState, ImmutableBlock, MutableBlock,
     locality::LocalityProvider,
-    transfer::{HostTransferSemantics, PoolConfig, TransferContext},
+    transfer::{PoolConfig, TransferContext},
 };
 use super::pool::{BlockPool, BlockPoolError};
 use super::storage::{Cuda, Storage};
@@ -212,13 +212,12 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
 
         // The host pool in this path is always a DevbarStorage-backed pool;
         // derive the host-transfer semantics from the same env selection the
-        // host factory uses (a VMM device-alias devbar region transfers via
-        // D2D).
-        let host_transfer_semantics = if DevbarAllocator::from_env()?.is_device_aliased() {
-            HostTransferSemantics::DeviceAlias
-        } else {
-            HostTransferSemantics::HostPointer
-        };
+        // host factory uses. The semantics enum covers the staged Bar path:
+        // DeviceAlias for a VMM region, StagedCpu for a Bar/Bdf region on a
+        // raw sysfs MMIO aperture (staged default; `direct` opt-in),
+        // HostPointer otherwise. One derivation feeds both
+        // set_host_transfer_semantics calls below.
+        let host_transfer_semantics = DevbarAllocator::from_env()?.transfer_semantics();
 
         // We want cuda offloads to happen in parallel with host onboards, so we need to use a different stream.
         let device_offload_transfer_ctx = {
