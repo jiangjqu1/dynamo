@@ -684,6 +684,10 @@ mod tests {
             T::CudaStagedD2H
         );
         assert_eq!(
+            HostTransferSemantics::StagedCpu.adjust(T::CudaAsyncD2D),
+            T::CudaAsyncD2D
+        );
+        assert_eq!(
             HostTransferSemantics::StagedCpu.adjust(T::Memcpy),
             T::Memcpy
         );

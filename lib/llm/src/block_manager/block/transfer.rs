@@ -271,6 +271,12 @@ where
             });
             Ok(rx)
         }
+        TransferStrategy::CudaStagedH2D | TransferStrategy::CudaStagedD2H => {
+            tracing::debug!("Transfer: Using staged-CPU strategy: {:?}", strategy);
+            cuda::staged_write_blocks_to(sources, targets, &ctx, strategy)?;
+            tx.send(()).unwrap();
+            Ok(rx)
+        }
         _ => Err(TransferError::IncompatibleTypes(format!(
             "Unsupported copy strategy: {:?}",
             strategy

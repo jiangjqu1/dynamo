@@ -342,6 +342,157 @@ where
     Ok(())
 }
 
+/// Staged batch copy for raw-MMIO host tiers (the BAR-aperture expander
+/// path): the driver permits no GPU-side access to the window, so every
+/// block stages through a pinned bounce with CPU memcpy legs. Fully
+/// synchronous — the whole batch completes before returning (see the
+/// `Memcpy` arm's precedent in `handle_local_transfer`).
+///
+/// Xid-31 safety invariant: no CUDA call ever touches the window VA. The
+/// CPU legs move data window↔bounce; the DMAs move data bounce↔device only.
+pub fn staged_write_blocks_to<Source, Target>(
+    sources: &[Source],
+    targets: &mut [Target],
+    ctx: &Arc<TransferContext>,
+    direction: TransferStrategy,
+) -> Result<(), TransferError>
+where
+    Source: BlockDataProvider,
+    Target: BlockDataProviderMut,
+{
+    if sources.is_empty() && targets.is_empty() {
+        return Ok(());
+    }
+
+    if sources.len() != targets.len() {
+        return Err(TransferError::CountMismatch(sources.len(), targets.len()));
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        assert_strategy_valid::<Source, Target>(direction);
+    }
+
+    // Per-block view sizes, collected once: a block view covers the whole
+    // block, so `size` is the block's total byte size.
+    let mut sizes = Vec::with_capacity(sources.len());
+    let mut total = 0usize;
+    for src in sources {
+        let size = src.block_data().block_view().map(|v| v.size()).unwrap_or(0);
+        sizes.push(size);
+        total += size;
+    }
+
+    // One pinned bounce covering the whole batch. Per-batch allocation is
+    // acceptable for v1; pooling is a follow-up.
+    let mut bounce = dynamo_memory::PinnedStorage::new_for_device(total, None)
+        .map_err(|e| TransferError::ExecutionError(format!("staged bounce alloc: {e}")))?;
+    // SAFETY: `bounce_base` aliases the pinned buffer for the writes below;
+    // it stays valid until `bounce` is dropped, after every DMA completes.
+    let bounce_base = unsafe { bounce.as_mut_ptr() };
+
+    let stream = ctx.stream();
+
+    match direction {
+        TransferStrategy::CudaStagedH2D => {
+            // CPU legs: window -> bounce. CPU reads/writes are the only
+            // access the raw MMIO window permits (a device-side copy faults
+            // with Xid 31), so these legs never touch CUDA.
+            let mut offset = 0usize;
+            for src in sources {
+                let s_view = src.block_data().block_view()?;
+                // SAFETY: `s_view` covers `size` readable bytes and the
+                // bounce has `total >= offset + size` writable bytes; the
+                // regions do not overlap.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        s_view.as_ptr(),
+                        bounce_base.add(offset),
+                        s_view.size(),
+                    )
+                };
+                offset += s_view.size();
+            }
+
+            // DMA legs: bounce -> device, async on the stream.
+            let mut offset = 0usize;
+            for (idx, dst) in targets.iter_mut().enumerate() {
+                let size = sizes[idx];
+                let mut d_view = dst.block_data_mut().block_view_mut()?;
+                debug_assert_eq!(d_view.size(), size);
+                // SAFETY: the bounce holds `size` readable bytes at `offset`
+                // and `d_view` covers `size` writable device bytes; the
+                // regions do not overlap.
+                unsafe {
+                    cuda_memcpy_h2d(bounce_base.add(offset), d_view.as_mut_ptr(), size, stream)
+                }?;
+                offset += size;
+            }
+
+            // The async DMAs are still reading the bounce when they return;
+            // wait before the bounce drops.
+            let event = stream
+                .record_event(Some(CUevent_flags::CU_EVENT_BLOCKING_SYNC))
+                .map_err(|e| {
+                    TransferError::ExecutionError(format!("Failed to record staged H2D event: {e}"))
+                })?;
+            event.synchronize().map_err(|e| {
+                TransferError::ExecutionError(format!("Failed to sync staged H2D event: {e}"))
+            })?;
+        }
+        TransferStrategy::CudaStagedD2H => {
+            // DMA legs first: device -> bounce, async on the stream.
+            let mut offset = 0usize;
+            for (idx, src) in sources.iter().enumerate() {
+                let size = sizes[idx];
+                let s_view = src.block_data().block_view()?;
+                // SAFETY: `s_view` covers `size` readable device bytes and
+                // the bounce has `total >= offset + size` writable bytes; the
+                // regions do not overlap.
+                unsafe { cuda_memcpy_d2h(s_view.as_ptr(), bounce_base.add(offset), size, stream) }?;
+                offset += size;
+            }
+
+            // The CPU legs must not read the bounce until the DMAs complete.
+            let event = stream
+                .record_event(Some(CUevent_flags::CU_EVENT_BLOCKING_SYNC))
+                .map_err(|e| {
+                    TransferError::ExecutionError(format!("Failed to record staged D2H event: {e}"))
+                })?;
+            event.synchronize().map_err(|e| {
+                TransferError::ExecutionError(format!("Failed to sync staged D2H event: {e}"))
+            })?;
+
+            // CPU legs: bounce -> window. The target window is host memory —
+            // CPU writes are exactly where tier-2 data belongs.
+            let mut offset = 0usize;
+            for (idx, dst) in targets.iter_mut().enumerate() {
+                let size = sizes[idx];
+                let mut d_view = dst.block_data_mut().block_view_mut()?;
+                debug_assert_eq!(d_view.size(), size);
+                // SAFETY: the bounce holds `size` readable bytes at `offset`
+                // and `d_view` covers the same writable bytes; the regions do
+                // not overlap.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bounce_base.add(offset),
+                        d_view.as_mut_ptr(),
+                        size,
+                    )
+                };
+                offset += size;
+            }
+        }
+        _ => {
+            return Err(TransferError::ExecutionError(
+                "staged executor: not a staged direction".into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Copy a range of layers from a source to a destination using CUDA memcpy
 pub fn copy_layers<'a, Source, Destination>(
     layer_range: Range<usize>,
@@ -385,8 +536,10 @@ where
 
 /// The executor-side strategy check for a copy: host-pointer devbar
 /// backings (Pinned/Mock/Bar) use H2D/D2H; the Vmm device-alias uses D2D
-/// (see `TransferContext::host_transfer_adjust`). Asserts membership for
-/// devbar pairs, not the exact variant.
+/// (see `TransferContext::host_transfer_adjust`); raw-MMIO host tiers use
+/// the staged variants (`CudaStagedH2D`/`CudaStagedD2H`), whose CPU legs
+/// hand the window VA to no CUDA call. Asserts membership for devbar
+/// pairs, not the exact variant.
 #[cfg(debug_assertions)]
 fn assert_strategy_valid<Source: StorageTypeProvider, Destination: StorageTypeProvider>(
     strategy: TransferStrategy,
@@ -402,8 +555,10 @@ fn assert_strategy_valid<Source: StorageTypeProvider, Destination: StorageTypePr
                 TransferStrategy::CudaAsyncH2D
                     | TransferStrategy::CudaAsyncD2H
                     | TransferStrategy::CudaAsyncD2D
+                    | TransferStrategy::CudaStagedH2D
+                    | TransferStrategy::CudaStagedD2H
             ),
-            "devbar pair strategy must be H2D/D2H/D2D, got {strategy:?}"
+            "devbar pair strategy must be H2D/D2H/D2D/staged, got {strategy:?}"
         );
     } else {
         assert_eq!(
