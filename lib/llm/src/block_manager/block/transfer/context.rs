@@ -174,22 +174,34 @@ pub struct PoolConfig {
 /// CUDA copy kind for (host-tier ↔ Device) pairs:
 /// - `HostPointer` (default; Pinned/Mock/Bar-direct): ordinary H2D/D2H.
 /// - `DeviceAlias` (Vmm backing): the "host" pointer is a device VA — D2D.
+/// - `StagedCpu` (Bar on a raw sysfs MMIO aperture): the driver permits no
+///   GPU-side access (Xid 31, sticky) — copies stage through a pinned
+///   bounce with CPU memcpy legs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HostTransferSemantics {
     #[default]
     HostPointer,
     DeviceAlias,
+    StagedCpu,
 }
 
 impl HostTransferSemantics {
     /// The strategy adjustment this semantics implies for a compile-time
     /// strategy: DeviceAlias turns H2D/D2H into D2D (the "host" pointer is a
-    /// device VA); every other combination is the identity.
+    /// device VA); StagedCpu turns H2D/D2H into staged CPU bounce copies (the
+    /// raw-MMIO window has no GPU-side access); every other combination is
+    /// the identity.
     pub fn adjust(self, strategy: TransferStrategy) -> TransferStrategy {
         match (self, strategy) {
             (HostTransferSemantics::DeviceAlias, TransferStrategy::CudaAsyncH2D)
             | (HostTransferSemantics::DeviceAlias, TransferStrategy::CudaAsyncD2H) => {
                 TransferStrategy::CudaAsyncD2D
+            }
+            (HostTransferSemantics::StagedCpu, TransferStrategy::CudaAsyncH2D) => {
+                TransferStrategy::CudaStagedH2D
+            }
+            (HostTransferSemantics::StagedCpu, TransferStrategy::CudaAsyncD2H) => {
+                TransferStrategy::CudaStagedD2H
             }
             _ => strategy,
         }
@@ -662,6 +674,18 @@ mod tests {
         assert_eq!(
             HostTransferSemantics::HostPointer.adjust(T::CudaBlockingD2H),
             T::CudaBlockingD2H
+        );
+        assert_eq!(
+            HostTransferSemantics::StagedCpu.adjust(T::CudaAsyncH2D),
+            T::CudaStagedH2D
+        );
+        assert_eq!(
+            HostTransferSemantics::StagedCpu.adjust(T::CudaAsyncD2H),
+            T::CudaStagedD2H
+        );
+        assert_eq!(
+            HostTransferSemantics::StagedCpu.adjust(T::Memcpy),
+            T::Memcpy
         );
     }
 }
