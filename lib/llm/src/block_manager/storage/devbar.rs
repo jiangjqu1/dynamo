@@ -12,17 +12,23 @@
 //!
 //! ## NIXL registration
 //!
-//! [`DevbarStorage`] implements [`NixlDescriptor`] returning `MemType::Vram`
-//! with the configured device ID for BAR-backed instances (devbar is still GPU
-//! memory), so the serialized descriptor carries the "Device ID + memory type"
-//! triple required by the KVBM design doc's metadata-exchange section. The
+//! [`DevbarStorage`] implements [`NixlDescriptor`] following
+//! `DYN_KVBM_DEVBAR_MEM_TYPE` for BAR-backed instances — auto/dram (default;
+//! the 2026-10-04 evidence: a Vram registration of the raw sysfs mmap fails at
+//! ucp_mem_map with EIO on PCIe) or vram for peer-mapped products — with the
+//! configured device ID, so the serialized descriptor carries the
+//! "Device ID + memory type" triple required by the KVBM design doc's
+//! metadata-exchange section. The
 //! mock region and the pinned fallback report `MemType::Dram` — both are host
 //! memory, and a Vram registration of host memory fails in UCX's cuda
 //! transport on real-GPU hosts. The Vmm backing reports `MemType::Vram` at a
 //! real device VA — semantically correct on every system class (it *is*
 //! device memory), so it needs no per-class probe.
 
-use std::{path::PathBuf, ptr::NonNull};
+use std::{
+    path::{Path, PathBuf},
+    ptr::NonNull,
+};
 
 use super::nixl::{MemType, MemoryRegion, NixlAccessible, NixlDescriptor, NixlRegisterableStorage};
 use super::{
@@ -50,8 +56,9 @@ enum DevbarBacking {
 /// BAR-mapped device memory storage for the KVBM tier-2 (host-tier) offloading backend.
 ///
 /// Mirrors [`super::PinnedStorage`] but is backed by a host-mapped BAR aperture
-/// (`/sys/bus/pci/devices/<bdf>/resource0` mmap), an anonymous mock mapping, or —
-/// when no devbar region is configured — standard pinned allocation.
+/// (`/sys/bus/pci/devices/<bdf>/resource{N}` mmap, auto-selected or explicit),
+/// an anonymous mock mapping, or — when no devbar region is configured —
+/// standard pinned allocation.
 #[derive(Debug)]
 pub struct DevbarStorage {
     ptr: NonNull<u8>,
@@ -371,8 +378,9 @@ impl Storage for DevbarStorage {
             // TypeId-keyed CUDA transfer arms keep routing devbar D2H/H2D.
             // For Vmm the Device stamp is additionally literally true (the
             // memory is device-resident at a real device VA). The registered
-            // NIXL memory type comes from NixlDescriptor::mem_type (Vram for
-            // Bar and Vmm, Dram for mock/pinned).
+            // NIXL memory type comes from NixlDescriptor::mem_type (Bar
+            // follows DYN_KVBM_DEVBAR_MEM_TYPE; Vram for Vmm, Dram for
+            // mock/pinned).
             DevbarBacking::Bar | DevbarBacking::Mock | DevbarBacking::Vmm => {
                 StorageType::Device(self.device_id)
             }
@@ -479,13 +487,20 @@ impl NixlDescriptor for DevbarStorage {
             // The Vmm region IS device memory at a real device VA — Vram is
             // semantically correct on every system class; no per-class probe.
             DevbarBacking::Vmm => MemType::Vram,
-            // The BAR-mapped region is GPU memory: the serialized descriptor
-            // carries the "Device ID + memory type" triple of the KVBM design
-            // doc's metadata-exchange section. (PCIe caveat: UCX's cuda
-            // transport cannot map the raw sysfs mmap as Vram on PCIe-only
-            // GPUs — Bar mode is a C2C-targeted mechanism; the Vmm backing
-            // is the PCIe answer.)
-            DevbarBacking::Bar => MemType::Vram,
+            // The BAR-mapped region: the NIXL mem type follows
+            // DYN_KVBM_DEVBAR_MEM_TYPE — auto/dram (default; the
+            // 2026-10-04 evidence — a Vram registration of the raw sysfs
+            // mmap fails at ucp_mem_map with EIO on PCIe) or vram for
+            // peer-mapped products.
+            DevbarBacking::Bar => {
+                match std::env::var(env_devbar::DYN_KVBM_DEVBAR_MEM_TYPE)
+                    .as_deref()
+                    .unwrap_or("auto")
+                {
+                    "vram" => MemType::Vram,
+                    _ => MemType::Dram,
+                }
+            }
             // The mock region is an anonymous host mapping, not device
             // memory: a Vram registration of host memory fails in UCX's
             // cuda transport on real-GPU hosts ("Backend error occurred").
@@ -503,8 +518,11 @@ impl NixlDescriptor for DevbarStorage {
 /// Allocator for [`DevbarStorage`].
 ///
 /// Selects the backing from the environment:
-/// - `DYN_KVBM_DEVBAR_BDF=<bdf>` — mmap the BAR aperture of that PCI device
-///   (e.g. `0000:1f:00.0` -> `/sys/bus/pci/devices/0000:1f:00.0/resource0`)
+/// - `DYN_KVBM_DEVBAR_BDF=<bdf>` — mmap the BAR aperture of that PCI device;
+///   the sysfs resource file is resolved at `allocate()` time
+///   (smallest O_RDWR-openable `resource{N}` that fits the tier-2 size), or
+///   `DYN_KVBM_DEVBAR_RESOURCE_INDEX=<n>` pins the index explicitly
+///   (e.g. `0000:41:00.0` -> `/sys/bus/pci/devices/0000:41:00.0/resourceN`)
 /// - `DYN_KVBM_DEVBAR_MOCK=1` — anonymous mapping (plumbing tests without hardware)
 /// - `DYN_KVBM_DEVBAR_VMM=1` — CUDA-VMM device-alias allocation (cuMemCreate +
 ///   cuMemMap at a reserved GPU VA); mock wins over VMM, VMM wins over BDF
@@ -521,9 +539,74 @@ pub struct DevbarAllocator {
 
 #[derive(Debug, Clone)]
 enum DevbarRegion {
-    Bar { path: PathBuf, offset: u64 },
+    /// Explicit BAR aperture file (constructor / tests).
+    Bar {
+        path: PathBuf,
+        offset: u64,
+    },
+    /// BDF-selected aperture: the sysfs resource file is resolved at
+    /// `allocate()` time via `select_resource_file` (needs the tier-2
+    /// size, which only exists there). `explicit_index` comes from
+    /// `DYN_KVBM_DEVBAR_RESOURCE_INDEX`.
+    Bdf {
+        bdf: String,
+        offset: u64,
+        explicit_index: Option<u32>,
+    },
     Mock,
     Vmm,
+}
+
+/// Pick the BAR aperture file for `bdf`: the explicit index when set, else
+/// the smallest O_RDWR-openable `resource{N}` whose size >= `tier2_size`
+/// (the 16-MiB control BAR never fits a real tier-2). `sysfs_root` enables
+/// tests; production callers pass "/sys/bus/pci/devices".
+fn select_resource_file(
+    bdf: &str,
+    tier2_size: usize,
+    explicit_index: Option<u32>,
+    sysfs_root: &Path,
+) -> Result<PathBuf, StorageError> {
+    if let Some(idx) = explicit_index {
+        let p = sysfs_root.join(bdf).join(format!("resource{idx}"));
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&p)
+            .map_err(|e| {
+                StorageError::InvalidConfig(format!("cannot open {}: {e}", p.display()))
+            })?;
+        let len = f
+            .metadata()
+            .map_err(|e| StorageError::InvalidConfig(e.to_string()))?
+            .len();
+        if (len as usize) < tier2_size {
+            return Err(StorageError::InvalidConfig(format!(
+                "{} is {len} bytes < tier-2 {tier2_size}; set DYN_KVBM_DEVBAR_RESOURCE_INDEX",
+                p.display()
+            )));
+        }
+        return Ok(p);
+    }
+    let mut candidates: Vec<(u64, PathBuf)> = Vec::new();
+    for idx in 0..16 {
+        let p = sysfs_root.join(bdf).join(format!("resource{idx}"));
+        let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open(&p) else {
+            continue;
+        };
+        let Ok(meta) = f.metadata() else { continue };
+        if meta.len() as usize >= tier2_size {
+            candidates.push((meta.len(), p));
+        }
+    }
+    candidates.sort();
+    candidates.first().map(|(_, p)| p.clone()).ok_or_else(|| {
+        StorageError::InvalidConfig(format!(
+            "no O_RDWR resource{{N}} >= {tier2_size} bytes under {}/{}",
+            sysfs_root.display(),
+            bdf
+        ))
+    })
 }
 
 impl DevbarAllocator {
@@ -554,20 +637,29 @@ impl DevbarAllocator {
         }
 
         if let Ok(bdf) = std::env::var(env_devbar::DYN_KVBM_DEVBAR_BDF) {
-            let path = PathBuf::from(format!("/sys/bus/pci/devices/{bdf}/resource0"));
             let offset = std::env::var(env_devbar::DYN_KVBM_DEVBAR_OFFSET)
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
+            let explicit_index = std::env::var(env_devbar::DYN_KVBM_DEVBAR_RESOURCE_INDEX)
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok());
+            // No sysfs access here: the aperture file is resolved at
+            // allocate() time, when the tier-2 size is known (from_env must
+            // succeed on machines without the device).
             tracing::info!(
                 bdf,
-                path = %path.display(),
                 offset,
+                explicit_index = ?explicit_index,
                 device_id,
-                "Using devbar region as tier-2 storage"
+                "Using devbar region as tier-2 storage (aperture resolved at allocate time)"
             );
             return Ok(Self {
-                region: Some(DevbarRegion::Bar { path, offset }),
+                region: Some(DevbarRegion::Bdf {
+                    bdf,
+                    offset,
+                    explicit_index,
+                }),
                 device_id,
             });
         }
@@ -625,6 +717,30 @@ impl DevbarAllocator {
     pub fn is_device_aliased(&self) -> bool {
         matches!(self.region, Some(DevbarRegion::Vmm))
     }
+
+    /// The transfer semantics this allocator's backing requires, honoring
+    /// the `DYN_KVBM_DEVBAR_TRANSFERS` override. Evidence-based default for
+    /// Bar on a raw sysfs aperture: staged (a failed direct copy is a sticky
+    /// context poison — Xid 31, 2026-10-06); `direct` is opt-in for
+    /// peer-mapped products whose acceptance kit passed.
+    pub fn transfer_semantics(
+        &self,
+    ) -> crate::block_manager::block::transfer::HostTransferSemantics {
+        use crate::block_manager::block::transfer::HostTransferSemantics as S;
+        match &self.region {
+            Some(DevbarRegion::Vmm) => S::DeviceAlias,
+            Some(DevbarRegion::Bar { .. }) | Some(DevbarRegion::Bdf { .. }) => {
+                match std::env::var(env_devbar::DYN_KVBM_DEVBAR_TRANSFERS)
+                    .as_deref()
+                    .unwrap_or("auto")
+                {
+                    "direct" => S::HostPointer,
+                    _ => S::StagedCpu,
+                }
+            }
+            _ => S::HostPointer,
+        }
+    }
 }
 
 impl StorageAllocator<DevbarStorage> for DevbarAllocator {
@@ -632,6 +748,19 @@ impl StorageAllocator<DevbarStorage> for DevbarAllocator {
         match &self.region {
             Some(DevbarRegion::Bar { path, offset }) => {
                 DevbarStorage::from_bar(path.clone(), *offset, size, self.device_id)
+            }
+            Some(DevbarRegion::Bdf {
+                bdf,
+                offset,
+                explicit_index,
+            }) => {
+                let path = select_resource_file(
+                    bdf,
+                    size,
+                    *explicit_index,
+                    Path::new("/sys/bus/pci/devices"),
+                )?;
+                DevbarStorage::from_bar(path, *offset, size, self.device_id)
             }
             Some(DevbarRegion::Mock) => DevbarStorage::mock(size, self.device_id),
             Some(DevbarRegion::Vmm) => DevbarStorage::from_vmm(size, self.device_id),
@@ -701,6 +830,7 @@ mod tests {
 
     #[test]
     fn test_devbar_from_bar_roundtrip_and_aperture_validation() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let mut file = tempfile::NamedTempFile::new().expect("temp file");
         use std::io::{Seek as _, Write as _};
         file.write_all(&[0x5A; 1024]).expect("write pattern");
@@ -712,11 +842,23 @@ mod tests {
         assert!(storage.is_devbar_backed());
         assert_eq!(storage.storage_type(), StorageType::Device(7));
         assert_eq!(storage.device_id(), 7);
-        assert_eq!(storage.mem_type(), MemType::Vram);
+        // auto default (DYN_KVBM_DEVBAR_MEM_TYPE unset): Dram — the
+        // 2026-10-04 evidence (a Vram registration of the raw sysfs mmap
+        // fails at ucp_mem_map with EIO on PCIe).
+        assert_eq!(storage.mem_type(), MemType::Dram);
         unsafe {
             assert_eq!(std::ptr::read_volatile(Storage::as_ptr(&storage)), 0x5A);
         }
         drop(storage);
+
+        // vram override: a second from_bar on the same path at offset 0
+        // (the first storage released its mmap above).
+        unsafe { std::env::set_var("DYN_KVBM_DEVBAR_MEM_TYPE", "vram") };
+        let storage_vram = DevbarStorage::from_bar(file.path().to_path_buf(), 0, 1024, 7)
+            .expect("mmap with vram mem-type override");
+        assert_eq!(storage_vram.mem_type(), MemType::Vram);
+        drop(storage_vram);
+        unsafe { std::env::remove_var("DYN_KVBM_DEVBAR_MEM_TYPE") };
 
         // Requesting past the aperture must be rejected with the sizing
         // guidance error.
@@ -754,6 +896,61 @@ mod tests {
         let alloc = DevbarAllocator::from_env().unwrap();
         assert!(alloc.region.is_none());
         assert!(!alloc.is_device_aliased());
+    }
+
+    /// BAR-backed transfer semantics + resource-index plumbing. Works on
+    /// machines without the device: from_env does no sysfs access (the
+    /// aperture is resolved at allocate() time).
+    #[test]
+    fn from_env_bar_transfer_semantics_and_resource_index() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("DYN_KVBM_DEVBAR_BDF", "0000:41:00.0") };
+        unsafe { std::env::set_var("DYN_KVBM_DEVBAR_RESOURCE_INDEX", "0") };
+        let alloc = DevbarAllocator::from_env().unwrap();
+        assert!(matches!(
+            alloc.transfer_semantics(),
+            crate::block_manager::block::transfer::HostTransferSemantics::StagedCpu
+        ));
+        unsafe { std::env::set_var("DYN_KVBM_DEVBAR_TRANSFERS", "direct") };
+        assert!(matches!(
+            alloc.transfer_semantics(),
+            crate::block_manager::block::transfer::HostTransferSemantics::HostPointer
+        ));
+        unsafe {
+            std::env::remove_var("DYN_KVBM_DEVBAR_TRANSFERS");
+            std::env::remove_var("DYN_KVBM_DEVBAR_RESOURCE_INDEX");
+            std::env::remove_var("DYN_KVBM_DEVBAR_BDF");
+        }
+    }
+
+    #[test]
+    fn select_resource_file_prefers_smallest_fitting() {
+        let dir = std::env::temp_dir().join(format!("devbar-sysfs-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("0000:41:00.0")).unwrap();
+        for (idx, sz) in [(0, 16u64 << 20), (1, 64u64 << 30), (2, 2u64 << 30)] {
+            let p = dir.join("0000:41:00.0").join(format!("resource{idx}"));
+            std::fs::write(&p, vec![0u8; 8]).unwrap(); // placeholder content
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&p)
+                .unwrap();
+            f.set_len(sz).unwrap();
+            drop(f);
+        }
+        // 1-GiB tier-2: 16 MiB (resource0) does not fit; smallest fitting = 2 GiB (resource2).
+        let picked = select_resource_file("0000:41:00.0", 1 << 30, None, &dir).unwrap();
+        assert!(picked.ends_with("resource2"));
+        // Explicit index wins when it fits.
+        let explicit = select_resource_file("0000:41:00.0", 1 << 30, Some(1), &dir).unwrap();
+        assert!(explicit.ends_with("resource1"));
+        let explicit2 = select_resource_file("0000:41:00.0", 1 << 30, Some(2), &dir).unwrap();
+        assert!(explicit2.ends_with("resource2"));
+        // Explicit index that does not fit → error.
+        assert!(select_resource_file("0000:41:00.0", 1 << 30, Some(0), &dir).is_err());
+        // Nothing large enough → error.
+        assert!(select_resource_file("0000:41:00.0", 128 << 30, None, &dir).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

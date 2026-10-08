@@ -303,6 +303,20 @@ pub mod kvbm {
         /// driver-owned, collision-free, native D2D transfers; works on C2C
         /// and PCIe GPUs
         pub const DYN_KVBM_DEVBAR_VMM: &str = "DYN_KVBM_DEVBAR_VMM";
+
+        /// Transfer path for the BAR backing: "auto" (default; staged on raw
+        /// sysfs MMIO apertures — a failed direct copy poisons the CUDA
+        /// context stickily), "staged", or "direct" (peer-mapped products
+        /// whose acceptance kit passed the sacrificial direct-copy test)
+        pub const DYN_KVBM_DEVBAR_TRANSFERS: &str = "DYN_KVBM_DEVBAR_TRANSFERS";
+
+        /// NIXL mem type for the BAR backing: "auto" (default; Dram — the
+        /// 2026-10-04 evidence) or "vram" (peer-mapped products)
+        pub const DYN_KVBM_DEVBAR_MEM_TYPE: &str = "DYN_KVBM_DEVBAR_MEM_TYPE";
+
+        /// Explicit sysfs resource index (e.g. "1"); unset = auto-select the
+        /// smallest O_RDWR-openable resource{N} whose size fits the tier-2
+        pub const DYN_KVBM_DEVBAR_RESOURCE_INDEX: &str = "DYN_KVBM_DEVBAR_RESOURCE_INDEX";
     }
 
     /// Disk cache configuration
@@ -1074,6 +1088,9 @@ mod tests {
             kvbm::devbar::DYN_KVBM_DEVBAR_DEVICE_ID,
             kvbm::devbar::DYN_KVBM_DEVBAR_MOCK,
             kvbm::devbar::DYN_KVBM_DEVBAR_VMM,
+            kvbm::devbar::DYN_KVBM_DEVBAR_TRANSFERS,
+            kvbm::devbar::DYN_KVBM_DEVBAR_MEM_TYPE,
+            kvbm::devbar::DYN_KVBM_DEVBAR_RESOURCE_INDEX,
             kvbm::disk_cache::DYN_KVBM_DISK_CACHE_GB,
             kvbm::disk_cache::DYN_KVBM_DISK_CACHE_OVERRIDE_NUM_BLOCKS,
             kvbm::leader::DYN_KVBM_LEADER_WORKER_INIT_TIMEOUT_SECS,
