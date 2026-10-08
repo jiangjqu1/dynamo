@@ -285,7 +285,8 @@ pub mod kvbm {
     /// Devbar region configuration (BAR-mapped tier-2 KV storage)
     pub mod devbar {
         /// PCI BDF of the device whose BAR aperture backs the tier-2 host pool
-        /// (e.g. "0000:1f:00.0" -> /sys/bus/pci/devices/0000:1f:00.0/resource0)
+        /// (e.g. "0000:1f:00.0" -> the smallest O_RDWR-openable
+        /// /sys/bus/pci/devices/0000:1f:00.0/resource{N} that fits the tier-2)
         pub const DYN_KVBM_DEVBAR_BDF: &str = "DYN_KVBM_DEVBAR_BDF";
 
         /// Byte offset into the BAR aperture

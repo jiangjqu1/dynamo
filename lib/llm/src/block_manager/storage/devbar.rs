@@ -703,7 +703,9 @@ impl DevbarAllocator {
     /// Exception to block-level/pool-level mem-type consistency: mock blocks
     /// stamp `Device` (wire semantics) while the pool-level registration is
     /// deliberately `Dram` (UCX rejects a Vram registration of host memory);
-    /// Bar and pinned-fallback backings are consistent at both levels.
+    /// the Bar backing does the same under its default (`Dram` pool-level
+    /// registration via `DYN_KVBM_DEVBAR_MEM_TYPE`); only the pinned fallback
+    /// is consistent at both levels.
     pub fn host_storage_type(&self) -> StorageType {
         match &self.region {
             Some(_) => StorageType::Device(self.device_id),
