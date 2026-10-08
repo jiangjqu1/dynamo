@@ -582,13 +582,14 @@ fn select_resource_file(
             .len();
         if (len as usize) < tier2_size {
             return Err(StorageError::InvalidConfig(format!(
-                "{} is {len} bytes < tier-2 {tier2_size}; set DYN_KVBM_DEVBAR_RESOURCE_INDEX",
+                "{} is {len} bytes < tier-2 {tier2_size}; increase DYN_KVBM_DEVBAR_RESOURCE_INDEX or unset it to auto-select",
                 p.display()
             )));
         }
         return Ok(p);
     }
     let mut candidates: Vec<(u64, PathBuf)> = Vec::new();
+    // sysfs exposes resource0..resource15 (BARs + ROM + bridge windows); 16 covers every possible index.
     for idx in 0..16 {
         let p = sysfs_root.join(bdf).join(format!("resource{idx}"));
         let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open(&p) else {
@@ -599,14 +600,17 @@ fn select_resource_file(
             candidates.push((meta.len(), p));
         }
     }
-    candidates.sort();
-    candidates.first().map(|(_, p)| p.clone()).ok_or_else(|| {
-        StorageError::InvalidConfig(format!(
-            "no O_RDWR resource{{N}} >= {tier2_size} bytes under {}/{}",
-            sysfs_root.display(),
-            bdf
-        ))
-    })
+    candidates
+        .into_iter()
+        .min_by_key(|(len, _)| *len)
+        .map(|(_, p)| p)
+        .ok_or_else(|| {
+            StorageError::InvalidConfig(format!(
+                "no O_RDWR resource{{N}} >= {tier2_size} bytes under {}/{}; check DYN_KVBM_DEVBAR_BDF, or pin DYN_KVBM_DEVBAR_RESOURCE_INDEX",
+                sysfs_root.display(),
+                bdf
+            ))
+        })
 }
 
 impl DevbarAllocator {
@@ -643,7 +647,16 @@ impl DevbarAllocator {
                 .unwrap_or(0);
             let explicit_index = std::env::var(env_devbar::DYN_KVBM_DEVBAR_RESOURCE_INDEX)
                 .ok()
-                .and_then(|v| v.parse::<u32>().ok());
+                .and_then(|v| match v.parse::<u32>() {
+                    Ok(idx) => Some(idx),
+                    Err(_) => {
+                        tracing::warn!(
+                            value = %v,
+                            "malformed DYN_KVBM_DEVBAR_RESOURCE_INDEX; ignoring (auto-select)"
+                        );
+                        None
+                    }
+                });
             // No sysfs access here: the aperture file is resolved at
             // allocate() time, when the tier-2 size is known (from_env must
             // succeed on machines without the device).
@@ -832,7 +845,8 @@ mod tests {
 
     #[test]
     fn test_devbar_from_bar_roundtrip_and_aperture_validation() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("DYN_KVBM_DEVBAR_MEM_TYPE") };
         let mut file = tempfile::NamedTempFile::new().expect("temp file");
         use std::io::{Seek as _, Write as _};
         file.write_all(&[0x5A; 1024]).expect("write pattern");
@@ -880,7 +894,7 @@ mod tests {
     /// VMM alone (no BDF) selects Vmm; nothing set = pinned fallback.
     #[test]
     fn from_env_selects_vmm_region() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: devbar env vars are only read by devbar code and this test;
         // ENV_LOCK guards against parallel env mutation within this module.
         unsafe { std::env::remove_var("DYN_KVBM_DEVBAR_BDF") };
@@ -905,7 +919,9 @@ mod tests {
     /// aperture is resolved at allocate() time).
     #[test]
     fn from_env_bar_transfer_semantics_and_resource_index() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("DYN_KVBM_DEVBAR_TRANSFERS") };
+        unsafe { std::env::remove_var("DYN_KVBM_DEVBAR_MEM_TYPE") };
         unsafe { std::env::set_var("DYN_KVBM_DEVBAR_BDF", "0000:41:00.0") };
         unsafe { std::env::set_var("DYN_KVBM_DEVBAR_RESOURCE_INDEX", "0") };
         let alloc = DevbarAllocator::from_env().unwrap();
