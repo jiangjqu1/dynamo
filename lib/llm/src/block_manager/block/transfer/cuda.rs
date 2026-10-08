@@ -342,6 +342,17 @@ where
     Ok(())
 }
 
+/// Synchronizes the stream on drop so the pinned bounce never frees
+/// under an in-flight DMA (the happy path's explicit event sync covers
+/// the normal return; this guard covers every `?`/early-return path).
+struct BounceSyncGuard<'a>(&'a CudaStream);
+
+impl Drop for BounceSyncGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.synchronize();
+    }
+}
+
 /// Staged batch copy for raw-MMIO host tiers (the BAR-aperture expander
 /// path): the driver permits no GPU-side access to the window, so every
 /// block stages through a pinned bounce with CPU memcpy legs. Fully
@@ -350,11 +361,18 @@ where
 ///
 /// Xid-31 safety invariant: no CUDA call ever touches the window VA. The
 /// CPU legs move data window↔bounce; the DMAs move data bounce↔device only.
+///
+/// Bounce allocation tradeoff: `PinnedStorage::new_for_device` allocates
+/// WRITE_COMBINED pinned memory by default (unless the
+/// `DYN_KVBM_DISABLE_WRITE_COMBINED` env toggle is set). WC is ideal for
+/// this staged H2D path (fast CPU writes into the bounce) but penalizes
+/// the `CudaStagedD2H` CPU read legs (uncached reads); the non-WC
+/// constructor is a perf follow-up if profiling shows the penalty.
 pub fn staged_write_blocks_to<Source, Target>(
     sources: &[Source],
     targets: &mut [Target],
     ctx: &Arc<TransferContext>,
-    direction: TransferStrategy,
+    strategy: TransferStrategy,
 ) -> Result<(), TransferError>
 where
     Source: BlockDataProvider,
@@ -370,7 +388,7 @@ where
 
     #[cfg(debug_assertions)]
     {
-        assert_strategy_valid::<Source, Target>(direction);
+        assert_strategy_valid::<Source, Target>(strategy);
     }
 
     // Per-block view sizes, collected once: a block view covers the whole
@@ -378,40 +396,44 @@ where
     let mut sizes = Vec::with_capacity(sources.len());
     let mut total = 0usize;
     for src in sources {
-        let size = src.block_data().block_view().map(|v| v.size()).unwrap_or(0);
+        let size = src.block_data().block_view()?.size();
         sizes.push(size);
         total += size;
     }
 
-    // One pinned bounce covering the whole batch. Per-batch allocation is
-    // acceptable for v1; pooling is a follow-up.
-    let mut bounce = dynamo_memory::PinnedStorage::new_for_device(total, None)
-        .map_err(|e| TransferError::ExecutionError(format!("staged bounce alloc: {e}")))?;
-    // SAFETY: `bounce_base` aliases the pinned buffer for the writes below;
-    // it stays valid until `bounce` is dropped, after every DMA completes.
-    let bounce_base = unsafe { bounce.as_mut_ptr() };
-
     let stream = ctx.stream();
 
-    match direction {
+    // One pinned bounce covering the whole batch, scoped to the executor's
+    // device like every other `new_for_device` call site. Per-batch
+    // allocation is acceptable for v1; pooling is a follow-up.
+    let dev_ord = stream.context().ordinal() as u32;
+    let mut bounce = dynamo_memory::PinnedStorage::new_for_device(total, Some(dev_ord))
+        .map_err(|e| TransferError::ExecutionError(format!("staged bounce alloc: {e}")))?;
+    let _bounce_guard = BounceSyncGuard(stream);
+    // SAFETY: `bounce_base` aliases the pinned buffer for the writes below;
+    // it stays valid until `bounce` is dropped: the guard's blocking stream
+    // synchronize covers every `?`/early-return path and the explicit event
+    // syncs below cover the normal return, so the bounce never frees under
+    // an in-flight DMA.
+    let bounce_base = unsafe { bounce.as_mut_ptr() };
+
+    match strategy {
         TransferStrategy::CudaStagedH2D => {
             // CPU legs: window -> bounce. CPU reads/writes are the only
             // access the raw MMIO window permits (a device-side copy faults
             // with Xid 31), so these legs never touch CUDA.
             let mut offset = 0usize;
-            for src in sources {
+            for (idx, src) in sources.iter().enumerate() {
+                let size = sizes[idx];
                 let s_view = src.block_data().block_view()?;
+                debug_assert_eq!(s_view.size(), size);
                 // SAFETY: `s_view` covers `size` readable bytes and the
                 // bounce has `total >= offset + size` writable bytes; the
                 // regions do not overlap.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        s_view.as_ptr(),
-                        bounce_base.add(offset),
-                        s_view.size(),
-                    )
+                    std::ptr::copy_nonoverlapping(s_view.as_ptr(), bounce_base.add(offset), size)
                 };
-                offset += s_view.size();
+                offset += size;
             }
 
             // DMA legs: bounce -> device, async on the stream.
@@ -485,7 +507,7 @@ where
         }
         _ => {
             return Err(TransferError::ExecutionError(
-                "staged executor: not a staged direction".into(),
+                "staged executor: not a staged strategy".into(),
             ));
         }
     }

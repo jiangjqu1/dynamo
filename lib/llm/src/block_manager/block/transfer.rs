@@ -101,11 +101,12 @@ pub enum TransferStrategy {
     CudaAsyncD2D,
     CudaBlockingH2D,
     CudaBlockingD2H,
-    /// Staged host-to-device: CPU memcpy window→pinned bounce, then blocking
-    /// cudaMemcpy bounce→device (the raw-MMIO path; no GPU access to the window).
+    /// Staged host-to-device: CPU memcpy window→pinned bounce, then async
+    /// cudaMemcpy bounce→device + blocking event sync (the raw-MMIO path; no
+    /// GPU access to the window).
     CudaStagedH2D,
-    /// Staged device-to-host: blocking cudaMemcpy device→pinned bounce, then
-    /// CPU memcpy bounce→window.
+    /// Staged device-to-host: async cudaMemcpy device→pinned bounce + blocking
+    /// event sync, then CPU memcpy bounce→window.
     CudaStagedD2H,
     Nixl(NixlTransfer),
     Invalid,
