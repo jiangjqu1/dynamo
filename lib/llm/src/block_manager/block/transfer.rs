@@ -108,6 +108,12 @@ pub enum TransferStrategy {
     /// Staged device-to-host: async cudaMemcpy device→pinned bounce + blocking
     /// event sync, then CPU memcpy bounce→window.
     CudaStagedD2H,
+    /// Direct host-to-device through the BAR window's registered device VA:
+    /// GPU-side memcpy with the pointer translated via the context's io
+    /// mapping (the IOMEMORY path; requires the privileged registration).
+    CudaDirectIoH2D,
+    /// Direct device-to-host through the BAR window's registered device VA.
+    CudaDirectIoD2H,
     Nixl(NixlTransfer),
     Invalid,
 }

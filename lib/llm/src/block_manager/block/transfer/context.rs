@@ -172,16 +172,21 @@ pub struct PoolConfig {
 
 /// How the host-tier pool's memory is accessed by transfers. Decides the
 /// CUDA copy kind for (host-tier ↔ Device) pairs:
-/// - `HostPointer` (default; Pinned/Mock/Bar-direct): ordinary H2D/D2H.
+/// - `HostPointer` (default; Pinned/Mock): ordinary H2D/D2H.
 /// - `DeviceAlias` (Vmm backing): the "host" pointer is a device VA — D2D.
-/// - `StagedCpu` (Bar on a raw sysfs MMIO aperture): the driver permits no
-///   GPU-side access (Xid 31, sticky) — copies stage through a pinned
-///   bounce with CPU memcpy legs.
+/// - `DirectIo` (Bar with the IOMEMORY registration, `TRANSFERS=direct`):
+///   the window has a registered device VA — copies run as direct GPU-side
+///   memcpys through the device VA, pointer-translated via the context's io
+///   mapping (bar-direct-spike-verified: ~3.0 GiB/s both directions on
+///   cm008; requires a privileged registration).
+/// - `StagedCpu` (Bar without the registration — the non-privileged
+///   fallback): copies stage through a pinned bounce with CPU memcpy legs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HostTransferSemantics {
     #[default]
     HostPointer,
     DeviceAlias,
+    DirectIo,
     StagedCpu,
 }
 
@@ -196,6 +201,12 @@ impl HostTransferSemantics {
             (HostTransferSemantics::DeviceAlias, TransferStrategy::CudaAsyncH2D)
             | (HostTransferSemantics::DeviceAlias, TransferStrategy::CudaAsyncD2H) => {
                 TransferStrategy::CudaAsyncD2D
+            }
+            (HostTransferSemantics::DirectIo, TransferStrategy::CudaAsyncH2D) => {
+                TransferStrategy::CudaDirectIoH2D
+            }
+            (HostTransferSemantics::DirectIo, TransferStrategy::CudaAsyncD2H) => {
+                TransferStrategy::CudaDirectIoD2H
             }
             (HostTransferSemantics::StagedCpu, TransferStrategy::CudaAsyncH2D) => {
                 TransferStrategy::CudaStagedH2D
@@ -690,6 +701,18 @@ mod tests {
         assert_eq!(
             HostTransferSemantics::StagedCpu.adjust(T::Memcpy),
             T::Memcpy
+        );
+        assert_eq!(
+            HostTransferSemantics::DirectIo.adjust(T::CudaAsyncH2D),
+            T::CudaDirectIoH2D
+        );
+        assert_eq!(
+            HostTransferSemantics::DirectIo.adjust(T::CudaAsyncD2H),
+            T::CudaDirectIoD2H
+        );
+        assert_eq!(
+            HostTransferSemantics::DirectIo.adjust(T::CudaAsyncD2D),
+            T::CudaAsyncD2D
         );
     }
 }
