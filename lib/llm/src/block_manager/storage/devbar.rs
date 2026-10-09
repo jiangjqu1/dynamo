@@ -1097,3 +1097,61 @@ mod vmm_tests {
         drop(again);
     }
 }
+
+#[cfg(all(test, feature = "testing-cuda"))]
+mod staged_tests {
+    use super::*;
+    use cudarc::driver::sys;
+
+    /// Staged legs' mechanics with real CUDA: the pattern goes window (CPU)
+    /// -> bounce (CPU) -> device (DMA) -> bounce (DMA) -> window (CPU). The
+    /// mock region is host RAM, so every leg is exercised without MMIO; the
+    /// full executor + routing are proven by the e2e on real hardware.
+    #[test]
+    fn test_devbar_staged_roundtrip_mock() {
+        let alloc = DevbarAllocator::mock(0);
+        let mut storage = alloc.allocate(64 * 1024).expect("mock alloc");
+
+        let pattern: &[u8; 15] = b"STAGED-PATTERN2";
+        unsafe {
+            std::ptr::copy_nonoverlapping(pattern.as_ptr(), storage.as_mut_ptr(), pattern.len());
+        }
+
+        let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+        ctx.bind_to_thread().unwrap();
+        let mut dev: sys::CUdeviceptr = 0;
+        unsafe {
+            assert_eq!(
+                sys::cuMemAlloc_v2(&mut dev, 64 * 1024),
+                sys::CUresult::CUDA_SUCCESS
+            );
+            // H2D staged legs: CPU window->bounce, DMA bounce->device.
+            let mut bounce = vec![0u8; 64 * 1024];
+            std::ptr::copy_nonoverlapping(
+                Storage::as_ptr(&storage),
+                bounce.as_mut_ptr(),
+                pattern.len(),
+            );
+            assert_eq!(
+                sys::cuMemcpyHtoD_v2(
+                    dev,
+                    bounce.as_ptr() as *const core::ffi::c_void,
+                    pattern.len()
+                ),
+                sys::CUresult::CUDA_SUCCESS
+            );
+            // D2H staged legs: DMA device->bounce, CPU bounce->window; compare.
+            let mut back = [0u8; 15];
+            assert_eq!(
+                sys::cuMemcpyDtoH_v2(back.as_mut_ptr() as *mut core::ffi::c_void, dev, 15),
+                sys::CUresult::CUDA_SUCCESS
+            );
+            assert_eq!(&back, pattern, "device->bounce leg integrity");
+            std::ptr::copy_nonoverlapping(back.as_ptr(), storage.as_mut_ptr(), back.len());
+            let window = std::slice::from_raw_parts(Storage::as_ptr(&storage), 15);
+            assert_eq!(window, pattern, "staged roundtrip pattern integrity");
+            assert_eq!(sys::cuMemFree_v2(dev), sys::CUresult::CUDA_SUCCESS);
+        }
+        drop(storage);
+    }
+}
