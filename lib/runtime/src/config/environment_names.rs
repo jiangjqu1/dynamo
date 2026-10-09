@@ -306,9 +306,10 @@ pub mod kvbm {
         pub const DYN_KVBM_DEVBAR_VMM: &str = "DYN_KVBM_DEVBAR_VMM";
 
         /// Transfer path for the BAR backing: "auto" (default; staged on raw
-        /// sysfs MMIO apertures — a failed direct copy poisons the CUDA
-        /// context stickily), "staged", or "direct" (peer-mapped products
-        /// whose acceptance kit passed the sacrificial direct-copy test)
+        /// sysfs MMIO apertures), "staged" (same), or "direct" (the
+        /// IOMEMORY-registered device-VA path — requires a privileged
+        /// process: root or CAP_SYS_ADMIN-equivalent; the documented
+        /// non-privileged failure is CUDA_ERROR_NOT_PERMITTED)
         pub const DYN_KVBM_DEVBAR_TRANSFERS: &str = "DYN_KVBM_DEVBAR_TRANSFERS";
 
         /// NIXL mem type for the BAR backing: "auto" (default; Dram — the

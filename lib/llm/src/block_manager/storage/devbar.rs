@@ -71,6 +71,10 @@ pub struct DevbarStorage {
     /// Present only in Vmm mode; owns the CUDA-VMM allocation and the context
     /// needed for device-side operations (memset, teardown).
     vmm: Option<VmmOwn>,
+    /// Present only in Bar mode with the IOMEMORY registration
+    /// (`DYN_KVBM_DEVBAR_TRANSFERS=direct`); owns the registration and the
+    /// window's device VA for direct GPU-side transfers.
+    io: Option<IoOwn>,
 }
 
 /// Owns the VMM physical handle, the reserved device VA, and the CUDA context
@@ -81,6 +85,17 @@ struct VmmOwn {
     handle: cudarc::driver::sys::CUmemGenericAllocationHandle,
     va: cudarc::driver::sys::CUdeviceptr,
     size: usize,
+}
+
+/// Owns the IOMEMORY registration and the device VA of a Bar-backed devbar
+/// region registered for direct transfers (`DYN_KVBM_DEVBAR_TRANSFERS=direct`).
+#[derive(Debug)]
+struct IoOwn {
+    /// The CUDA context the registration is bound to (the device's primary
+    /// context); the Drop binds it before unregistering (the Vmm Drop's lesson).
+    ctx: std::sync::Arc<cudarc::driver::CudaContext>,
+    /// The device VA `cuMemHostGetDevicePointer` returned for the window mmap.
+    dev_va: cudarc::driver::sys::CUdeviceptr,
 }
 
 // SAFETY: DevbarStorage owns its mapping exclusively; raw-pointer access is
@@ -113,7 +128,12 @@ impl DevbarStorage {
     ) -> Result<Self, StorageError> {
         let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes())
             .map_err(|e| StorageError::InvalidConfig(e.to_string()))?;
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDWR | libc::O_SYNC | libc::O_CLOEXEC,
+            )
+        };
         if fd < 0 {
             return Err(StorageError::AllocationFailed(format!(
                 "failed to open devbar region file {}: {}",
@@ -180,6 +200,51 @@ impl DevbarStorage {
         let ptr = NonNull::new(ptr as *mut u8)
             .ok_or_else(|| StorageError::AllocationFailed("mmap returned null".into()))?;
 
+        // Direct transfers (`DYN_KVBM_DEVBAR_TRANSFERS=direct`): register the
+        // window with CUDA as I/O memory and take its device VA — the
+        // bar-direct-spike-verified path (~3.0 GiB/s both directions on cm008).
+        // The registration requires a privileged process (root or a
+        // CAP_SYS_ADMIN-equivalent): the documented non-privileged failure is
+        // CUDA_ERROR_NOT_PERMITTED. Clean error — the sticky-context lesson
+        // covers copies, not registrations.
+        let io = if std::env::var(env_devbar::DYN_KVBM_DEVBAR_TRANSFERS).as_deref() == Ok("direct")
+        {
+            let ctx = cudarc::driver::CudaContext::new(device_id as usize).map_err(|e| {
+                StorageError::InvalidConfig(format!(
+                    "direct transfers need a CUDA context on device {device_id}: {e}"
+                ))
+            })?;
+            ctx.bind_to_thread()
+                .map_err(|e| StorageError::InvalidConfig(format!("cuda bind: {e}")))?;
+            let r = unsafe {
+                sys::cuMemHostRegister_v2(
+                    ptr.as_ptr() as *mut core::ffi::c_void,
+                    size,
+                    sys::CU_MEMHOSTREGISTER_IOMEMORY | sys::CU_MEMHOSTREGISTER_DEVICEMAP,
+                )
+            };
+            if r != sys::CUresult::CUDA_SUCCESS {
+                return Err(StorageError::InvalidConfig(format!(
+                    "cuMemHostRegister(IOMEMORY|DEVICEMAP) failed: {r:?} — direct BAR transfers \
+                     require a privileged process (root or CAP_SYS_ADMIN-equivalent; the \
+                     documented non-privileged failure is CUDA_ERROR_NOT_PERMITTED). \
+                     Use the default staged transfers or run the worker privileged."
+                )));
+            }
+            let mut dev_va: sys::CUdeviceptr = 0;
+            let rg = unsafe {
+                sys::cuMemHostGetDevicePointer_v2(
+                    &mut dev_va,
+                    ptr.as_ptr() as *mut core::ffi::c_void,
+                    0,
+                )
+            };
+            curesult(rg, "cuMemHostGetDevicePointer")?;
+            Some(IoOwn { ctx, dev_va })
+        } else {
+            None
+        };
+
         Ok(Self {
             ptr,
             len: size,
@@ -188,7 +253,18 @@ impl DevbarStorage {
             handles: RegistrationHandles::new(),
             pinned: None,
             vmm: None,
+            io,
         })
+    }
+
+    /// The io mapping for direct transfers: (host base, device base, length) —
+    /// the window's host VA, its registered device VA, and the window length
+    /// (the executor's per-block range check). Present only when the IOMEMORY
+    /// registration succeeded (`TRANSFERS=direct`).
+    pub fn io_mapping(&self) -> Option<(usize, u64, usize)> {
+        self.io
+            .as_ref()
+            .map(|io| (self.ptr.as_ptr() as usize, io.dev_va, self.len))
     }
 
     /// Create a mock devbar-backed storage from an anonymous mapping.
@@ -220,6 +296,7 @@ impl DevbarStorage {
             handles: RegistrationHandles::new(),
             pinned: None,
             vmm: None,
+            io: None,
         })
     }
 
@@ -237,6 +314,7 @@ impl DevbarStorage {
             handles: RegistrationHandles::new(),
             pinned: Some(inner),
             vmm: None,
+            io: None,
         })
     }
 
@@ -335,6 +413,7 @@ impl DevbarStorage {
                 va,
                 size,
             }),
+            io: None,
         })
     }
 
@@ -348,6 +427,22 @@ impl DevbarStorage {
 impl Drop for DevbarStorage {
     fn drop(&mut self) {
         self.handles.release();
+        // The IOMEMORY registration must be released before the window's
+        // munmap (the mapping must stay valid); bind the owning context
+        // first (the Vmm Drop's bind_to_thread lesson).
+        if let Some(io) = self.io.take() {
+            if let Err(e) = io.ctx.bind_to_thread() {
+                tracing::error!(
+                    error = %e,
+                    "devbar drop: bind_to_thread failed; leaking the IOMEMORY registration"
+                );
+            } else {
+                let r = unsafe { sys::cuMemHostUnregister(self.ptr.as_ptr() as *mut libc::c_void) };
+                if r != sys::CUresult::CUDA_SUCCESS {
+                    tracing::error!(result = ?r, "devbar drop: cuMemHostUnregister failed");
+                }
+            }
+        }
         if let Some(vmm) = self.vmm.take() {
             if let Err(e) = vmm.ctx.bind_to_thread() {
                 tracing::error!(error = %e, "vmm drop: bind_to_thread failed; leaking VMM region");
@@ -750,7 +845,7 @@ impl DevbarAllocator {
                     .unwrap_or("auto")
                 {
                     "auto" | "staged" => S::StagedCpu,
-                    "direct" => S::HostPointer,
+                    "direct" => S::DirectIo,
                     other => {
                         tracing::warn!(
                             value = other,
@@ -939,7 +1034,27 @@ mod tests {
         unsafe { std::env::set_var("DYN_KVBM_DEVBAR_TRANSFERS", "direct") };
         assert!(matches!(
             alloc.transfer_semantics(),
-            crate::block_manager::block::transfer::HostTransferSemantics::HostPointer
+            crate::block_manager::block::transfer::HostTransferSemantics::DirectIo
+        ));
+        unsafe {
+            std::env::remove_var("DYN_KVBM_DEVBAR_TRANSFERS");
+            std::env::remove_var("DYN_KVBM_DEVBAR_RESOURCE_INDEX");
+            std::env::remove_var("DYN_KVBM_DEVBAR_BDF");
+        }
+    }
+
+    /// `TRANSFERS=direct` on a BAR-backed allocator maps to the DirectIo
+    /// semantics (the IOMEMORY-registered device-VA path from Task 2).
+    #[test]
+    fn from_env_bar_direct_maps_to_direct_io_semantics() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("DYN_KVBM_DEVBAR_BDF", "0000:41:00.0") };
+        unsafe { std::env::set_var("DYN_KVBM_DEVBAR_RESOURCE_INDEX", "0") };
+        unsafe { std::env::set_var("DYN_KVBM_DEVBAR_TRANSFERS", "direct") };
+        let alloc = DevbarAllocator::from_env().unwrap();
+        assert!(matches!(
+            alloc.transfer_semantics(),
+            crate::block_manager::block::transfer::HostTransferSemantics::DirectIo
         ));
         unsafe {
             std::env::remove_var("DYN_KVBM_DEVBAR_TRANSFERS");
