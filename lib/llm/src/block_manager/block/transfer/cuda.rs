@@ -515,6 +515,131 @@ where
     Ok(())
 }
 
+/// Direct batch copy for IOMEMORY-registered BAR windows (the
+/// `DYN_KVBM_DEVBAR_TRANSFERS=direct` path): the window's device VA is
+/// registered (bar-direct-spike-verified, ~3.0 GiB/s both directions on
+/// cm008), so every block copies as a GPU-side memcpy through the device VA,
+/// pointer-translated via the context's io mapping. Runs on the calling
+/// thread; the batch's async memcpys are synced by the closing event (the
+/// staged arm's synchronous shape).
+///
+/// Xid-31 safety: the device VA comes from the registration's device-mapping
+/// (the driver-sanctioned surface) — never the raw sysfs VA, which is the
+/// copy-kernel fault path.
+pub fn direct_io_write_blocks_to<Source, Target>(
+    sources: &[Source],
+    targets: &mut [Target],
+    ctx: &Arc<TransferContext>,
+    strategy: TransferStrategy,
+) -> Result<(), TransferError>
+where
+    Source: BlockDataProvider,
+    Target: BlockDataProviderMut,
+{
+    let (host_base, io_dev_base, win_len) = ctx.host_tier_io_mapping().ok_or_else(|| {
+        TransferError::ExecutionError(
+            "direct-io executor: no io mapping wired (the IOMEMORY registration did not run)"
+                .into(),
+        )
+    })?;
+
+    if sources.is_empty() && targets.is_empty() {
+        return Ok(());
+    }
+    if sources.len() != targets.len() {
+        return Err(TransferError::CountMismatch(sources.len(), targets.len()));
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        assert_strategy_valid::<Source, Target>(strategy);
+    }
+
+    // Per-block view sizes, collected once.
+    let mut sizes = Vec::with_capacity(sources.len());
+    for src in sources {
+        sizes.push(src.block_data().block_view()?.size());
+    }
+
+    let stream = ctx.stream();
+
+    // Translate a host-tier block pointer into the window's device VA,
+    // range-checked against the window span.
+    let translate = |ptr: *const u8, size: usize| -> Result<u64, TransferError> {
+        let addr = ptr as usize;
+        if addr < host_base || addr.saturating_add(size) > host_base + win_len {
+            return Err(TransferError::ExecutionError(format!(
+                "direct-io executor: block [0x{addr:x}, 0x{:x}) outside the window \
+                 [0x{host_base:x}, 0x{:x})",
+                addr.saturating_add(size),
+                host_base + win_len
+            )));
+        }
+        Ok(io_dev_base + (addr - host_base) as u64)
+    };
+
+    match strategy {
+        TransferStrategy::CudaDirectIoH2D => {
+            // The host tier is the SOURCE: window -> device through the io mapping.
+            for (idx, (src, dst)) in sources.iter().zip(targets.iter()).enumerate() {
+                let size = sizes[idx];
+                let s_view = src.block_data().block_view()?;
+                let d_view = dst.block_data().block_view()?;
+                let s_dev = translate(unsafe { s_view.as_ptr() }, size)?;
+                unsafe {
+                    cuda_result::memcpy_dtod_async(
+                        d_view.as_ptr() as u64,
+                        s_dev,
+                        size,
+                        stream.cu_stream(),
+                    )
+                }
+                .map_err(|e| {
+                    TransferError::ExecutionError(format!("direct-io H2D memcpy failed: {e}"))
+                })?;
+            }
+        }
+        TransferStrategy::CudaDirectIoD2H => {
+            // The host tier is the TARGET: device -> window through the io mapping.
+            for (idx, (src, dst)) in sources.iter().zip(targets.iter()).enumerate() {
+                let size = sizes[idx];
+                let s_view = src.block_data().block_view()?;
+                let d_view = dst.block_data().block_view()?;
+                let d_dev = translate(unsafe { d_view.as_ptr() }, size)?;
+                unsafe {
+                    cuda_result::memcpy_dtod_async(
+                        d_dev,
+                        s_view.as_ptr() as u64,
+                        size,
+                        stream.cu_stream(),
+                    )
+                }
+                .map_err(|e| {
+                    TransferError::ExecutionError(format!("direct-io D2H memcpy failed: {e}"))
+                })?;
+            }
+        }
+        _ => {
+            return Err(TransferError::ExecutionError(
+                "direct-io executor: not a direct-io strategy".into(),
+            ));
+        }
+    }
+
+    // The async memcpys must complete before the caller proceeds (the staged
+    // arm's synchronous shape; the async fire-and-forget is a follow-up).
+    let event = stream
+        .record_event(Some(CUevent_flags::CU_EVENT_BLOCKING_SYNC))
+        .map_err(|e| {
+            TransferError::ExecutionError(format!("Failed to record direct-io event: {e}"))
+        })?;
+    event.synchronize().map_err(|e| {
+        TransferError::ExecutionError(format!("Failed to sync direct-io event: {e}"))
+    })?;
+
+    Ok(())
+}
+
 /// Copy a range of layers from a source to a destination using CUDA memcpy
 pub fn copy_layers<'a, Source, Destination>(
     layer_range: Range<usize>,
@@ -560,8 +685,10 @@ where
 /// backings (Pinned/Mock) use H2D/D2H; the Vmm device-alias uses D2D
 /// (see `TransferContext::host_transfer_adjust`); raw-MMIO Bar/Bdf host
 /// tiers use the staged variants (`CudaStagedH2D`/`CudaStagedD2H`), whose
-/// CPU legs hand the window VA to no CUDA call. Asserts membership for
-/// devbar pairs, not the exact variant.
+/// CPU legs hand the window VA to no CUDA call, or the direct-io variants
+/// (`CudaDirectIoH2D`/`CudaDirectIoD2H`) when the window is
+/// IOMEMORY-registered. Asserts membership for devbar pairs, not the exact
+/// variant.
 #[cfg(debug_assertions)]
 fn assert_strategy_valid<Source: StorageTypeProvider, Destination: StorageTypeProvider>(
     strategy: TransferStrategy,
@@ -579,8 +706,10 @@ fn assert_strategy_valid<Source: StorageTypeProvider, Destination: StorageTypePr
                     | TransferStrategy::CudaAsyncD2D
                     | TransferStrategy::CudaStagedH2D
                     | TransferStrategy::CudaStagedD2H
+                    | TransferStrategy::CudaDirectIoH2D
+                    | TransferStrategy::CudaDirectIoD2H
             ),
-            "devbar pair strategy must be H2D/D2H/D2D/staged, got {strategy:?}"
+            "devbar pair strategy must be H2D/D2H/D2D/staged/direct-io, got {strategy:?}"
         );
     } else {
         assert_eq!(

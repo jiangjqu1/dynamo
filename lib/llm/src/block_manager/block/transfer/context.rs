@@ -194,8 +194,9 @@ impl HostTransferSemantics {
     /// The strategy adjustment this semantics implies for a compile-time
     /// strategy: DeviceAlias turns H2D/D2H into D2D (the "host" pointer is a
     /// device VA); StagedCpu turns H2D/D2H into staged CPU bounce copies (the
-    /// raw-MMIO window has no GPU-side access); every other combination is
-    /// the identity.
+    /// raw-MMIO window has no GPU-side access); DirectIo turns H2D/D2H into
+    /// the direct-io device-VA variants; every other combination is the
+    /// identity.
     pub fn adjust(self, strategy: TransferStrategy) -> TransferStrategy {
         match (self, strategy) {
             (HostTransferSemantics::DeviceAlias, TransferStrategy::CudaAsyncH2D)
@@ -237,6 +238,12 @@ pub struct TransferContext {
     /// How the host-tier pool's memory is accessed by transfers (see
     /// [`HostTransferSemantics`]).
     host_transfer_semantics: HostTransferSemantics,
+
+    /// The BAR window's io mapping (host base, device base, length) for the
+    /// DirectIo executor's pointer translation. Set once at pool construction
+    /// (after the host tier's allocate); interior-mutable because the wiring
+    /// lands after the context is shared.
+    host_tier_io_mapping: std::sync::Mutex<Option<(usize, u64, usize)>>,
 }
 
 impl TransferContext {
@@ -308,6 +315,7 @@ impl TransferContext {
             cuda_event_worker: Some(cuda_event_worker),
             cancel_token,
             host_transfer_semantics: HostTransferSemantics::default(),
+            host_tier_io_mapping: std::sync::Mutex::new(None),
         })
     }
 
@@ -361,6 +369,17 @@ impl TransferContext {
     /// [`HostTransferSemantics::HostPointer`].
     pub fn set_host_transfer_semantics(&mut self, semantics: HostTransferSemantics) {
         self.host_transfer_semantics = semantics;
+    }
+
+    /// Wire the BAR window's io mapping (host base, device base, length) for
+    /// the DirectIo executor's pointer translation. Idempotent.
+    pub fn set_host_tier_io_mapping(&self, mapping: (usize, u64, usize)) {
+        *self.host_tier_io_mapping.lock().unwrap() = Some(mapping);
+    }
+
+    /// The wired io mapping, if any.
+    pub fn host_tier_io_mapping(&self) -> Option<(usize, u64, usize)> {
+        *self.host_tier_io_mapping.lock().unwrap()
     }
 
     /// Adjust a compile-time transfer strategy for this context's host-tier

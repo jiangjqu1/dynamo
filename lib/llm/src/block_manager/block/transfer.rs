@@ -285,6 +285,12 @@ where
             tx.send(()).unwrap();
             Ok(rx)
         }
+        TransferStrategy::CudaDirectIoH2D | TransferStrategy::CudaDirectIoD2H => {
+            tracing::debug!("Transfer: Using direct-io strategy: {:?}", strategy);
+            cuda::direct_io_write_blocks_to(sources, targets, &ctx, strategy)?;
+            tx.send(()).unwrap();
+            Ok(rx)
+        }
         _ => Err(TransferError::IncompatibleTypes(format!(
             "Unsupported copy strategy: {:?}",
             strategy
