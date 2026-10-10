@@ -1114,6 +1114,106 @@ mod tests {
         assert!(select_resource_file("0000:41:00.0", 128 << 30, None, &dir).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// Direct-io roundtrip through the REAL BAR: H2D and D2H via the
+    /// IOMEMORY-registered device VA (the executor's shape). REQUIRES root
+    /// (the IOMEMORY registration's privilege check) and the expander
+    /// stand-in (the BAR aperture as resource0); run on the node with the
+    /// `testing-cuda` feature. A non-root run fails in `DevbarStorage::from_bar`
+    /// at the registration with CUDA_ERROR_NOT_PERMITTED (the documented
+    /// privilege requirement); a no-GPU machine fails earlier at cudarc /
+    /// context setup.
+    #[cfg(feature = "testing-cuda")]
+    #[test]
+    fn test_devbar_direct_io_roundtrip_real_bar() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("DYN_KVBM_DEVBAR_BDF", "0000:41:00.0") };
+        unsafe { std::env::set_var("DYN_KVBM_DEVBAR_RESOURCE_INDEX", "0") };
+        unsafe { std::env::set_var("DYN_KVBM_DEVBAR_TRANSFERS", "direct") };
+        let alloc = DevbarAllocator::from_env().unwrap();
+        assert!(matches!(
+            alloc.transfer_semantics(),
+            crate::block_manager::block::transfer::HostTransferSemantics::DirectIo
+        ));
+        let mut storage = alloc
+            .allocate(64 * 1024)
+            .expect("direct alloc (root + the expander stand-in needed)");
+        let (host_base, io_dev_base, len) = alloc.io_mapping().expect("io mapping wired");
+        assert_eq!(len, 64 * 1024);
+
+        let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+        ctx.bind_to_thread().unwrap();
+
+        // H2D: stamp a pattern into the window via the host VA (CPU),
+        // translate to the device VA, memcpy to a device buffer, DtoH back,
+        // compare — the executor's shape.
+        let pattern: Vec<u8> = (0..64).map(|i| (0xA5 ^ i) as u8).collect();
+        unsafe {
+            std::ptr::copy_nonoverlapping(pattern.as_ptr(), storage.as_mut_ptr(), pattern.len());
+        }
+        let s_dev = io_dev_base + (storage.addr() as usize - host_base) as u64;
+        let mut dev: sys::CUdeviceptr = 0;
+        unsafe {
+            assert_eq!(
+                sys::cuMemAlloc_v2(&mut dev, 64 * 1024),
+                sys::CUresult::CUDA_SUCCESS
+            );
+            assert_eq!(
+                sys::cuMemcpyAsync(dev, s_dev, pattern.len(), std::ptr::null_mut()),
+                sys::CUresult::CUDA_SUCCESS
+            );
+            let mut back = [0u8; 64];
+            assert_eq!(
+                sys::cuMemcpyDtoH_v2(back.as_mut_ptr() as *mut core::ffi::c_void, dev, 64),
+                sys::CUresult::CUDA_SUCCESS
+            );
+            assert_eq!(
+                &back,
+                pattern.as_slice(),
+                "direct H2D through the io mapping"
+            );
+            assert_eq!(sys::cuMemFree_v2(dev), sys::CUresult::CUDA_SUCCESS);
+        }
+
+        // D2H: stamp a distinct pattern into VRAM, memcpy through the device
+        // VA into the window, read back via the host VA (CPU), compare.
+        let changed: Vec<u8> = (0..64).map(|i| (0x5C ^ i) as u8).collect();
+        let mut dev2: sys::CUdeviceptr = 0;
+        unsafe {
+            assert_eq!(
+                sys::cuMemAlloc_v2(&mut dev2, 64 * 1024),
+                sys::CUresult::CUDA_SUCCESS
+            );
+            assert_eq!(
+                sys::cuMemcpyHtoD_v2(
+                    dev2,
+                    changed.as_ptr() as *const core::ffi::c_void,
+                    changed.len()
+                ),
+                sys::CUresult::CUDA_SUCCESS
+            );
+            assert_eq!(
+                sys::cuMemcpyAsync(s_dev, dev2, changed.len(), std::ptr::null_mut()),
+                sys::CUresult::CUDA_SUCCESS
+            );
+            assert_eq!(sys::cuMemFree_v2(dev2), sys::CUresult::CUDA_SUCCESS);
+        }
+        let mut window_back = [0u8; 64];
+        unsafe {
+            std::ptr::copy_nonoverlapping(Storage::as_ptr(&storage), window_back.as_mut_ptr(), 64);
+        }
+        assert_eq!(
+            window_back.as_slice(),
+            changed.as_slice(),
+            "direct D2H through the io mapping"
+        );
+
+        unsafe {
+            std::env::remove_var("DYN_KVBM_DEVBAR_TRANSFERS");
+            std::env::remove_var("DYN_KVBM_DEVBAR_RESOURCE_INDEX");
+            std::env::remove_var("DYN_KVBM_DEVBAR_BDF");
+        }
+    }
 }
 
 #[cfg(all(test, feature = "testing-nixl"))]
