@@ -420,6 +420,9 @@ impl Drop for BounceSyncGuard<'_> {
 /// Xid-31 safety invariant: no CUDA call ever touches the window VA. The
 /// CPU legs move data window↔bounce; the DMAs move data bounce↔device only.
 ///
+/// The DMA legs decompose LayerSeparate device blocks into per-`(layer,
+/// outer)` segments (the bounce's logical layout mirrors the window's).
+///
 /// Bounce allocation tradeoff: `PinnedStorage::new_for_device` allocates
 /// WRITE_COMBINED pinned memory by default (unless the
 /// `DYN_KVBM_DISABLE_WRITE_COMBINED` env toggle is set). WC is ideal for
@@ -450,11 +453,30 @@ where
     }
 
     // Per-block view sizes, collected once: a block view covers the whole
-    // block, so `size` is the block's total byte size.
+    // block, so `size` is the block's total byte size. A LayerSeparate block
+    // has no whole-block view; its total is the uniform segment size times
+    // the segment count (the same product `block_view` computes for
+    // contiguous blocks).
     let mut sizes = Vec::with_capacity(sources.len());
     let mut total = 0usize;
     for src in sources {
-        let size = src.block_data().block_view()?.size();
+        let s_data = src.block_data();
+        let size = if s_data.is_fully_contiguous() {
+            s_data.block_view()?.size()
+        } else {
+            let seg_size = s_data.layer_view(0, 0)?.size();
+            seg_size
+                .checked_mul(s_data.num_layers())
+                .and_then(|intermediate| intermediate.checked_mul(s_data.num_outer_dims()))
+                .ok_or_else(|| {
+                    TransferError::ExecutionError(format!(
+                        "staged executor: block size overflow: seg={seg_size} * layers={} * \
+                         outer_dims={}",
+                        s_data.num_layers(),
+                        s_data.num_outer_dims()
+                    ))
+                })?
+        };
         sizes.push(size);
         total += size;
     }
@@ -494,18 +516,49 @@ where
                 offset += size;
             }
 
-            // DMA legs: bounce -> device, async on the stream.
+            // DMA legs: bounce -> device, async on the stream. When the
+            // device block is LayerSeparate, copy per-`(layer, outer)`
+            // segment: the bounce mirrors the window's FullyContiguous
+            // layout, so each segment lands at its logical offset.
             let mut offset = 0usize;
             for (idx, dst) in targets.iter_mut().enumerate() {
                 let size = sizes[idx];
-                let mut d_view = dst.block_data_mut().block_view_mut()?;
-                debug_assert_eq!(d_view.size(), size);
-                // SAFETY: the bounce holds `size` readable bytes at `offset`
-                // and `d_view` covers `size` writable device bytes; the
-                // regions do not overlap.
-                unsafe {
-                    cuda_memcpy_h2d(bounce_base.add(offset), d_view.as_mut_ptr(), size, stream)
-                }?;
+                let d_data = dst.block_data_mut();
+                if d_data.is_fully_contiguous() {
+                    let mut d_view = d_data.block_view_mut()?;
+                    debug_assert_eq!(d_view.size(), size);
+                    // SAFETY: the bounce holds `size` readable bytes at `offset`
+                    // and `d_view` covers `size` writable device bytes; the
+                    // regions do not overlap.
+                    unsafe {
+                        cuda_memcpy_h2d(bounce_base.add(offset), d_view.as_mut_ptr(), size, stream)
+                    }?;
+                } else {
+                    let seg_count = d_data.num_layers() * d_data.num_outer_dims();
+                    let seg_size = size / seg_count;
+                    for layer_idx in 0..d_data.num_layers() {
+                        for outer_idx in 0..d_data.num_outer_dims() {
+                            let d_view = d_data.layer_view(layer_idx, outer_idx)?;
+                            let seg_off = offset
+                                + (layer_idx * d_data.num_outer_dims() + outer_idx) * seg_size;
+                            debug_assert_eq!(d_view.size(), seg_size);
+                            // SAFETY: the bounce holds `seg_size` readable
+                            // bytes at `seg_off`; the pointer is only handed
+                            // to the driver (the DMA writes the device bytes,
+                            // Rust never dereferences it); the regions do not
+                            // overlap (the bounce is host memory, the block is
+                            // device memory).
+                            unsafe {
+                                cuda_memcpy_h2d(
+                                    bounce_base.add(seg_off),
+                                    d_view.as_ptr() as *mut u8,
+                                    seg_size,
+                                    stream,
+                                )
+                            }?;
+                        }
+                    }
+                }
                 offset += size;
             }
 
@@ -521,15 +574,47 @@ where
             })?;
         }
         TransferStrategy::CudaStagedD2H => {
-            // DMA legs first: device -> bounce, async on the stream.
+            // DMA legs first: device -> bounce, async on the stream. When the
+            // device block is LayerSeparate, copy per-`(layer, outer)`
+            // segment: the bounce mirrors the window's FullyContiguous
+            // layout, so each segment lands at its logical offset.
             let mut offset = 0usize;
             for (idx, src) in sources.iter().enumerate() {
                 let size = sizes[idx];
-                let s_view = src.block_data().block_view()?;
-                // SAFETY: `s_view` covers `size` readable device bytes and
-                // the bounce has `total >= offset + size` writable bytes; the
-                // regions do not overlap.
-                unsafe { cuda_memcpy_d2h(s_view.as_ptr(), bounce_base.add(offset), size, stream) }?;
+                let s_data = src.block_data();
+                if s_data.is_fully_contiguous() {
+                    let s_view = s_data.block_view()?;
+                    debug_assert_eq!(s_view.size(), size);
+                    // SAFETY: `s_view` covers `size` readable device bytes and
+                    // the bounce has `total >= offset + size` writable bytes; the
+                    // regions do not overlap.
+                    unsafe {
+                        cuda_memcpy_d2h(s_view.as_ptr(), bounce_base.add(offset), size, stream)
+                    }?;
+                } else {
+                    let seg_count = s_data.num_layers() * s_data.num_outer_dims();
+                    let seg_size = size / seg_count;
+                    for layer_idx in 0..s_data.num_layers() {
+                        for outer_idx in 0..s_data.num_outer_dims() {
+                            let s_view = s_data.layer_view(layer_idx, outer_idx)?;
+                            let seg_off = offset
+                                + (layer_idx * s_data.num_outer_dims() + outer_idx) * seg_size;
+                            debug_assert_eq!(s_view.size(), seg_size);
+                            // SAFETY: `s_view` covers `seg_size` readable
+                            // device bytes and the bounce has
+                            // `total >= seg_off + seg_size` writable bytes;
+                            // the regions do not overlap.
+                            unsafe {
+                                cuda_memcpy_d2h(
+                                    s_view.as_ptr(),
+                                    bounce_base.add(seg_off),
+                                    seg_size,
+                                    stream,
+                                )
+                            }?;
+                        }
+                    }
+                }
                 offset += size;
             }
 
