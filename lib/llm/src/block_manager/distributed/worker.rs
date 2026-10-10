@@ -189,10 +189,19 @@ async fn perform_allocation_and_build_handler(
     // Backed by a BAR-mapped devbar region when DYN_KVBM_DEVBAR_* is configured,
     // otherwise standard pinned host memory (default deployments unchanged).
     let host_blocks = if should_allocate_offload && leader_meta.num_host_blocks > 0 {
+        // The layout takes the Arc by value; clone so the io-mapping stash
+        // (filled by the allocate inside) stays readable after the call.
+        let host_alloc_wire = Arc::clone(&host_allocator);
         let host_layout = layout_builder
             .num_blocks(leader_meta.num_host_blocks)
             .build()?
-            .allocate_layout(worker_config.host_layout_type, host_allocator)?;
+            .allocate_layout(worker_config.host_layout_type, host_alloc_wire)?;
+        // Direct transfers: wire the BAR window's io mapping (host base,
+        // device base, length) into the context for the executor's pointer
+        // translation. Present only when the IOMEMORY registration succeeded.
+        if let Some(mapping) = host_allocator.io_mapping() {
+            transfer_context.set_host_tier_io_mapping(mapping);
+        }
         Some(KvbmWorker::make_layout::<_, BasicMetadata>(
             host_layout,
             transfer_context.nixl_agent().as_ref(),

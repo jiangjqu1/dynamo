@@ -626,10 +626,14 @@ impl NixlDescriptor for DevbarStorage {
 /// The tier-2 sizing still comes from `DYN_KVBM_CPU_CACHE_GB` /
 /// `DYN_KVBM_CPU_CACHE_OVERRIDE_NUM_BLOCKS` (computed upstream into num_host_blocks);
 /// allocation fails if the requested size exceeds the devbar region.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct DevbarAllocator {
     region: Option<DevbarRegion>,
     device_id: u32,
+    /// The io mapping stashed by the last Bar/Bdf allocate (present only when
+    /// the IOMEMORY registration succeeded): (host base, device base, length).
+    /// The worker holds the allocator, not the storage — this is the channel.
+    io_mapping: std::sync::Mutex<Option<(usize, u64, usize)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -721,6 +725,7 @@ impl DevbarAllocator {
             return Ok(Self {
                 region: Some(DevbarRegion::Mock),
                 device_id,
+                io_mapping: std::sync::Mutex::new(None),
             });
         }
 
@@ -732,6 +737,7 @@ impl DevbarAllocator {
             return Ok(Self {
                 region: Some(DevbarRegion::Vmm),
                 device_id,
+                io_mapping: std::sync::Mutex::new(None),
             });
         }
 
@@ -769,12 +775,14 @@ impl DevbarAllocator {
                     explicit_index,
                 }),
                 device_id,
+                io_mapping: std::sync::Mutex::new(None),
             });
         }
 
         Ok(Self {
             region: None,
             device_id,
+            io_mapping: std::sync::Mutex::new(None),
         })
     }
 
@@ -783,6 +791,7 @@ impl DevbarAllocator {
         Self {
             region: Some(DevbarRegion::Mock),
             device_id,
+            io_mapping: std::sync::Mutex::new(None),
         }
     }
 
@@ -791,6 +800,7 @@ impl DevbarAllocator {
         Self {
             region: Some(DevbarRegion::Bar { path, offset }),
             device_id,
+            io_mapping: std::sync::Mutex::new(None),
         }
     }
 
@@ -799,6 +809,7 @@ impl DevbarAllocator {
         Self {
             region: Some(DevbarRegion::Vmm),
             device_id,
+            io_mapping: std::sync::Mutex::new(None),
         }
     }
 
@@ -858,11 +869,17 @@ impl DevbarAllocator {
             _ => S::HostPointer,
         }
     }
+
+    /// The io mapping stashed by the last Bar/Bdf allocate (present only when
+    /// the IOMEMORY registration succeeded): (host base, device base, length).
+    pub fn io_mapping(&self) -> Option<(usize, u64, usize)> {
+        *self.io_mapping.lock().unwrap()
+    }
 }
 
 impl StorageAllocator<DevbarStorage> for DevbarAllocator {
     fn allocate(&self, size: usize) -> Result<DevbarStorage, StorageError> {
-        match &self.region {
+        let storage = match &self.region {
             Some(DevbarRegion::Bar { path, offset }) => {
                 DevbarStorage::from_bar(path.clone(), *offset, size, self.device_id)
             }
@@ -882,7 +899,13 @@ impl StorageAllocator<DevbarStorage> for DevbarAllocator {
             Some(DevbarRegion::Mock) => DevbarStorage::mock(size, self.device_id),
             Some(DevbarRegion::Vmm) => DevbarStorage::from_vmm(size, self.device_id),
             None => DevbarStorage::pinned_fallback(size, Some(self.device_id)),
+        }?;
+        // Stash the io mapping for the worker's wiring (the worker holds the
+        // allocator, not the storage). Absent for every non-direct backing.
+        if let Some(mapping) = storage.io_mapping() {
+            *self.io_mapping.lock().unwrap() = Some(mapping);
         }
+        Ok(storage)
     }
 }
 
