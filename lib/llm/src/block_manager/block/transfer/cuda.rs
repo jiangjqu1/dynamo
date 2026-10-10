@@ -81,6 +81,64 @@ where
     Ok((src_addresses, dst_addresses))
 }
 
+/// The copy segments for one (source, target) block pair: one whole-block pair
+/// when both sides are fully contiguous, otherwise the per-`(layer, outer)`
+/// layer-view pairs — the same layout-agnostic decomposition
+/// `collect_kv_addresses` uses for the custom kernel. Each entry is
+/// `(src_ptr, dst_ptr, size)`; the sizes are uniform across segments.
+///
+/// SAFETY (the returned raw pointers): the views borrow pool-owned block data
+/// that outlives the transfer; the pointers are handed to the CUDA memcpy and
+/// never dereferenced on the host.
+fn block_copy_segments<Source, Target>(
+    src: &Source,
+    dst: &mut Target,
+) -> Result<Vec<(*const u8, *mut u8, usize)>, TransferError>
+where
+    Source: BlockDataProvider,
+    Target: BlockDataProviderMut,
+{
+    let s_data = src.block_data();
+    let d_data = dst.block_data_mut();
+
+    if s_data.is_fully_contiguous() && d_data.is_fully_contiguous() {
+        let s_view = s_data.block_view()?;
+        let mut d_view = d_data.block_view_mut()?;
+        debug_assert_eq!(s_view.size(), d_view.size());
+        // SAFETY: the views cover pool-owned block data that stays valid
+        // until the transfer completes; the pointers are only handed to the
+        // driver (never dereferenced by Rust).
+        return Ok(vec![(
+            unsafe { s_view.as_ptr() },
+            unsafe { d_view.as_mut_ptr() },
+            s_view.size(),
+        )]);
+    }
+
+    assert_eq!(
+        s_data.num_layers(),
+        d_data.num_layers(),
+        "segment copy: layer-count mismatch"
+    );
+    let mut segments = Vec::new();
+    for layer_idx in 0..s_data.num_layers() {
+        for outer_idx in 0..s_data.num_outer_dims() {
+            let s_view = s_data.layer_view(layer_idx, outer_idx)?;
+            let mut d_view = d_data.layer_view_mut(layer_idx, outer_idx)?;
+            debug_assert_eq!(s_view.size(), d_view.size());
+            // SAFETY: the views cover pool-owned block data that stays valid
+            // until the transfer completes; the pointers are only handed to
+            // the driver (never dereferenced by Rust).
+            segments.push((
+                unsafe { s_view.as_ptr() },
+                unsafe { d_view.as_mut_ptr() },
+                s_view.size(),
+            ));
+        }
+    }
+    Ok(segments)
+}
+
 /// Launch CUDA kernel directly with pinned buffer pointers (no address copying)
 unsafe fn launch_copy_kernel_direct(
     src_pinned_ptr: u64,
@@ -518,10 +576,13 @@ where
 /// Direct batch copy for IOMEMORY-registered BAR windows (the
 /// `DYN_KVBM_DEVBAR_TRANSFERS=direct` path): the window's device VA is
 /// registered (bar-direct-spike-verified, ~3.0 GiB/s both directions on
-/// cm008), so every block copies as a GPU-side memcpy through the device VA,
-/// pointer-translated via the context's io mapping. Runs on the calling
-/// thread; the batch's async memcpys are synced by the closing event (the
-/// staged arm's synchronous shape).
+/// cm008), so every block copies as GPU-side memcpys through the device VA,
+/// pointer-translated via the context's io mapping — per-segment
+/// (LayerSeparate-capable): one whole-block memcpy when both sides are fully
+/// contiguous, otherwise per-`(layer, outer)` layer-view memcpys (the same
+/// decomposition `collect_kv_addresses` uses for the custom kernel). Runs on
+/// the calling thread; the batch's async memcpys are synced by the closing
+/// event (the staged arm's synchronous shape).
 ///
 /// Xid-31 safety: the device VA comes from the registration's device-mapping
 /// (the driver-sanctioned surface) — never the raw sysfs VA, which is the
@@ -590,65 +651,45 @@ where
 
     match strategy {
         TransferStrategy::CudaDirectIoH2D => {
-            // The host tier is the SOURCE: window -> device through the io mapping.
+            // The host tier is the SOURCE: window -> device through the io
+            // mapping. Per-segment: the device tier may be LayerSeparate.
             for (src, dst) in sources.iter().zip(targets.iter_mut()) {
-                let s_view = src.block_data().block_view()?;
-                let mut d_view = dst.block_data_mut().block_view_mut()?;
-                debug_assert_eq!(s_view.size(), d_view.size());
-                // The window side's size drives the range check; the memcpy
-                // moves both views' bytes (equal by the assert above).
-                let size = s_view.size();
-                // SAFETY: the view is alive for the memcpy duration
-                // (pool-owned memory); the raw pointer is only translated
-                // (never dereferenced by Rust).
-                let s_dev = translate(unsafe { s_view.as_ptr() }, size)?;
-                unsafe {
-                    // SAFETY: both views are alive for the memcpy duration
+                let segments = block_copy_segments(src, dst)?;
+                for (s_ptr, d_ptr, seg) in segments {
+                    let s_dev = translate(s_ptr, seg)?;
+                    // SAFETY: the device block data outlives the transfer
                     // (pool-owned memory); the pointers are only passed to
                     // the driver (never dereferenced by Rust); the regions
                     // do not overlap (the window is host memory, the peer
                     // block is device memory).
-                    cuda_result::memcpy_dtod_async(
-                        d_view.as_mut_ptr() as u64,
-                        s_dev,
-                        size,
-                        stream.cu_stream(),
-                    )
+                    unsafe {
+                        cuda_result::memcpy_dtod_async(d_ptr as u64, s_dev, seg, stream.cu_stream())
+                    }
+                    .map_err(|e| {
+                        TransferError::ExecutionError(format!("direct-io H2D memcpy failed: {e}"))
+                    })?;
                 }
-                .map_err(|e| {
-                    TransferError::ExecutionError(format!("direct-io H2D memcpy failed: {e}"))
-                })?;
             }
         }
         TransferStrategy::CudaDirectIoD2H => {
-            // The host tier is the TARGET: device -> window through the io mapping.
+            // The host tier is the TARGET: device -> window through the io
+            // mapping. Per-segment: the device tier may be LayerSeparate.
             for (src, dst) in sources.iter().zip(targets.iter_mut()) {
-                let s_view = src.block_data().block_view()?;
-                let mut d_view = dst.block_data_mut().block_view_mut()?;
-                debug_assert_eq!(s_view.size(), d_view.size());
-                // The window side's size drives the range check; the memcpy
-                // moves both views' bytes (equal by the assert above).
-                let size = d_view.size();
-                // SAFETY: the view is alive for the memcpy duration
-                // (pool-owned memory); the raw pointer is only translated
-                // (never dereferenced by Rust).
-                let d_dev = translate(unsafe { d_view.as_mut_ptr() }, size)?;
-                unsafe {
-                    // SAFETY: both views are alive for the memcpy duration
+                let segments = block_copy_segments(src, dst)?;
+                for (s_ptr, d_ptr, seg) in segments {
+                    let d_dev = translate(d_ptr, seg)?;
+                    // SAFETY: the device block data outlives the transfer
                     // (pool-owned memory); the pointers are only passed to
                     // the driver (never dereferenced by Rust); the regions
                     // do not overlap (the window is host memory, the peer
                     // block is device memory).
-                    cuda_result::memcpy_dtod_async(
-                        d_dev,
-                        s_view.as_ptr() as u64,
-                        size,
-                        stream.cu_stream(),
-                    )
+                    unsafe {
+                        cuda_result::memcpy_dtod_async(d_dev, s_ptr as u64, seg, stream.cu_stream())
+                    }
+                    .map_err(|e| {
+                        TransferError::ExecutionError(format!("direct-io D2H memcpy failed: {e}"))
+                    })?;
                 }
-                .map_err(|e| {
-                    TransferError::ExecutionError(format!("direct-io D2H memcpy failed: {e}"))
-                })?;
             }
         }
         _ => {
