@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -41,7 +42,7 @@ class DynamoConnectorMetadata(KVConnectorMetadata):
         self.metadata = metadata
 
 
-class DynamoConnector(KVConnectorBase_V1):
+class DynamoConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -97,6 +98,25 @@ class DynamoConnector(KVConnectorBase_V1):
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         return self._scheduler.request_finished(request, block_ids)
+
+    @nvtx_annotate(category="scheduler")
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        """HMA (Hybrid Memory Allocator) support (vLLM 0.29+).
+
+        Single-group configs (attention-only models) delegate to the existing
+        request_finished flow unchanged. Multi-group configs (hybrid SSM
+        models) return (False, None) — vLLM frees the blocks immediately and
+        the kvbm offload/onboard for the per-group KV/state is a follow-up;
+        declaring HMA keeps the hybrid memory allocator enabled so hybrid
+        models can start.
+        """
+        if len(block_ids) == 1:
+            return self.request_finished(request, block_ids[0])
+        return False, None
 
     @nvtx_annotate(category="scheduler")
     @override
