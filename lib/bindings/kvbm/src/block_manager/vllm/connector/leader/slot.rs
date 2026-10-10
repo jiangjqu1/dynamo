@@ -1658,10 +1658,6 @@ async fn process_offload_request(
 
     if bypass_cpu_mem {
         // Direct G1 -> G3 path (Device to Disk, bypassing Host)
-        kvbm_metrics
-            .offload_blocks_d2d
-            .inc_by(offload_req.block_ids.len() as u64);
-
         tracing::debug!(
             request_id = %request_id,
             operation_id = %operation_id,
@@ -1673,6 +1669,7 @@ async fn process_offload_request(
             block_manager.disk().unwrap(),
             BlockTransferPool::Disk,
             leader,
+            kvbm_metrics,
             &request_id,
             &operation_id,
             "disk",
@@ -1680,15 +1677,12 @@ async fn process_offload_request(
         .await?;
     } else {
         // Standard path: G1 -> G2 (Device to Host)
-        kvbm_metrics
-            .offload_blocks_d2h
-            .inc_by(offload_req.block_ids.len() as u64);
-
         process_offload_to_storage(
             offload_req,
             block_manager.host().unwrap(),
             BlockTransferPool::Host,
             leader,
+            kvbm_metrics,
             &request_id,
             &operation_id,
             "host",
@@ -1704,6 +1698,7 @@ async fn process_offload_to_storage<S, L, M>(
     storage_pool: &dyn BlockPool<S, L, M>,
     transfer_pool: BlockTransferPool,
     leader: &Arc<KvbmLeader>,
+    kvbm_metrics: KvbmMetrics,
     request_id: &str,
     operation_id: &uuid::Uuid,
     storage_name: &str,
@@ -1725,6 +1720,7 @@ where
         .into_iter()
         .zip(allocated_block_ids)
         .collect();
+    let num_blocks = block_pairs.len();
 
     tracing::debug!(
         request_id = request_id,
@@ -1780,6 +1776,15 @@ where
     // 4. Wait for the offload request to complete
     match notify_receiver.await {
         Ok(_) => {
+            match transfer_pool {
+                BlockTransferPool::Disk => {
+                    kvbm_metrics.offload_blocks_d2d.inc_by(num_blocks as u64);
+                }
+                BlockTransferPool::Host => {
+                    kvbm_metrics.offload_blocks_d2h.inc_by(num_blocks as u64);
+                }
+                _ => {}
+            }
             tracing::debug!(
                 "Offloading transfer to {} completed successfully",
                 storage_name
@@ -1817,16 +1822,6 @@ async fn process_onboard_request(
     leader: &Arc<KvbmLeader>,
     kvbm_metrics: KvbmMetrics,
 ) -> anyhow::Result<()> {
-    if onboard_req.src_blocks.storage_pool() == BlockTransferPool::Host {
-        kvbm_metrics
-            .onboard_blocks_h2d
-            .inc_by(onboard_req.src_blocks.len() as u64);
-    } else if onboard_req.src_blocks.storage_pool() == BlockTransferPool::Disk {
-        kvbm_metrics
-            .onboard_blocks_d2d
-            .inc_by(onboard_req.src_blocks.len() as u64);
-    }
-
     let request_id = &onboard_req.request_id;
     let operation_id = &onboard_req.operation_id;
 
@@ -1857,6 +1852,15 @@ async fn process_onboard_request(
 
     match notify_receiver.await {
         Ok(_) => {
+            if onboard_req.src_blocks.storage_pool() == BlockTransferPool::Host {
+                kvbm_metrics
+                    .onboard_blocks_h2d
+                    .inc_by(onboard_req.src_blocks.len() as u64);
+            } else if onboard_req.src_blocks.storage_pool() == BlockTransferPool::Disk {
+                kvbm_metrics
+                    .onboard_blocks_d2d
+                    .inc_by(onboard_req.src_blocks.len() as u64);
+            }
             tracing::debug!("Onboarding transfer completed successfully");
         }
         Err(_) => {
