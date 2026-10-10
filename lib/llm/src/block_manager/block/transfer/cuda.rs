@@ -526,6 +526,10 @@ where
 /// Xid-31 safety: the device VA comes from the registration's device-mapping
 /// (the driver-sanctioned surface) — never the raw sysfs VA, which is the
 /// copy-kernel fault path.
+///
+/// The local (KvManagerModel) path does not wire the io mapping —
+/// `TRANSFERS=direct` there fails with the guard's clean error; wiring it is
+/// a follow-up.
 pub fn direct_io_write_blocks_to<Source, Target>(
     sources: &[Source],
     targets: &mut [Target],
@@ -538,7 +542,9 @@ where
 {
     let (host_base, io_dev_base, win_len) = ctx.host_tier_io_mapping().ok_or_else(|| {
         TransferError::ExecutionError(
-            "direct-io executor: no io mapping wired (the IOMEMORY registration did not run)"
+            "direct-io executor: no io mapping wired (the IOMEMORY registration did not run, or \
+             the local KvManagerModel path which does not wire it — direct transfers are \
+             supported on the distributed worker path)"
                 .into(),
         )
     })?;
