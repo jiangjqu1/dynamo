@@ -901,10 +901,9 @@ impl StorageAllocator<DevbarStorage> for DevbarAllocator {
             None => DevbarStorage::pinned_fallback(size, Some(self.device_id)),
         }?;
         // Stash the io mapping for the worker's wiring (the worker holds the
-        // allocator, not the storage). Absent for every non-direct backing.
-        if let Some(mapping) = storage.io_mapping() {
-            *self.io_mapping.lock().unwrap() = Some(mapping);
-        }
+        // allocator, not the storage). Set unconditionally: None clears a
+        // stale mapping from a previous allocate (strictly more robust).
+        *self.io_mapping.lock().unwrap() = storage.io_mapping();
         Ok(storage)
     }
 }

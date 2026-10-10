@@ -555,24 +555,28 @@ where
         assert_strategy_valid::<Source, Target>(strategy);
     }
 
-    // Per-block view sizes, collected once.
-    let mut sizes = Vec::with_capacity(sources.len());
-    for src in sources {
-        sizes.push(src.block_data().block_view()?.size());
-    }
-
     let stream = ctx.stream();
+
+    // Sync-on-drop guard for the copy loops below: on a mid-loop memcpy
+    // failure the already-issued memcpys are still queued, and returning Err
+    // without a sync would let a caller recycling blocks on Err corrupt data
+    // under an in-flight DMA. The guard's blocking stream synchronize on drop
+    // covers every `?`/early-return path (the staged executor's
+    // `BounceSyncGuard` precedent); on the happy path the drop is redundant
+    // with the closing event sync below. Reused directly: same-file private
+    // guard with exactly these Drop semantics.
+    let _io_sync_guard = BounceSyncGuard(stream);
 
     // Translate a host-tier block pointer into the window's device VA,
     // range-checked against the window span.
     let translate = |ptr: *const u8, size: usize| -> Result<u64, TransferError> {
         let addr = ptr as usize;
-        if addr < host_base || addr.saturating_add(size) > host_base + win_len {
+        if addr < host_base || addr.saturating_add(size) > host_base.saturating_add(win_len) {
             return Err(TransferError::ExecutionError(format!(
                 "direct-io executor: block [0x{addr:x}, 0x{:x}) outside the window \
                  [0x{host_base:x}, 0x{:x})",
                 addr.saturating_add(size),
-                host_base + win_len
+                host_base.saturating_add(win_len)
             )));
         }
         Ok(io_dev_base + (addr - host_base) as u64)
@@ -581,14 +585,25 @@ where
     match strategy {
         TransferStrategy::CudaDirectIoH2D => {
             // The host tier is the SOURCE: window -> device through the io mapping.
-            for (idx, (src, dst)) in sources.iter().zip(targets.iter()).enumerate() {
-                let size = sizes[idx];
+            for (src, dst) in sources.iter().zip(targets.iter_mut()) {
                 let s_view = src.block_data().block_view()?;
-                let d_view = dst.block_data().block_view()?;
+                let mut d_view = dst.block_data_mut().block_view_mut()?;
+                debug_assert_eq!(s_view.size(), d_view.size());
+                // The window side's size drives the range check; the memcpy
+                // moves both views' bytes (equal by the assert above).
+                let size = s_view.size();
+                // SAFETY: the view is alive for the memcpy duration
+                // (pool-owned memory); the raw pointer is only translated
+                // (never dereferenced by Rust).
                 let s_dev = translate(unsafe { s_view.as_ptr() }, size)?;
                 unsafe {
+                    // SAFETY: both views are alive for the memcpy duration
+                    // (pool-owned memory); the pointers are only passed to
+                    // the driver (never dereferenced by Rust); the regions
+                    // do not overlap (the window is host memory, the peer
+                    // block is device memory).
                     cuda_result::memcpy_dtod_async(
-                        d_view.as_ptr() as u64,
+                        d_view.as_mut_ptr() as u64,
                         s_dev,
                         size,
                         stream.cu_stream(),
@@ -601,12 +616,23 @@ where
         }
         TransferStrategy::CudaDirectIoD2H => {
             // The host tier is the TARGET: device -> window through the io mapping.
-            for (idx, (src, dst)) in sources.iter().zip(targets.iter()).enumerate() {
-                let size = sizes[idx];
+            for (src, dst) in sources.iter().zip(targets.iter_mut()) {
                 let s_view = src.block_data().block_view()?;
-                let d_view = dst.block_data().block_view()?;
-                let d_dev = translate(unsafe { d_view.as_ptr() }, size)?;
+                let mut d_view = dst.block_data_mut().block_view_mut()?;
+                debug_assert_eq!(s_view.size(), d_view.size());
+                // The window side's size drives the range check; the memcpy
+                // moves both views' bytes (equal by the assert above).
+                let size = d_view.size();
+                // SAFETY: the view is alive for the memcpy duration
+                // (pool-owned memory); the raw pointer is only translated
+                // (never dereferenced by Rust).
+                let d_dev = translate(unsafe { d_view.as_mut_ptr() }, size)?;
                 unsafe {
+                    // SAFETY: both views are alive for the memcpy duration
+                    // (pool-owned memory); the pointers are only passed to
+                    // the driver (never dereferenced by Rust); the regions
+                    // do not overlap (the window is host memory, the peer
+                    // block is device memory).
                     cuda_result::memcpy_dtod_async(
                         d_dev,
                         s_view.as_ptr() as u64,
