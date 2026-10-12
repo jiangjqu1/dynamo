@@ -33,6 +33,8 @@ if TYPE_CHECKING:
 
 from kvbm.vllm_integration.rust import KvConnectorWorker as RustKvConnectorWorker
 
+from .group_plan import GroupPlan, derive_layer_groups
+
 logger = logging.getLogger(__name__)
 
 
@@ -116,6 +118,7 @@ class KvConnectorWorker:
         self.vllm_config = vllm_config
         self._connector = RustKvConnectorWorker(self.drt, engine_id)
         self.mamba_layer_names: set[str] = set()
+        self.group_plans: list[GroupPlan] = []
 
     # Worker
 
@@ -141,6 +144,15 @@ class KvConnectorWorker:
                 kv_caches.items(), key=lambda item: extract_layer_index(item[0])
             )
         ]
+
+        # Partition the layers into HMA groups (vLLM's kv_cache_config) for
+        # per-group validation below; a missing config falls back to one
+        # group covering every layer.
+        group_plans = derive_layer_groups(
+            getattr(self.vllm_config, "kv_cache_config", None),
+            [name for name, _tensor in ordered_kv_caches],
+        )
+        self.group_plans = group_plans
 
         # Normalize recurrent (Mamba/GDN) layers — list[Tensor] strided views —
         # to the flat raw_tensor backing them, so every registered layer is a
@@ -173,6 +185,14 @@ class KvConnectorWorker:
             attention_layer_count,
             recurrent_layer_count,
         )
+        for group in group_plans:
+            logger.info(
+                "register_kv_caches: group %d: %d layers (mamba=%s), layers=%s",
+                group.group_id,
+                len(group.layer_names),
+                group.is_mamba,
+                group.layer_names[:4],
+            )
 
         events = [
             torch.cuda.Event(enable_timing=False, interprocess=False)
@@ -214,24 +234,31 @@ class KvConnectorWorker:
         page_size = cache_config.block_size
         device_id = ordered_kv_caches[0][1].device.index
 
-        # The block manager's single pool requires uniform bytes-per-block
-        # across all layers.  HMA preserves this invariant across groups when
-        # the per-group block sizes match (Nemotron needed block_size=512);
-        # if a model's recurrent-state config breaks it, fail here naming the
-        # layer instead of corrupting pool metadata downstream.
+        # The block manager tracks per-group pools: bytes-per-block must be
+        # uniform within each HMA group, not across all layers (attention and
+        # Mamba/GDN groups may differ).  With the single-group fallback
+        # (kv_cache_config absent) this degrades to the old all-layers check.
+        # If a model's recurrent-state config breaks a group's invariant, fail
+        # here naming the layer and group instead of corrupting pool metadata
+        # downstream.
         def _byte_size_per_block(t: torch.Tensor) -> int:
             return (t.element_size() * t.nelement()) // num_device_blocks
 
-        expected_bspb = _byte_size_per_block(ordered_kv_caches[0][1])
-        for layer_name, tensor in ordered_kv_caches:
-            actual_bspb = _byte_size_per_block(tensor)
-            if actual_bspb != expected_bspb:
-                raise ValueError(
-                    f"Layer {layer_name}: byte_size_per_block={actual_bspb} "
-                    f"differs from expected={expected_bspb}. All layers must "
-                    "have uniform byte-size-per-block for the block manager "
-                    "(check the HMA per-group block sizes)."
-                )
+        name_to_tensor = dict(ordered_kv_caches)
+        for group in group_plans:
+            if not group.layer_names:
+                continue
+            expected_bspb = _byte_size_per_block(name_to_tensor[group.layer_names[0]])
+            for layer_name in group.layer_names:
+                actual_bspb = _byte_size_per_block(name_to_tensor[layer_name])
+                if actual_bspb != expected_bspb:
+                    raise ValueError(
+                        f"Layer {layer_name}: byte_size_per_block={actual_bspb} "
+                        f"differs from expected={expected_bspb} in group "
+                        f"{group.group_id}. All layers in a group must have "
+                        "uniform byte-size-per-block for the block manager "
+                        "(check the HMA per-group block sizes)."
+                    )
 
         layout = KvTensorLayout.from_vllm_config(self.vllm_config, shape, use_mla)
 
