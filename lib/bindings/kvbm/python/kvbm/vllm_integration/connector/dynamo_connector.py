@@ -126,7 +126,9 @@ class DynamoConnector(KVConnectorBase_V1, SupportsHMA):
     # Worker
 
     @nvtx_annotate(category="worker")
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+    def register_kv_caches(
+        self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
+    ):
         self._worker.register_kv_caches(kv_caches)
 
     @nvtx_annotate(category="worker")

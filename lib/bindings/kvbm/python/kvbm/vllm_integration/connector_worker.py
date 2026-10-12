@@ -7,6 +7,7 @@ Implementation of vLLM KV cache manager protocol.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -31,6 +32,8 @@ if TYPE_CHECKING:
 # )
 
 from kvbm.vllm_integration.rust import KvConnectorWorker as RustKvConnectorWorker
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -76,6 +79,29 @@ class DynamoConnectorMetadata(KVConnectorMetadata):
         self.metadata = metadata
 
 
+def _recover_raw_tensor(state_tensors: "list[torch.Tensor]") -> "torch.Tensor":
+    """Recover the flat raw_tensor backing a list of recurrent-state tensors.
+
+    vLLM's hybrid (HMA) mode creates Mamba/GDN state tensors as strided views
+    (``torch.as_strided``) into a single flat ``int8`` buffer.  The
+    ``raw_tensor`` attribute is not always set on these views, so we
+    reconstruct it from the shared ``untyped_storage()``.
+
+    This uses the low-level ``torch.Tensor.set_`` storage pattern (which
+    PyTorch discourages) because it is the only way to reach the backing
+    buffer from a strided view; it assumes the source tensor's storage is
+    valid and its first dimension is the block count.
+    """
+    raw = getattr(state_tensors[0], "raw_tensor", None)
+    if raw is not None:
+        return raw
+    storage = state_tensors[0].untyped_storage()
+    num_blocks = state_tensors[0].shape[0]
+    device = state_tensors[0].device
+    raw = torch.empty([], dtype=torch.uint8, device=device).set_(storage)
+    return raw.view(num_blocks, -1)
+
+
 class KvConnectorWorker:
     def __init__(self, vllm_config: "VllmConfig", engine_id: str, **kwargs):
         drt: Optional[object] = kwargs.get("drt")
@@ -89,16 +115,21 @@ class KvConnectorWorker:
 
         self.vllm_config = vllm_config
         self._connector = RustKvConnectorWorker(self.drt, engine_id)
+        self.mamba_layer_names: set[str] = set()
 
     # Worker
 
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+    def register_kv_caches(
+        self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
+    ):
         """
         Initialize with the KV caches. Useful for pre-registering the
         KV Caches in the KVConnector (e.g. for NIXL).
 
         Args: kv_caches:
-            dictionary of layer names, kv cache
+            dictionary of layer names, kv cache.  Hybrid models (vLLM HMA)
+            pass a list[Tensor] for recurrent (Mamba/GDN) layers — strided
+            views into one flat backing buffer — instead of a single Tensor.
         """
 
         cache_config = self.vllm_config.cache_config
@@ -110,6 +141,38 @@ class KvConnectorWorker:
                 kv_caches.items(), key=lambda item: extract_layer_index(item[0])
             )
         ]
+
+        # Normalize recurrent (Mamba/GDN) layers — list[Tensor] strided views —
+        # to the flat raw_tensor backing them, so every registered layer is a
+        # Tensor with the same [num_blocks, ...] block layout as attention KV.
+        attention_layer_count = 0
+        recurrent_layer_count = 0
+        normalized_kv_caches: list[tuple[str, torch.Tensor]] = []
+        mamba_layer_names: set[str] = set()
+        for layer_name, value in ordered_kv_caches:
+            if isinstance(value, list):
+                raw_tensor = _recover_raw_tensor(value)
+                mamba_layer_names.add(layer_name)
+                recurrent_layer_count += 1
+                normalized_kv_caches.append((layer_name, raw_tensor))
+                logger.debug(
+                    "register_kv_caches: layer=%s list[Tensor] len=%d raw_shape=%s",
+                    layer_name,
+                    len(value),
+                    list(raw_tensor.shape),
+                )
+            else:
+                attention_layer_count += 1
+                normalized_kv_caches.append((layer_name, value))
+        ordered_kv_caches = normalized_kv_caches
+        self.mamba_layer_names = mamba_layer_names
+
+        logger.info(
+            "register_kv_caches: %d KV layers (%d attention, %d recurrent/HMA)",
+            len(ordered_kv_caches),
+            attention_layer_count,
+            recurrent_layer_count,
+        )
 
         events = [
             torch.cuda.Event(enable_timing=False, interprocess=False)
@@ -127,25 +190,48 @@ class KvConnectorWorker:
             for (layer_name, _tensor), event in zip(ordered_kv_caches, events)
         }
 
-        # Get first tensor to extract common properties
-        first_tensor = ordered_kv_caches[0][1]
-        shape = first_tensor.shape
-
-        # Validate all tensors have same shape
-        if not all(t.shape == shape for t in kv_caches.values()):
-            raise NotImplementedError(
-                "Hybrid models with different KV cache shapes are not supported yet."
-            )
+        # num_device_blocks must come from an attention tensor (>= 3 dims):
+        # recurrent raw_tensors are 2D [num_blocks, flat_state] where shape[1]
+        # is the flattened state size, not the block axis.  Nemotron-style
+        # hybrid patterns start with a Mamba layer, so the first tensor cannot
+        # be assumed to be attention.
+        use_mla = getattr(self.vllm_config.model_config, "use_mla", False)
+        attention_tensor = next(
+            (t for _n, t in ordered_kv_caches if t.dim() >= 3), None
+        )
+        if attention_tensor is None:
+            ref_tensor = ordered_kv_caches[0][1]
+            shape = ref_tensor.shape
+            num_device_blocks = shape[0]
+        else:
+            shape = attention_tensor.shape
+            # MLA tensors are [num_blocks, page_size, head_size] — block dim is always axis 0.
+            # Standard attention tensors are [outer_dim, num_blocks, ...] or [num_blocks, outer_dim, ...]
+            # — block dim is whichever axis is larger, which is unambiguous as long as
+            # num_blocks >> outer_dim (always true in practice).
+            num_device_blocks = shape[0] if use_mla else max(shape[0], shape[1])
 
         page_size = cache_config.block_size
-        use_mla = getattr(self.vllm_config.model_config, "use_mla", False)
+        device_id = ordered_kv_caches[0][1].device.index
 
-        # MLA tensors are [num_blocks, page_size, head_size] — block dim is always axis 0.
-        # Standard attention tensors are [outer_dim, num_blocks, ...] or [num_blocks, outer_dim, ...]
-        # — block dim is whichever axis is larger, which is unambiguous as long as
-        # num_blocks >> outer_dim (always true in practice).
-        num_device_blocks = shape[0] if use_mla else max(shape[0], shape[1])
-        device_id = first_tensor.device.index
+        # The block manager's single pool requires uniform bytes-per-block
+        # across all layers.  HMA preserves this invariant across groups when
+        # the per-group block sizes match (Nemotron needed block_size=512);
+        # if a model's recurrent-state config breaks it, fail here naming the
+        # layer instead of corrupting pool metadata downstream.
+        def _byte_size_per_block(t: torch.Tensor) -> int:
+            return (t.element_size() * t.nelement()) // num_device_blocks
+
+        expected_bspb = _byte_size_per_block(ordered_kv_caches[0][1])
+        for layer_name, tensor in ordered_kv_caches:
+            actual_bspb = _byte_size_per_block(tensor)
+            if actual_bspb != expected_bspb:
+                raise ValueError(
+                    f"Layer {layer_name}: byte_size_per_block={actual_bspb} "
+                    f"differs from expected={expected_bspb}. All layers must "
+                    "have uniform byte-size-per-block for the block manager "
+                    "(check the HMA per-group block sizes)."
+                )
 
         layout = KvTensorLayout.from_vllm_config(self.vllm_config, shape, use_mla)
 
