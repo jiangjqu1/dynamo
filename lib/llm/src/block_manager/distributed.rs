@@ -17,7 +17,7 @@ pub use transfer::{BlockTransferHandler, NcclConfig};
 pub use utils::{
     BlockTransferPool, BlockTransferRequest, ConnectorRequestLeader, ConnectorTransferType,
 };
-pub use worker::{KvbmWorker, KvbmWorkerConfig};
+pub use worker::{KvbmWorker, KvbmWorkerConfig, LayerGroup};
 pub use zmq::Handler;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -54,6 +54,7 @@ impl WorkerState {
 pub fn load_and_validate_tensors(
     tensors: &[Arc<dyn TorchTensor>],
     device_id: usize,
+    groups: &[LayerGroup],
 ) -> anyhow::Result<(Vec<DeviceStorage>, Vec<usize>)> {
     let mut shape = None;
 
@@ -68,18 +69,23 @@ pub fn load_and_validate_tensors(
         tracing::debug!("stride is monotonically decreasing for NHD layout");
         tracing::debug!("stride is NOT monotonically decreasing for HND layout");
 
-        // Check that all layer tensors have the same shape.
-        // TODO: We eventually need to support the weirder models with heterogenous layers.
-        if let Some(shape) = shape.as_ref() {
-            if *shape != tensor.shape() {
-                return Err(anyhow::anyhow!(
-                    "All tensors must have the same shape! Got {:?} and {:?}",
-                    *shape,
-                    tensor.shape()
-                ));
+        // Legacy contract (no groups): all layer tensors share one shape.
+        // With groups, shapes may differ across groups and are checked
+        // per-group below.
+        if groups.is_empty() {
+            // Check that all layer tensors have the same shape.
+            // TODO: We eventually need to support the weirder models with heterogenous layers.
+            if let Some(shape) = shape.as_ref() {
+                if *shape != tensor.shape() {
+                    return Err(anyhow::anyhow!(
+                        "All tensors must have the same shape! Got {:?} and {:?}",
+                        *shape,
+                        tensor.shape()
+                    ));
+                }
+            } else {
+                shape = Some(tensor.shape());
             }
-        } else {
-            shape = Some(tensor.shape());
         }
 
         // Build the storage object from the tensor.
@@ -88,7 +94,41 @@ pub fn load_and_validate_tensors(
         device_tensors.push(device_tensor);
     }
 
-    Ok((device_tensors, shape.unwrap()))
+    // Grouped contract: tensors within a group share a shape; across groups
+    // they may differ (e.g. attention K/V pages vs dense mamba state rows).
+    for (group_idx, group) in groups.iter().enumerate() {
+        let mut group_shape: Option<Vec<usize>> = None;
+        for &tensor_idx in &group.tensor_indices {
+            let tensor = tensors.get(tensor_idx).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Layer group {} references tensor index {} but only {} tensors are registered",
+                    group_idx,
+                    tensor_idx,
+                    tensors.len()
+                )
+            })?;
+            let tensor_shape = tensor.shape();
+            match group_shape {
+                Some(prev) if prev != tensor_shape => {
+                    return Err(anyhow::anyhow!(
+                        "All tensors in layer group {} must have the same shape! Got {:?} and {:?}",
+                        group_idx,
+                        prev,
+                        tensor_shape
+                    ));
+                }
+                None => group_shape = Some(tensor_shape),
+                _ => {}
+            }
+        }
+    }
+
+    Ok((
+        device_tensors,
+        shape
+            .or_else(|| tensors.first().map(|t| t.shape()))
+            .unwrap(),
+    ))
 }
 
 fn build_agent(worker_id: usize, use_gds: bool) -> anyhow::Result<NixlAgent> {
@@ -425,12 +465,205 @@ impl Handler for BlockTransferDispatch {
 }
 
 fn validate_page_size(value: usize) -> Result<(), validator::ValidationError> {
-    if !value.is_power_of_two() {
+    // Power-of-two pages are the historical contract. Pages whose size is a
+    // multiple of 16 (e.g. 784 = 16 x 49 tokens for hybrid attention/mamba
+    // models) tile the same way and are accepted as well. Zero is never a
+    // valid page size.
+    if value == 0 || (!value.is_power_of_two() && !value.is_multiple_of(16)) {
         return Err(validator::ValidationError::new(
             "page_size_not_power_of_two",
         ));
     }
     Ok(())
+}
+
+/// Geometry of one group of KV layers within a worker's registered tensors.
+///
+/// A group is a set of layers sharing one physical page geometry, e.g. the
+/// standard attention K/V tensors versus a mamba block's dense state rows.
+/// `page_bytes` is the value the layout multiplies as its `page_size`
+/// (page-token count for attention groups; for mamba groups the dense int8
+/// row size `C` with `outer = inner = dtype = 1`, so the layout's
+/// `page * inner * dtype` product reproduces `C` without re-multiplication).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerGroup {
+    pub num_layers: usize,
+    pub page_bytes: usize,
+    pub outer_dim: usize,
+    pub inner_dim: usize,
+    pub dtype_width_bytes: usize,
+    pub is_mamba: bool,
+    /// Indices into the registration-order tensor list; strictly increasing,
+    /// and across all groups a partition of `0..tensors.len()`.
+    pub tensor_indices: Vec<usize>,
+}
+
+impl LayerGroup {
+    /// Attention group: `page_tokens` per block row, `outer_dim` K/V
+    /// components of `inner_dim` elements each, `dtype_width_bytes` bytes
+    /// per element.
+    pub fn attention(
+        num_layers: usize,
+        page_tokens: usize,
+        outer_dim: usize,
+        inner_dim: usize,
+        dtype_width_bytes: usize,
+    ) -> Self {
+        Self {
+            num_layers,
+            page_bytes: page_tokens,
+            outer_dim,
+            inner_dim,
+            dtype_width_bytes,
+            is_mamba: false,
+            tensor_indices: Vec::new(),
+        }
+    }
+
+    /// Mamba group: `num_layers` dense int8 `[B, C]` state rows of `C` bytes
+    /// per layer. Geometry is fully determined: `outer = inner = dtype = 1`
+    /// and `page_bytes = C`.
+    pub fn mamba(num_layers: usize, page_bytes: usize) -> Self {
+        Self {
+            num_layers,
+            page_bytes,
+            outer_dim: 1,
+            inner_dim: 1,
+            dtype_width_bytes: 1,
+            is_mamba: true,
+            tensor_indices: Vec::new(),
+        }
+    }
+
+    /// Synthesize the single legacy group for a config without explicit
+    /// `groups`: `page_size` is the page-token count and `num_tensors` the
+    /// number of registered tensors (one index per tensor in registration
+    /// order; for FullyContiguous layouts a single tensor may hold every
+    /// layer).
+    pub fn from_legacy(
+        num_layers: usize,
+        page_size: usize,
+        outer_dim: usize,
+        inner_dim: usize,
+        dtype_width_bytes: usize,
+        num_tensors: usize,
+    ) -> Self {
+        Self {
+            num_layers,
+            page_bytes: page_size,
+            outer_dim,
+            inner_dim,
+            dtype_width_bytes,
+            is_mamba: false,
+            tensor_indices: (0..num_tensors).collect(),
+        }
+    }
+
+    /// Total physical bytes of one block across the group's layers:
+    /// `num_layers * outer_dim * page_bytes * inner_dim * dtype_width_bytes`.
+    pub fn bytes_per_block(&self) -> usize {
+        self.num_layers * self.outer_dim * self.page_bytes * self.inner_dim * self.dtype_width_bytes
+    }
+
+    pub fn is_mamba(&self) -> bool {
+        self.is_mamba
+    }
+
+    pub fn layout_type(&self) -> LayoutType {
+        LayoutType::LayerSeparate {
+            outer_contiguous: true,
+        }
+    }
+}
+
+/// Derived per-group geometry for the layout/pool path (staging for
+/// per-group layouts; pool construction currently consumes only the first
+/// group).
+#[derive(Debug, Clone, Copy)]
+struct GroupGeometry {
+    layout_type: LayoutType,
+    num_layers: usize,
+    outer_dim: usize,
+    inner_dim: usize,
+    page_size: usize,
+    dtype_width_bytes: usize,
+    bytes_per_block: usize,
+}
+
+/// Infer `(outer_dim, inner_dim)` from a LayerSeparate tensor shape.
+///
+/// Shared by the legacy single-group path and per-group derivation; the
+/// inference rules are unchanged from the historical inline version.
+fn infer_layer_separate_dims(
+    shape: &[usize],
+    page_size: usize,
+    outer_contiguous: bool,
+    explicit: (Option<usize>, Option<usize>),
+) -> (usize, usize) {
+    // Explicit dims provided by caller (e.g. Python via KvTensorLayout) — use as-is.
+    if let (Some(od), Some(id)) = explicit {
+        return (od, id);
+    }
+    // No explicit dims: infer from shape.
+    // outer_dim valid range is [1, 2] (1 = MLA fused, 2 = standard K/V split).
+    // If the candidate dimension exceeds 2 the tensor has no explicit K/V axis
+    // (e.g. MLA models produce [n_blocks, page_size, latent_dim]) — fall back to
+    // outer_dim=1 and compute inner_dim from all dims after n_blocks.
+    let candidate = if outer_contiguous { shape[0] } else { shape[1] };
+    if candidate <= 2 {
+        // Standard layout: outer_dim is encoded in the shape.
+        //   outer_contiguous=true:  [outer_dim, n_blocks, page_size, inner_dim]
+        //   outer_contiguous=false: [n_blocks, outer_dim, page_size, inner_dim]
+        let inner_dim = shape[2..].iter().product::<usize>() / page_size;
+        (candidate, inner_dim)
+    } else {
+        // MLA-style: no explicit K/V split, treat as outer_dim=1.
+        let dims_start = if outer_contiguous { 2 } else { 1 };
+        let inner_dim = shape[dims_start..].iter().product::<usize>() / page_size;
+        (1, inner_dim)
+    }
+}
+
+/// Derive one group's geometry. Mamba groups carry their full geometry (no
+/// shape inference); attention groups reuse the LayerSeparate inference
+/// scoped to the group's first registered tensor.
+///
+/// Precondition: `config.validate()` ensured every group has non-empty,
+/// in-range `tensor_indices`.
+fn derive_group_geometry(
+    group: &LayerGroup,
+    tensors: &[Arc<dyn TorchTensor>],
+    explicit: (Option<usize>, Option<usize>),
+) -> GroupGeometry {
+    if group.is_mamba() {
+        GroupGeometry {
+            layout_type: group.layout_type(),
+            num_layers: group.num_layers,
+            outer_dim: group.outer_dim,
+            inner_dim: group.inner_dim,
+            page_size: group.page_bytes,
+            dtype_width_bytes: group.dtype_width_bytes,
+            bytes_per_block: group.bytes_per_block(),
+        }
+    } else {
+        let first_idx = group.tensor_indices[0];
+        let shape = tensors[first_idx].shape();
+        let (outer_dim, inner_dim) =
+            infer_layer_separate_dims(&shape, group.page_bytes, true, explicit);
+        GroupGeometry {
+            layout_type: group.layout_type(),
+            num_layers: group.num_layers,
+            outer_dim,
+            inner_dim,
+            page_size: group.page_bytes,
+            dtype_width_bytes: group.dtype_width_bytes,
+            bytes_per_block: group.num_layers
+                * outer_dim
+                * group.page_bytes
+                * inner_dim
+                * group.dtype_width_bytes,
+        }
+    }
 }
 
 #[derive(Builder, Clone, Validate)]
@@ -490,6 +723,17 @@ pub struct KvbmWorkerConfig {
     /// NCCL configuration for replicated mode
     #[builder(default = "transfer::NcclConfig::disabled()")]
     nccl_config: transfer::NcclConfig,
+
+    /// Per-group layer geometry. Empty (the default) keeps the legacy
+    /// single-geometry synthesis.
+    #[builder(default = "Vec::new()")]
+    pub groups: Vec<LayerGroup>,
+
+    /// Bound on layers kept active for save operations; consumed downstream.
+    /// Only meaningful for grouped configs, where it is validated against
+    /// the registered tensor count.
+    #[builder(default = "None")]
+    pub active_save_layers: Option<usize>,
 }
 
 impl KvbmWorkerConfig {
@@ -521,6 +765,58 @@ impl KvbmWorkerConfig {
             _ => {}
         }
 
+        // Grouped configs: the groups must partition the registered tensor
+        // list in registration order, and `active_save_layers` is bounded by
+        // the number of registered tensors. Ungrouped (legacy) configs are
+        // not subject to the bound.
+        if !self.groups.is_empty() {
+            for (group_idx, group) in self.groups.iter().enumerate() {
+                if group.tensor_indices.is_empty() {
+                    anyhow::bail!(
+                        "LayerGroup {} has no tensor indices; every group must cover at least one registered tensor",
+                        group_idx
+                    );
+                }
+            }
+
+            let covered: usize = self.groups.iter().map(|g| g.tensor_indices.len()).sum();
+            if covered != self.tensors.len() {
+                anyhow::bail!(
+                    "LayerGroups must partition the registered tensors: groups cover {} tensor indices but {} tensors are registered",
+                    covered,
+                    self.tensors.len()
+                );
+            }
+
+            // A single ordered pass: the concatenation of the groups'
+            // indices must be exactly 0..tensors.len(), which enforces
+            // strict increase, disjointness, and registration order.
+            let mut expected = 0usize;
+            for (group_idx, group) in self.groups.iter().enumerate() {
+                for &tensor_idx in &group.tensor_indices {
+                    if tensor_idx != expected {
+                        anyhow::bail!(
+                            "LayerGroup {} tensor indices must be strictly increasing and follow registration order; expected index {}, got {}",
+                            group_idx,
+                            expected,
+                            tensor_idx
+                        );
+                    }
+                    expected += 1;
+                }
+            }
+
+            if let Some(active_save_layers) = self.active_save_layers
+                && active_save_layers > self.tensors.len()
+            {
+                anyhow::bail!(
+                    "active_save_layers ({}) exceeds the number of registered tensors ({})",
+                    active_save_layers,
+                    self.tensors.len()
+                );
+            }
+        }
+
         Ok(())
     }
 }
@@ -545,7 +841,8 @@ impl KvbmWorker {
             return Err(anyhow::anyhow!("num_device_blocks must be greater than 0"));
         }
 
-        let (device_tensors, shape) = load_and_validate_tensors(&config.tensors, config.device_id)?;
+        let (device_tensors, shape) =
+            load_and_validate_tensors(&config.tensors, config.device_id, &config.groups)?;
 
         if shape.len() < 3 {
             return Err(anyhow::anyhow!(format!(
@@ -554,81 +851,125 @@ impl KvbmWorker {
             )));
         }
 
-        let (layout_type, num_layers, outer_dim, inner_dim) = match config.device_layout_type {
-            LayoutType::FullyContiguous => {
-                let num_layers = shape[1];
-                let outer_dim = config.outer_dim.unwrap_or(shape[2]);
-                let inner_dim = config
-                    .inner_dim
-                    .unwrap_or_else(|| shape[3..].iter().product::<usize>() / config.page_size);
-                tracing::info!(
-                    "Inferred layout: num_layers={}, outer_dim={}, page_size={}, inner_dim={}",
-                    num_layers,
-                    outer_dim,
-                    config.page_size,
-                    inner_dim
-                );
+        let (
+            layout_type,
+            num_layers,
+            outer_dim,
+            inner_dim,
+            page_size,
+            dtype_width_bytes,
+            bytes_per_block,
+        ) = if config.groups.is_empty() {
+            let (layout_type, num_layers, outer_dim, inner_dim) = match config.device_layout_type {
+                LayoutType::FullyContiguous => {
+                    let num_layers = shape[1];
+                    let outer_dim = config.outer_dim.unwrap_or(shape[2]);
+                    let inner_dim = config
+                        .inner_dim
+                        .unwrap_or_else(|| shape[3..].iter().product::<usize>() / config.page_size);
+                    tracing::info!(
+                        "Inferred layout: num_layers={}, outer_dim={}, page_size={}, inner_dim={}",
+                        num_layers,
+                        outer_dim,
+                        config.page_size,
+                        inner_dim
+                    );
 
-                (
-                    LayoutType::FullyContiguous,
-                    num_layers,
-                    outer_dim,
-                    inner_dim,
-                )
-            }
-            LayoutType::LayerSeparate { outer_contiguous } => {
-                let layout_type = config.device_layout_type;
-                let num_layers = device_tensors.len();
+                    (
+                        LayoutType::FullyContiguous,
+                        num_layers,
+                        outer_dim,
+                        inner_dim,
+                    )
+                }
+                LayoutType::LayerSeparate { outer_contiguous } => {
+                    let layout_type = config.device_layout_type;
+                    let num_layers = device_tensors.len();
 
-                let (outer_dim, inner_dim) = match (config.outer_dim, config.inner_dim) {
-                    // Explicit dims provided by caller (e.g. Python via KvTensorLayout) — use as-is.
-                    (Some(od), Some(id)) => (od, id),
-                    // No explicit dims: infer from shape.
-                    // outer_dim valid range is [1, 2] (1 = MLA fused, 2 = standard K/V split).
-                    // If the candidate dimension exceeds 2 the tensor has no explicit K/V axis
-                    // (e.g. MLA models produce [n_blocks, page_size, latent_dim]) — fall back to
-                    // outer_dim=1 and compute inner_dim from all dims after n_blocks.
-                    _ => {
-                        let candidate = if outer_contiguous { shape[0] } else { shape[1] };
-                        if candidate <= 2 {
-                            // Standard layout: outer_dim is encoded in the shape.
-                            //   outer_contiguous=true:  [outer_dim, n_blocks, page_size, inner_dim]
-                            //   outer_contiguous=false: [n_blocks, outer_dim, page_size, inner_dim]
-                            let inner_dim = shape[2..].iter().product::<usize>() / config.page_size;
-                            (candidate, inner_dim)
-                        } else {
-                            // MLA-style: no explicit K/V split, treat as outer_dim=1.
-                            let dims_start = if outer_contiguous { 2 } else { 1 };
-                            let inner_dim =
-                                shape[dims_start..].iter().product::<usize>() / config.page_size;
-                            (1, inner_dim)
-                        }
-                    }
-                };
+                    let (outer_dim, inner_dim) = infer_layer_separate_dims(
+                        &shape,
+                        config.page_size,
+                        outer_contiguous,
+                        (config.outer_dim, config.inner_dim),
+                    );
 
-                tracing::info!(
-                    "Layout: num_layers={}, outer_dim={}, outer_contiguous={}, page_size={}, inner_dim={}",
-                    num_layers,
-                    outer_dim,
-                    outer_contiguous,
-                    config.page_size,
-                    inner_dim
-                );
+                    tracing::info!(
+                        "Layout: num_layers={}, outer_dim={}, outer_contiguous={}, page_size={}, inner_dim={}",
+                        num_layers,
+                        outer_dim,
+                        outer_contiguous,
+                        config.page_size,
+                        inner_dim
+                    );
 
-                (layout_type, num_layers, outer_dim, inner_dim)
-            }
+                    (layout_type, num_layers, outer_dim, inner_dim)
+                }
+            };
+
+            // Legacy scalar: the single synthesized group carries exactly
+            // the product of the historical formula (KEY INVARIANT: an
+            // empty `groups` reproduces today's geometry).
+            let group = LayerGroup::from_legacy(
+                num_layers,
+                config.page_size,
+                outer_dim,
+                inner_dim,
+                config.dtype_width_bytes,
+                device_tensors.len(),
+            );
+            let bytes_per_block = group.bytes_per_block();
+
+            (
+                layout_type,
+                num_layers,
+                outer_dim,
+                inner_dim,
+                config.page_size,
+                config.dtype_width_bytes,
+                bytes_per_block,
+            )
+        } else {
+            // Grouped path: derive each group's geometry — mamba groups
+            // skip shape inference, attention groups infer from their
+            // first registered tensor — and sum the per-block bytes.
+            let geometries: Vec<GroupGeometry> = config
+                .groups
+                .iter()
+                .map(|group| {
+                    derive_group_geometry(
+                        group,
+                        &config.tensors,
+                        (config.outer_dim, config.inner_dim),
+                    )
+                })
+                .collect();
+            let bytes_per_block = geometries
+                .iter()
+                .map(|geometry| geometry.bytes_per_block)
+                .sum();
+
+            // STAGING (Task 4): pool construction still consumes only the
+            // FIRST group's geometry; per-group layouts are not threaded
+            // through the transfer handler yet.
+            let first = &geometries[0];
+            (
+                first.layout_type,
+                first.num_layers,
+                first.outer_dim,
+                first.inner_dim,
+                first.page_size,
+                first.dtype_width_bytes,
+                bytes_per_block,
+            )
         };
-
-        let bytes_per_block =
-            num_layers * outer_dim * config.page_size * inner_dim * config.dtype_width_bytes;
 
         let mut layout_builder_instance = LayoutConfigBuilder::default();
         let layout_builder = layout_builder_instance
             .num_layers(num_layers)
             .outer_dim(outer_dim)
-            .page_size(config.page_size)
+            .page_size(page_size)
             .inner_dim(inner_dim)
-            .dtype_width_bytes(config.dtype_width_bytes);
+            .dtype_width_bytes(dtype_width_bytes);
 
         let device_layout = layout_builder
             .num_blocks(config.num_device_blocks)
@@ -1029,5 +1370,253 @@ mod tests {
             err.contains("page_size") && err.contains("range"),
             "got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod layer_group_tests {
+    use super::*;
+    use crate::block_manager::storage::torch::TorchDevice;
+
+    /// Minimal tensor stand-in for config-level validation (no CUDA needed).
+    #[derive(Debug)]
+    struct FakeTensor {
+        shape: Vec<usize>,
+    }
+
+    impl TorchTensor for FakeTensor {
+        fn device(&self) -> TorchDevice {
+            TorchDevice::Other("fake".to_string())
+        }
+
+        fn data_ptr(&self) -> u64 {
+            0
+        }
+
+        fn size_bytes(&self) -> usize {
+            self.shape.iter().product()
+        }
+
+        fn shape(&self) -> Vec<usize> {
+            self.shape.clone()
+        }
+
+        fn stride(&self) -> Vec<usize> {
+            let mut stride = vec![1usize];
+            for i in (0..self.shape.len().saturating_sub(1)).rev() {
+                stride.push(stride.last().unwrap() * self.shape[i]);
+            }
+            stride.reverse();
+            stride
+        }
+    }
+
+    #[test]
+    fn group_geometry_mamba_and_attention() {
+        // attention group: 4 layers, K/V outer=2, page 784 tokens, inner 512, fp8(1B)
+        let attn = LayerGroup::attention(4, 784, 2, 512, 1);
+        assert_eq!(attn.bytes_per_block(), 4 * 2 * 784 * 512 * 1);
+        // mamba group: 24 layers, dense int8 [B, C] rows, C = 3_207_168
+        let mamba = LayerGroup::mamba(24, 3_207_168);
+        assert_eq!(mamba.bytes_per_block(), 24 * 3_207_168);
+        assert!(mamba.is_mamba());
+        assert_eq!(
+            mamba.layout_type(),
+            LayoutType::LayerSeparate {
+                outer_contiguous: true
+            }
+        );
+    }
+
+    #[test]
+    fn total_bytes_per_block_sums_groups() {
+        let groups = vec![
+            LayerGroup::attention(4, 784, 2, 512, 1),
+            LayerGroup::mamba(24, 3_207_168),
+        ];
+        let total: usize = groups.iter().map(|g| g.bytes_per_block()).sum();
+        assert_eq!(total, 4 * 2 * 784 * 512 + 24 * 3_207_168);
+    }
+
+    /// THE KEY INVARIANT: with `groups` empty (every caller today), the
+    /// synthesized single group must reproduce the legacy geometry EXACTLY.
+    /// The legacy scalar is recomputed here independently of
+    /// `bytes_per_block`, so the check is not a tautology.
+    #[test]
+    fn legacy_synthesis_reproduces_legacy_geometry() {
+        let config = KvbmWorkerConfig::builder()
+            .cancel_token(CancellationToken::new())
+            .num_device_blocks(64)
+            .page_size(784)
+            .dtype_width_bytes(1)
+            .build()
+            .expect("legacy config should build");
+        assert!(config.groups.is_empty());
+        assert!(config.active_save_layers.is_none());
+        assert!(config.validate().is_ok());
+
+        // Scalar geometry the legacy LayerSeparate inference derives for a
+        // standard K/V model: 28 layer tensors, outer=2, page 784, inner 512.
+        let (num_layers, outer_dim, inner_dim, num_tensors) = (28usize, 2, 512, 28);
+        let group = LayerGroup::from_legacy(
+            num_layers,
+            config.page_size,
+            outer_dim,
+            inner_dim,
+            config.dtype_width_bytes,
+            num_tensors,
+        );
+
+        // Legacy scalar computation, spelled out independently.
+        let legacy_bytes_per_block =
+            num_layers * outer_dim * config.page_size * inner_dim * config.dtype_width_bytes;
+        assert_eq!(group.bytes_per_block(), legacy_bytes_per_block);
+        assert_eq!(group.num_layers, num_layers);
+        assert_eq!(
+            group.page_bytes,
+            config.page_size * config.dtype_width_bytes
+        );
+        assert_eq!(group.outer_dim, outer_dim);
+        assert_eq!(group.inner_dim, inner_dim);
+        assert_eq!(group.dtype_width_bytes, config.dtype_width_bytes);
+        assert!(!group.is_mamba());
+        assert_eq!(
+            group.tensor_indices,
+            (0..num_tensors).collect::<Vec<usize>>()
+        );
+
+        // FullyContiguous legacy: num_layers comes from shape[1] and may
+        // differ from the tensor count (one tensor holding every layer).
+        let fc_group = LayerGroup::from_legacy(80, 32, 2, 576, 2, 1);
+        assert_eq!(fc_group.bytes_per_block(), 80 * 2 * 32 * 576 * 2);
+        assert_eq!(fc_group.tensor_indices, vec![0]);
+
+        // active_save_layers is only bounded when groups are present.
+        let mut no_groups = config.clone();
+        no_groups.active_save_layers = Some(9999);
+        assert!(no_groups.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_groups_partition_happy_path() {
+        let tensors: Vec<Arc<dyn TorchTensor>> = vec![
+            Arc::new(FakeTensor {
+                shape: vec![2, 4, 16, 64],
+            }),
+            Arc::new(FakeTensor {
+                shape: vec![2, 4, 16, 64],
+            }),
+            Arc::new(FakeTensor {
+                shape: vec![8, 128],
+            }),
+        ];
+        let mut attn = LayerGroup::attention(2, 16, 2, 64, 2);
+        attn.tensor_indices = vec![0, 1];
+        let mut mamba = LayerGroup::mamba(1, 128);
+        mamba.tensor_indices = vec![2];
+        let config = KvbmWorkerConfig::builder()
+            .cancel_token(CancellationToken::new())
+            .num_device_blocks(4)
+            .tensors(tensors)
+            .groups(vec![attn, mamba])
+            .build()
+            .expect("grouped config should build");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_groups_reject_non_registration_order() {
+        let tensors: Vec<Arc<dyn TorchTensor>> = vec![
+            Arc::new(FakeTensor {
+                shape: vec![2, 4, 16, 64],
+            }),
+            Arc::new(FakeTensor {
+                shape: vec![2, 4, 16, 64],
+            }),
+        ];
+        let mut attn = LayerGroup::attention(2, 16, 2, 64, 2);
+        attn.tensor_indices = vec![1, 0];
+        let config = KvbmWorkerConfig::builder()
+            .cancel_token(CancellationToken::new())
+            .num_device_blocks(4)
+            .tensors(tensors)
+            .groups(vec![attn])
+            .build()
+            .expect("config should build");
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("registration order"),
+            "expected registration-order error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_groups_reject_partition_size_mismatch() {
+        let mut attn = LayerGroup::attention(1, 16, 2, 64, 2);
+        attn.tensor_indices = vec![0];
+        let config = KvbmWorkerConfig::builder()
+            .cancel_token(CancellationToken::new())
+            .num_device_blocks(4)
+            .groups(vec![attn])
+            .build()
+            .expect("config should build");
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("partition"),
+            "expected partition-size error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_groups_reject_empty_group() {
+        let config = KvbmWorkerConfig::builder()
+            .cancel_token(CancellationToken::new())
+            .num_device_blocks(4)
+            .groups(vec![LayerGroup::attention(1, 16, 2, 64, 2)])
+            .build()
+            .expect("config should build");
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("no tensor indices"),
+            "expected empty-group error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_active_save_layers_bounded_when_grouped() {
+        let tensors: Vec<Arc<dyn TorchTensor>> = vec![
+            Arc::new(FakeTensor {
+                shape: vec![2, 4, 16, 64],
+            }),
+            Arc::new(FakeTensor {
+                shape: vec![2, 4, 16, 64],
+            }),
+        ];
+        let mut attn = LayerGroup::attention(2, 16, 2, 64, 2);
+        attn.tensor_indices = vec![0, 1];
+
+        let over = KvbmWorkerConfig::builder()
+            .cancel_token(CancellationToken::new())
+            .num_device_blocks(4)
+            .tensors(tensors.clone())
+            .groups(vec![attn.clone()])
+            .active_save_layers(Some(3))
+            .build()
+            .expect("config should build");
+        let err = over.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("active_save_layers"),
+            "expected active_save_layers error, got: {err}"
+        );
+
+        let ok = KvbmWorkerConfig::builder()
+            .cancel_token(CancellationToken::new())
+            .num_device_blocks(4)
+            .tensors(tensors)
+            .groups(vec![attn])
+            .active_save_layers(Some(2))
+            .build()
+            .expect("config should build");
+        assert!(ok.validate().is_ok());
     }
 }
