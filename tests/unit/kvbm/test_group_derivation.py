@@ -13,14 +13,23 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
+pytestmark = [
+    pytest.mark.unit,
+    pytest.mark.pre_merge,
+    pytest.mark.gpu_0,
+    pytest.mark.kvbm,
+]
+
 _MODULE_PATH = (
     Path(__file__).resolve().parents[3]
     / "lib/bindings/kvbm/python/kvbm/vllm_integration/group_plan.py"
 )
 _spec = importlib.util.spec_from_file_location("_group_plan_under_test", _MODULE_PATH)
 group_plan = importlib.util.module_from_spec(_spec)
-# dataclasses resolves string annotations against sys.modules[module.__name__];
-# the loader recipe requires registering the module before exec_module.
+# Standard module_from_spec recipe: register in sys.modules before
+# exec_module so inspect / get_type_hints / pickle can resolve the module.
 sys.modules[_spec.name] = group_plan
 _spec.loader.exec_module(group_plan)
 
@@ -81,3 +90,10 @@ def test_unregistered_group_layer_is_ignored():
     groups = [FakeGroup(["a", "ghost"], "attn", 128)]
     plan = derive_layer_groups(FakeKVCacheConfig(groups), ["a"])
     assert plan[0].layer_names == ["a"]
+
+
+def test_registered_layer_missing_from_all_groups_files_into_group_zero():
+    groups = [FakeGroup(["a"], "attn", 128)]
+    plan = derive_layer_groups(FakeKVCacheConfig(groups), ["a", "b"])
+    assert plan[0].layer_names == ["a", "b"]
+    assert plan[0].group_of_layer == [0, 0]

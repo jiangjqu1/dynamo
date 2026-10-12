@@ -118,6 +118,7 @@ class KvConnectorWorker:
         self.vllm_config = vllm_config
         self._connector = RustKvConnectorWorker(self.drt, engine_id)
         self.mamba_layer_names: set[str] = set()
+        # Rust handoff (Task 6); fallback: one non-mamba group, page_bytes=None
         self.group_plans: list[GroupPlan] = []
 
     # Worker
@@ -148,11 +149,29 @@ class KvConnectorWorker:
         # Partition the layers into HMA groups (vLLM's kv_cache_config) for
         # per-group validation below; a missing config falls back to one
         # group covering every layer.
+        kv_cache_config = getattr(self.vllm_config, "kv_cache_config", None)
         group_plans = derive_layer_groups(
-            getattr(self.vllm_config, "kv_cache_config", None),
-            [name for name, _tensor in ordered_kv_caches],
+            kv_cache_config, [name for name, _tensor in ordered_kv_caches]
         )
         self.group_plans = group_plans
+        if getattr(kv_cache_config, "kv_cache_groups", None):
+            config_layer_names = {
+                name
+                for group in kv_cache_config.kv_cache_groups
+                for name in group.layer_names
+            }
+            unknown_layers = [
+                name
+                for name, _tensor in ordered_kv_caches
+                if name not in config_layer_names
+            ]
+            if unknown_layers:
+                logger.warning(
+                    "register_kv_caches: %d layers absent from every "
+                    "kv_cache_config group, filed into group 0: %s",
+                    len(unknown_layers),
+                    unknown_layers[:4],
+                )
 
         # Normalize recurrent (Mamba/GDN) layers — list[Tensor] strided views —
         # to the flat raw_tensor backing them, so every registered layer is a

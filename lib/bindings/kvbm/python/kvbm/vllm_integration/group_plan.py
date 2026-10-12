@@ -14,7 +14,13 @@ if TYPE_CHECKING:
 
 @dataclass
 class GroupPlan:
-    """One HMA group's registration plan (order-preserving)."""
+    """One HMA group's registration plan (order-preserving).
+
+    ``group_of_layer`` is ONE list shared by every plan of a derivation,
+    parallel to the caller's ``ordered_layer_names``; each entry indexes the
+    plans by ``group_id``.  It is shared intentionally for the Rust handoff
+    and should be treated as read-only.
+    """
 
     group_id: int
     layer_names: list[str]
@@ -24,6 +30,8 @@ class GroupPlan:
 
 
 def _spec_is_mamba(spec) -> bool:
+    # Keyed on the spec TYPE NAME: that name is the cross-version contract,
+    # and an isinstance check would require importing vllm at runtime.
     return type(spec).__name__ == "MambaSpec"
 
 
@@ -32,13 +40,17 @@ def derive_layer_groups(
 ) -> list[GroupPlan]:
     """Partition ordered_layer_names into groups.
 
-    Falls back to a single group when kv_cache_config is None (attention-only
-    path must behave exactly as before Phase 2).
+    Falls back to a single group when kv_cache_config is None (the
+    attention-only path must keep its previous all-layers-uniform behavior).
     """
     if not kv_cache_config or not getattr(kv_cache_config, "kv_cache_groups", None):
         return [
             GroupPlan(
-                0, list(ordered_layer_names), False, None, [0] * len(ordered_layer_names)
+                group_id=0,
+                layer_names=list(ordered_layer_names),
+                is_mamba=False,
+                page_bytes=None,
+                group_of_layer=[0] * len(ordered_layer_names),
             )
         ]
 
@@ -47,10 +59,10 @@ def derive_layer_groups(
     for gid, group in enumerate(kv_cache_config.kv_cache_groups):
         plans.append(
             GroupPlan(
-                gid,
-                [],
-                _spec_is_mamba(group.kv_cache_spec),
-                getattr(group.kv_cache_spec, "page_size", None),
+                group_id=gid,
+                layer_names=[],
+                is_mamba=_spec_is_mamba(group.kv_cache_spec),
+                page_bytes=getattr(group.kv_cache_spec, "page_size", None),
             )
         )
         for name in group.layer_names:
