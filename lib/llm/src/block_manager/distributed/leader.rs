@@ -140,13 +140,48 @@ impl KvbmLeaderConfig {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct KvbmLeaderState {
     pub num_device_blocks: Arc<AtomicUsize>,
     pub num_host_blocks: Arc<AtomicUsize>,
     pub num_disk_blocks: Arc<AtomicUsize>,
+    /// HMA group count learned from the handshake (the element-wise Σ's
+    /// length; any legacy peer degrades the set to 1, matching the sizing
+    /// fallback). Defaults to 1 so a pre-handshake reader sees legacy
+    /// single-group behavior.
+    pub num_groups: Arc<AtomicUsize>,
     pub workers_allocation_ready: Arc<AtomicBool>,
     pub workers_ready_notify: Arc<Notify>,
+}
+
+impl Default for KvbmLeaderState {
+    fn default() -> Self {
+        Self {
+            num_device_blocks: Arc::new(AtomicUsize::new(0)),
+            num_host_blocks: Arc::new(AtomicUsize::new(0)),
+            num_disk_blocks: Arc::new(AtomicUsize::new(0)),
+            num_groups: Arc::new(AtomicUsize::new(1)),
+            workers_allocation_ready: Arc::new(AtomicBool::new(false)),
+            workers_ready_notify: Arc::new(Notify::new()),
+        }
+    }
+}
+
+/// HMA group count for the slot fan-out: the element-wise Σ's length when
+/// the worker set is fully modern, else 1 (a legacy peer empties the
+/// aggregate, degrading the whole set to the scalar path — the same rule
+/// that drives tier sizing).
+fn handshake_num_groups(workers: &[WorkerMetadata]) -> usize {
+    let per_group = aggregate_worker_bytes_per_group(
+        workers
+            .iter()
+            .map(|worker| worker.bytes_per_block_per_group.as_slice()),
+    );
+    if per_group.is_empty() {
+        1
+    } else {
+        per_group.len()
+    }
 }
 
 /// The leader of the KVBM.
@@ -193,6 +228,7 @@ impl KvbmLeader {
         let num_device_blocks_cell = state.num_device_blocks.clone();
         let num_host_blocks_cell = state.num_host_blocks.clone();
         let num_disk_blocks_cell = state.num_disk_blocks.clone();
+        let num_groups_cell = state.num_groups.clone();
 
         tokio::spawn(async move {
             let res = ZmqActiveMessageLeader::new_with_handshake(
@@ -211,6 +247,7 @@ impl KvbmLeader {
                     // store into leader state
                     num_host_blocks_cell.store(metadata.num_host_blocks, Ordering::Release);
                     num_disk_blocks_cell.store(metadata.num_disk_blocks, Ordering::Release);
+                    num_groups_cell.store(handshake_num_groups(workers), Ordering::Release);
 
                     metadata
                 },
@@ -255,6 +292,13 @@ impl KvbmLeader {
 
     pub fn num_disk_blocks(&self) -> usize {
         self.state.num_disk_blocks.load(Ordering::Acquire)
+    }
+
+    /// Number of HMA groups the worker set agreed on at handshake time (1
+    /// until the handshake completes, and for any legacy peer set). The
+    /// slot fan-out sends one transfer request per group.
+    pub fn num_groups(&self) -> usize {
+        self.state.num_groups.load(Ordering::Acquire).max(1)
     }
 
     pub async fn wait_worker_sync_ready(&self) -> bool {

@@ -17,7 +17,10 @@ use crate::block_manager::{
     connector::scheduler::TransferSchedulerClient,
     layout::LayoutType,
     offload::{max_concurrent_transfers, max_transfer_batch_size},
-    storage::{DevbarAllocator, DeviceAllocator, DeviceStorage, DiskAllocator, torch::TorchTensor},
+    storage::{
+        DevbarAllocator, DeviceAllocator, DeviceStorage, DiskAllocator, DiskStorage,
+        StorageAllocator, torch::TorchTensor,
+    },
 };
 
 use derive_builder::Builder;
@@ -154,14 +157,14 @@ fn build_agent(worker_id: usize, use_gds: bool) -> anyhow::Result<NixlAgent> {
 
 // Helper: perform allocation and build transfer handler (factored from previous code)
 async fn perform_allocation_and_build_handler(
-    device_layout: Box<dyn NixlLayout<StorageType = DeviceStorage>>,
-    mut layout_builder: LayoutConfigBuilder,
+    group_layouts: Vec<GroupLayoutSpec>,
     worker_config: KvbmWorkerConfig,
     leader_meta: LeaderMetadata,
     worker_id: usize,
     device_id: usize,
     scheduler_client: Option<TransferSchedulerClient>,
 ) -> anyhow::Result<BlockTransferHandler> {
+    let num_groups = group_layouts.len();
     // Determine if this rank should allocate G2/G3 (host/disk)
     // - Sharded mode (rank=None): all ranks allocate
     // - Replicated mode (rank=Some(r)): only rank 0 allocates
@@ -185,15 +188,27 @@ async fn perform_allocation_and_build_handler(
         enable_pool: true,
         max_concurrent_transfers: max_concurrent_transfers(),
         max_transfer_batch_size: max_transfer_batch_size(),
-        num_outer_components: device_layout.config().outer_dim,
-        num_layers: device_layout.config().num_layers,
+        // Sizing-only bound for the context's CUDA pool pre-warm: the
+        // largest single-request layer/outer count across groups (exactly
+        // the single group's values for the legacy path).
+        num_outer_components: group_layouts
+            .iter()
+            .map(|spec| spec.geometry.outer_dim)
+            .max()
+            .unwrap_or(1),
+        num_layers: group_layouts
+            .iter()
+            .map(|spec| spec.geometry.num_layers)
+            .max()
+            .unwrap_or(1),
     };
     // Host (G2 / tier-2) allocator, built before the transfer context so its
     // backing's transfer_semantics() can set the context's host-transfer
     // semantics: DeviceAlias for a VMM region, StagedCpu for a Bar/Bdf region
     // on a raw sysfs MMIO aperture (staged default; `direct` opt-in),
-    // HostPointer otherwise. The pool itself is only allocated below when
-    // should_allocate_offload.
+    // HostPointer otherwise. The per-group pools are only allocated below
+    // when should_allocate_offload — sequentially from this ONE allocator,
+    // so Bar/Bdf apertures carve disjoint windows per group.
     let host_allocator = Arc::new(DevbarAllocator::from_env()?);
     let host_transfer_semantics = host_allocator.transfer_semantics();
     let mut transfer_context = TransferContext::new(
@@ -215,63 +230,111 @@ async fn perform_allocation_and_build_handler(
     transfer_context.set_host_transfer_semantics(host_transfer_semantics);
     let transfer_context = Arc::new(transfer_context);
 
-    // device - always allocated on all ranks
-    let device_blocks = Some(KvbmWorker::make_layout::<_, BasicMetadata>(
-        device_layout,
-        transfer_context.nixl_agent().as_ref(),
-        0,
-        worker_id,
-    )?);
+    // disk (G3) allocator: created once when the tier is enabled, shared by
+    // the per-group allocates (each allocate creates its own file-backed
+    // storage — no aliasing).
+    let disk_allocator = if should_allocate_offload && leader_meta.num_disk_blocks > 0 {
+        Some(Arc::new(DiskAllocator::from_env()?))
+    } else {
+        None
+    };
 
-    // host (G2 / tier-2) - only allocated if should_allocate_offload.
-    // Backed by a BAR-mapped devbar region when DYN_KVBM_DEVBAR_* is configured,
-    // otherwise standard pinned host memory (default deployments unchanged).
-    let host_blocks = if should_allocate_offload && leader_meta.num_host_blocks > 0 {
-        // The layout takes the Arc by value; clone so the io-mapping stash
-        // (filled by the allocate inside) stays readable after the call.
-        let host_alloc_wire = Arc::clone(&host_allocator);
-        let host_layout = layout_builder
-            .num_blocks(leader_meta.num_host_blocks)
-            .build()?
-            .allocate_layout(worker_config.host_layout_type, host_alloc_wire)?;
-        // Direct transfers: wire the BAR window's io mapping (host base,
-        // device base, length) into the context for the executor's pointer
-        // translation. Present only when the IOMEMORY registration succeeded.
-        if let Some(mapping) = host_allocator.io_mapping() {
-            transfer_context.set_host_tier_io_mapping(mapping);
+    // One pool list per group, per tier. Block-set ids: the legacy
+    // single-group path keeps the historical 0/1/2; grouped tiers namespace
+    // per group (device 16+g, host 32+g, disk 48+g) so every group's
+    // serialized layout gets its own NixlBlockSet entry per worker.
+    let mut device_blocks = Vec::with_capacity(num_groups);
+    let mut host_blocks = Vec::with_capacity(num_groups);
+    let mut disk_blocks = Vec::with_capacity(num_groups);
+    // Each group's host window carries its OWN io mapping (Bar/Bdf direct
+    // transfers); collected per allocate and wired as a set below.
+    let mut host_io_mappings: Vec<(usize, u64, usize)> = Vec::new();
+
+    for (group_idx, spec) in group_layouts.into_iter().enumerate() {
+        let GroupLayoutSpec {
+            geometry,
+            device_layout,
+        } = spec;
+
+        // device - always allocated on all ranks
+        let device_set = if num_groups == 1 { 0 } else { 16 + group_idx };
+        device_blocks.push(Some(KvbmWorker::make_layout::<_, BasicMetadata>(
+            device_layout,
+            transfer_context.nixl_agent().as_ref(),
+            device_set,
+            worker_id,
+        )?));
+
+        // host (G2 / tier-2) - only allocated if should_allocate_offload.
+        // Backed by a BAR-mapped devbar region when DYN_KVBM_DEVBAR_* is
+        // configured, otherwise standard pinned host memory (default
+        // deployments unchanged). Grouped contract: FullyContiguous over ONE
+        // allocation per group at the shared num_host_blocks count, from the
+        // shared DevbarAllocator.
+        if should_allocate_offload && leader_meta.num_host_blocks > 0 {
+            let host_layout_type = if num_groups == 1 {
+                worker_config.host_layout_type
+            } else {
+                LayoutType::FullyContiguous
+            };
+            // The layout takes the Arc by value; clone so the io-mapping
+            // stash (filled by the allocate inside) stays readable after
+            // the call.
+            let host_alloc_wire = Arc::clone(&host_allocator);
+            let host_layout = tier_layout_builder(&geometry, leader_meta.num_host_blocks)
+                .build()?
+                .allocate_layout(host_layout_type, host_alloc_wire)
+                .map_err(|e| anyhow::anyhow!("host layout for layer group {group_idx}: {e}"))?;
+            if let Some(mapping) = host_allocator.io_mapping() {
+                host_io_mappings.push(mapping);
+            }
+            let host_set = if num_groups == 1 { 1 } else { 32 + group_idx };
+            host_blocks.push(Some(KvbmWorker::make_layout::<_, BasicMetadata>(
+                host_layout,
+                transfer_context.nixl_agent().as_ref(),
+                host_set,
+                worker_id,
+            )?));
+        } else {
+            host_blocks.push(None);
         }
-        Some(KvbmWorker::make_layout::<_, BasicMetadata>(
-            host_layout,
-            transfer_context.nixl_agent().as_ref(),
-            1,
-            worker_id,
-        )?)
-    } else {
-        None
-    };
-    // disk (G3) - only allocated if should_allocate_offload
-    let disk_blocks = if should_allocate_offload && leader_meta.num_disk_blocks > 0 {
-        let disk_allocator = Arc::new(DiskAllocator::from_env()?);
-        let disk_layout = layout_builder
-            .num_blocks(leader_meta.num_disk_blocks)
-            .build()?
-            .allocate_layout(worker_config.disk_layout_type, disk_allocator)?;
-        Some(KvbmWorker::make_layout::<_, BasicMetadata>(
-            disk_layout,
-            transfer_context.nixl_agent().as_ref(),
-            2,
-            worker_id,
-        )?)
-    } else {
-        None
-    };
 
-    // Single-group legacy construction: one pool list per tier. The real
-    // per-group construction lands with the grouped pool path below.
+        // disk (G3) - only allocated if should_allocate_offload
+        if let (true, Some(disk_allocator)) = (should_allocate_offload, disk_allocator.as_ref()) {
+            let disk_layout_type = if num_groups == 1 {
+                worker_config.disk_layout_type
+            } else {
+                LayoutType::FullyContiguous
+            };
+            let disk_alloc_wire: Arc<dyn StorageAllocator<DiskStorage>> = disk_allocator.clone();
+            let disk_layout = tier_layout_builder(&geometry, leader_meta.num_disk_blocks)
+                .build()?
+                .allocate_layout(disk_layout_type, disk_alloc_wire)
+                .map_err(|e| anyhow::anyhow!("disk layout for layer group {group_idx}: {e}"))?;
+            let disk_set = if num_groups == 1 { 2 } else { 48 + group_idx };
+            disk_blocks.push(Some(KvbmWorker::make_layout::<_, BasicMetadata>(
+                disk_layout,
+                transfer_context.nixl_agent().as_ref(),
+                disk_set,
+                worker_id,
+            )?));
+        } else {
+            disk_blocks.push(None);
+        }
+    }
+
+    // Direct transfers: wire the BAR windows' io mappings (host base,
+    // device base, length) into the context for the executor's pointer
+    // translation — one entry per group's window. Present only when the
+    // IOMEMORY registration succeeded.
+    if !host_io_mappings.is_empty() {
+        transfer_context.set_host_tier_io_mappings(host_io_mappings);
+    }
+
     let handler = BlockTransferHandler::new(
-        vec![device_blocks],
-        vec![host_blocks],
-        vec![disk_blocks],
+        device_blocks,
+        host_blocks,
+        disk_blocks,
         transfer_context,
         scheduler_client,
         worker_config.nccl_config,
@@ -308,8 +371,9 @@ impl Handler for WorkerMetadataHandler {
 // Leader sends allocation config -> allocate -> publish handler -> mark ready -> ACK
 struct LeaderMetadataHandler {
     state: Arc<WorkerState>,
-    device_layout: Mutex<Option<Box<dyn NixlLayout<StorageType = DeviceStorage>>>>,
-    layout_builder: LayoutConfigBuilder,
+    /// Per-group device layout specs (one entry per HMA group; exactly one
+    /// for the legacy path), consumed once by the allocation task.
+    group_layouts: Mutex<Option<Vec<GroupLayoutSpec>>>,
     worker_config: KvbmWorkerConfig,
     worker_id: usize,
     device_id: usize,
@@ -356,20 +420,19 @@ impl Handler for LeaderMetadataHandler {
             return Ok(());
         }
 
-        // Take device_layout once.
-        let dev_layout = {
-            let mut guard = self.device_layout.lock().await;
+        // Take the per-group layout specs once.
+        let group_layouts = {
+            let mut guard = self.group_layouts.lock().await;
             match guard.take() {
                 Some(d) => d,
                 None => {
-                    tracing::warn!("leader_metadata: device_layout already consumed; dropping");
+                    tracing::warn!("leader_metadata: group_layouts already consumed; dropping");
                     return Ok(());
                 }
             }
         };
 
         // Capture what we need and run allocation in the background.
-        let layout_builder = self.layout_builder.clone();
         let worker_config = self.worker_config.clone();
         let worker_id = self.worker_id;
         let device_id = self.device_id;
@@ -380,8 +443,7 @@ impl Handler for LeaderMetadataHandler {
 
         tokio::spawn(async move {
             match perform_allocation_and_build_handler(
-                dev_layout,
-                layout_builder,
+                group_layouts,
                 worker_config,
                 leader_meta,
                 worker_id,
@@ -628,6 +690,36 @@ fn infer_layer_separate_dims(
     }
 }
 
+/// One HMA group's layout spec: the group's derived geometry plus its DEVICE
+/// layout, built over the group's own tensor subset. Per-group tier (host /
+/// disk) layouts are allocated from the same geometry at pool-construction
+/// time; one spec exists per group, exactly one for the legacy path.
+struct GroupLayoutSpec {
+    geometry: GroupGeometry,
+    device_layout: Box<dyn NixlLayout<StorageType = DeviceStorage>>,
+}
+
+/// Handshake-reported geometry: the scalar Σ and the per-group vec the
+/// worker publishes in `WorkerMetadata`.
+struct HandshakeGeometry {
+    bytes_per_block: usize,
+    bytes_per_block_per_group: Vec<usize>,
+}
+
+/// A `LayoutConfig` builder for a group's geometry at `num_blocks` — the
+/// per-group tier (host / disk) layout configuration.
+fn tier_layout_builder(geometry: &GroupGeometry, num_blocks: usize) -> LayoutConfigBuilder {
+    let mut builder = LayoutConfigBuilder::default();
+    builder
+        .num_layers(geometry.num_layers)
+        .outer_dim(geometry.outer_dim)
+        .page_size(geometry.page_size)
+        .inner_dim(geometry.inner_dim)
+        .dtype_width_bytes(geometry.dtype_width_bytes)
+        .num_blocks(num_blocks);
+    builder
+}
+
 /// Derive one group's geometry. Mamba groups carry their full geometry (no
 /// shape inference); attention groups reuse the LayerSeparate inference
 /// scoped to the group's first registered tensor.
@@ -850,6 +942,19 @@ impl KvbmWorkerConfig {
     }
 }
 
+/// Everything `worker_task` needs, bundled by value: the per-group layout
+/// specs, the handshake-reported geometry, the worker config, and the cells
+/// it publishes through.
+struct WorkerTaskArgs {
+    group_layouts: Vec<GroupLayoutSpec>,
+    geometry: HandshakeGeometry,
+    config: KvbmWorkerConfig,
+    cancel_token: CancellationToken,
+    handler_tx: Arc<Mutex<Option<oneshot::Sender<BlockTransferHandler>>>>,
+    layout_ready_tx: tokio::sync::Mutex<Option<oneshot::Sender<String>>>,
+    scheduler_client: Option<TransferSchedulerClient>,
+}
+
 pub struct KvbmWorker {
     task: Option<CriticalTaskExecutionHandle>,
     block_transfer_handler_rx: Option<oneshot::Receiver<transfer::BlockTransferHandler>>,
@@ -873,23 +978,38 @@ impl KvbmWorker {
         let (device_tensors, shape) =
             load_and_validate_tensors(&config.tensors, config.device_id, &config.groups)?;
 
-        if shape.len() < 3 {
-            return Err(anyhow::anyhow!(format!(
-                "Unsupported kv cache layout. Got shape: {:?}",
-                shape
-            )));
+        if config.groups.is_empty() {
+            if shape.len() < 3 {
+                return Err(anyhow::anyhow!(format!(
+                    "Unsupported kv cache layout. Got shape: {:?}",
+                    shape
+                )));
+            }
+        } else {
+            // Grouped: validate per group. Attention groups keep the
+            // >=3-dim layout contract; a mamba group's dense [B, C] rows
+            // are legitimately 2D, so a mamba-first first-tensor must not
+            // trip the legacy guard.
+            for (group_idx, group) in config.groups.iter().enumerate() {
+                if group.is_mamba() {
+                    continue;
+                }
+                let tensor_idx = group.tensor_indices[0];
+                let tensor_shape = config.tensors[tensor_idx].shape();
+                if tensor_shape.len() < 3 {
+                    return Err(anyhow::anyhow!(
+                        "Unsupported kv cache layout for attention layer group {}: got shape {:?} (needs >= 3 dims)",
+                        group_idx,
+                        tensor_shape
+                    ));
+                }
+            }
         }
 
-        let (
-            layout_type,
-            num_layers,
-            outer_dim,
-            inner_dim,
-            page_size,
-            dtype_width_bytes,
-            bytes_per_block,
-            bytes_per_block_per_group,
-        ) = if config.groups.is_empty() {
+        let (group_layouts, bytes_per_block, bytes_per_block_per_group) = if config
+            .groups
+            .is_empty()
+        {
             let (layout_type, num_layers, outer_dim, inner_dim) = match config.device_layout_type {
                 LayoutType::FullyContiguous => {
                     let num_layers = shape[1];
@@ -949,13 +1069,33 @@ impl KvbmWorker {
             );
             let bytes_per_block = group.bytes_per_block();
 
+            let mut layout_builder_instance = LayoutConfigBuilder::default();
+            let layout_builder = layout_builder_instance
+                .num_layers(num_layers)
+                .outer_dim(outer_dim)
+                .page_size(config.page_size)
+                .inner_dim(inner_dim)
+                .dtype_width_bytes(config.dtype_width_bytes);
+
+            let device_layout = layout_builder
+                .num_blocks(config.num_device_blocks)
+                .build()?
+                .create_layout(layout_type, device_tensors)
+                .map_err(|e| anyhow::anyhow!("legacy device layout: {e}"))?;
+
             (
-                layout_type,
-                num_layers,
-                outer_dim,
-                inner_dim,
-                config.page_size,
-                config.dtype_width_bytes,
+                vec![GroupLayoutSpec {
+                    geometry: GroupGeometry {
+                        layout_type,
+                        num_layers,
+                        outer_dim,
+                        inner_dim,
+                        page_size: config.page_size,
+                        dtype_width_bytes: config.dtype_width_bytes,
+                        bytes_per_block,
+                    },
+                    device_layout,
+                }],
                 bytes_per_block,
                 // Modern single-group worker: one group, one vec entry.
                 vec![bytes_per_block],
@@ -1000,59 +1140,56 @@ impl KvbmWorker {
                 .map(|geometry| geometry.bytes_per_block)
                 .collect();
 
-            // STAGING (Task 4): pool construction still consumes only the
-            // FIRST group's geometry; per-group layouts are not threaded
-            // through the transfer handler yet, and create_layout currently
-            // consumes the first group's layout flavor with ALL tensors.
-            // Both are cleared in Task 4.
-            let first = &geometries[0];
-            (
-                first.layout_type,
-                first.num_layers,
-                first.outer_dim,
-                first.inner_dim,
-                first.page_size,
-                first.dtype_width_bytes,
-                bytes_per_block,
-                bytes_per_block_per_group,
-            )
+            // Per-group DEVICE layouts: each group's layout is built over
+            // its OWN tensor subset (the groups partition the
+            // registration-order tensor list — validate() enforces it),
+            // with the group's derived geometry.
+            let mut remaining: Vec<Option<DeviceStorage>> =
+                device_tensors.into_iter().map(Some).collect();
+            let mut group_layouts = Vec::with_capacity(geometries.len());
+            for (group_idx, (group, geometry)) in config.groups.iter().zip(&geometries).enumerate()
+            {
+                let mut subset = Vec::with_capacity(group.tensor_indices.len());
+                for &i in &group.tensor_indices {
+                    let Some(storage) = remaining[i].take() else {
+                        return Err(anyhow::anyhow!(
+                            "layer group {group_idx}: tensor index {i} already consumed by an earlier group (groups must partition the tensor list)"
+                        ));
+                    };
+                    subset.push(storage);
+                }
+                let mut builder = LayoutConfigBuilder::default();
+                let builder = builder
+                    .num_layers(geometry.num_layers)
+                    .outer_dim(geometry.outer_dim)
+                    .page_size(geometry.page_size)
+                    .inner_dim(geometry.inner_dim)
+                    .dtype_width_bytes(geometry.dtype_width_bytes);
+                let device_layout = builder
+                    .num_blocks(config.num_device_blocks)
+                    .build()?
+                    .create_layout(geometry.layout_type, subset)
+                    .map_err(|e| {
+                        anyhow::anyhow!("device layout for layer group {group_idx}: {e}")
+                    })?;
+                group_layouts.push(GroupLayoutSpec {
+                    geometry: *geometry,
+                    device_layout,
+                });
+            }
+
+            (group_layouts, bytes_per_block, bytes_per_block_per_group)
         };
 
-        let mut layout_builder_instance = LayoutConfigBuilder::default();
-        let layout_builder = layout_builder_instance
-            .num_layers(num_layers)
-            .outer_dim(outer_dim)
-            .page_size(page_size)
-            .inner_dim(inner_dim)
-            .dtype_width_bytes(dtype_width_bytes);
-
-        let device_layout = layout_builder
-            .num_blocks(config.num_device_blocks)
-            .build()?
-            .create_layout(layout_type, device_tensors)?;
-
-        let layout_builder = layout_builder.clone();
+        let geometry = HandshakeGeometry {
+            bytes_per_block,
+            bytes_per_block_per_group,
+        };
 
         let (task, handler_rx) = if layout_blocking {
-            Self::run_blocking_layout_initialization(
-                config,
-                bytes_per_block,
-                bytes_per_block_per_group,
-                device_layout,
-                layout_builder,
-                layout_type,
-            )
-            .await?
+            Self::run_blocking_layout_initialization(config, group_layouts, geometry).await?
         } else {
-            Self::run_non_blocking_layout_initialization(
-                config,
-                bytes_per_block,
-                bytes_per_block_per_group,
-                device_layout,
-                layout_builder,
-                layout_type,
-            )
-            .await?
+            Self::run_non_blocking_layout_initialization(config, group_layouts, geometry).await?
         };
 
         Ok(Self {
@@ -1063,11 +1200,8 @@ impl KvbmWorker {
 
     async fn run_blocking_layout_initialization(
         config: KvbmWorkerConfig,
-        bytes_per_block: usize,
-        bytes_per_block_per_group: Vec<usize>,
-        device_layout: Box<dyn NixlLayout<StorageType = DeviceStorage>>,
-        layout_builder: LayoutConfigBuilder,
-        layout_type: LayoutType,
+        group_layouts: Vec<GroupLayoutSpec>,
+        geometry: HandshakeGeometry,
     ) -> anyhow::Result<(
         CriticalTaskExecutionHandle,
         oneshot::Receiver<transfer::BlockTransferHandler>,
@@ -1088,18 +1222,15 @@ impl KvbmWorker {
         // start background worker task to do layout allocation for host or disk
         let task = CriticalTaskExecutionHandle::new(
             move |cancel_token| {
-                KvbmWorker::worker_task(
-                    device_layout,
-                    layout_builder,
-                    layout_type,
-                    worker_config,
+                KvbmWorker::worker_task(WorkerTaskArgs {
+                    group_layouts,
+                    geometry,
+                    config: worker_config,
                     cancel_token,
-                    handler_tx_cell,
-                    layout_ready_tx_cell,
+                    handler_tx: handler_tx_cell,
+                    layout_ready_tx: layout_ready_tx_cell,
                     scheduler_client,
-                    bytes_per_block,
-                    bytes_per_block_per_group,
-                )
+                })
             },
             cancel_token.clone(),
             "kvbm-worker-task",
@@ -1116,11 +1247,8 @@ impl KvbmWorker {
 
     async fn run_non_blocking_layout_initialization(
         config: KvbmWorkerConfig,
-        bytes_per_block: usize,
-        bytes_per_block_per_group: Vec<usize>,
-        device_layout: Box<dyn NixlLayout<StorageType = DeviceStorage> + Send + 'static>,
-        layout_builder: LayoutConfigBuilder,
-        layout_type: LayoutType,
+        group_layouts: Vec<GroupLayoutSpec>,
+        geometry: HandshakeGeometry,
     ) -> anyhow::Result<(
         CriticalTaskExecutionHandle,
         oneshot::Receiver<transfer::BlockTransferHandler>,
@@ -1143,27 +1271,19 @@ impl KvbmWorker {
         // Single task that orchestrates everything in-order.
         let task = CriticalTaskExecutionHandle::new(
             move |ct| {
-                let cfg = worker_config.clone();
-                let scheduler = scheduler_client.clone();
+                let args = WorkerTaskArgs {
+                    group_layouts,
+                    geometry,
+                    config: worker_config.clone(),
+                    cancel_token: ct.clone(),
+                    handler_tx: handler_tx_cell,
+                    layout_ready_tx: layout_ready_tx_cell,
+                    scheduler_client: scheduler_client.clone(),
+                };
 
                 async move {
                     // Start the long-running worker.
-                    let dev_layout = device_layout; // moved in
-                    let lb = layout_builder; // moved in
-                    let lt = layout_type; // moved in
-
-                    let worker_fut = KvbmWorker::worker_task(
-                        dev_layout,
-                        lb,
-                        lt,
-                        cfg.clone(),
-                        ct.clone(),
-                        handler_tx_cell,
-                        layout_ready_tx_cell,
-                        scheduler,
-                        bytes_per_block,
-                        bytes_per_block_per_group,
-                    );
+                    let worker_fut = KvbmWorker::worker_task(args);
 
                     // If worker_task returns Result, handle/log it inside the spawned task.
                     tokio::spawn(async move {
@@ -1214,18 +1334,16 @@ impl KvbmWorker {
         Ok(blocks)
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn worker_task(
-        device_layout: Box<dyn NixlLayout<StorageType = DeviceStorage>>,
-        layout_builder: LayoutConfigBuilder,
-        _device_layout_type: LayoutType,
-        config: KvbmWorkerConfig,
-        cancel_token: CancellationToken,
-        handler_tx: Arc<Mutex<Option<oneshot::Sender<BlockTransferHandler>>>>,
-        layout_ready_tx: tokio::sync::Mutex<Option<oneshot::Sender<String>>>,
-        scheduler_client: Option<TransferSchedulerClient>,
-        bytes_per_block: usize,
-        bytes_per_block_per_group: Vec<usize>,
+        WorkerTaskArgs {
+            group_layouts,
+            geometry,
+            config,
+            cancel_token,
+            handler_tx,
+            layout_ready_tx,
+            scheduler_client,
+        }: WorkerTaskArgs,
     ) -> anyhow::Result<()> {
         let worker_id = config.device_id;
         // Readiness gating for ping
@@ -1250,8 +1368,8 @@ impl KvbmWorker {
             ZMQ_WORKER_METADATA_MESSAGE.to_string(),
             Arc::new(WorkerMetadataHandler {
                 num_device_blocks: config.num_device_blocks,
-                bytes_per_block,
-                bytes_per_block_per_group,
+                bytes_per_block: geometry.bytes_per_block,
+                bytes_per_block_per_group: geometry.bytes_per_block_per_group,
             }) as Arc<dyn Handler>,
         );
 
@@ -1259,8 +1377,7 @@ impl KvbmWorker {
             ZMQ_LEADER_METADATA_MESSAGE.to_string(),
             Arc::new(LeaderMetadataHandler {
                 state: state.clone(),
-                device_layout: tokio::sync::Mutex::new(Some(device_layout)), // moved in
-                layout_builder,                                              // moved
+                group_layouts: tokio::sync::Mutex::new(Some(group_layouts)), // moved in
                 worker_config: config.clone(),
                 worker_id,
                 device_id: config.device_id,

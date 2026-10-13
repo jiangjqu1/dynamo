@@ -1695,6 +1695,7 @@ async fn process_offload_request(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_offload_to_storage<S, L, M>(
     offload_req: LocalOffloadRequest,
     storage_pool: &dyn BlockPool<S, L, M>,
@@ -1755,51 +1756,63 @@ where
         storage_name
     );
 
-    // 3. Issue the offload request using `leader`
-    let block_xfer_req = BlockTransferRequest {
-        from_pool: BlockTransferPool::Device,
-        to_pool: transfer_pool,
-        blocks: block_pairs,
-        // Single-group pool set until the multi-group fan-out lands.
-        group: 0,
-        connector_req: Some(LeaderTransferRequest {
-            request_id: offload_req.request_id.clone(),
-            uuid: offload_req.operation_id,
-            requirement: None,
-            request_type: RequestType::Scheduled,
-        }),
+    // 3. Issue the offload: ONE logical op fanned out to one request PER
+    // GROUP (same block pairs — the tier's block ids index every group's
+    // worker-side pool; each worker holds one pool per group). All legs are
+    // sent before any is awaited. Single-group (num_groups == 1) sends the
+    // one request exactly as before.
+    let num_groups = leader.num_groups();
+    let connector_req = LeaderTransferRequest {
+        request_id: offload_req.request_id.clone(),
+        uuid: offload_req.operation_id,
+        requirement: None,
+        request_type: RequestType::Scheduled,
     };
-    let notify_receiver = leader.transfer_blocks_request(block_xfer_req).await?;
+    let mut notify_receivers = Vec::with_capacity(num_groups);
+    for group in 0..num_groups {
+        let block_xfer_req = BlockTransferRequest {
+            from_pool: BlockTransferPool::Device,
+            to_pool: transfer_pool,
+            blocks: block_pairs.clone(),
+            group,
+            connector_req: Some(connector_req.clone()),
+        };
+        notify_receivers.push(leader.transfer_blocks_request(block_xfer_req).await?);
+    }
     tracing::debug!(
         request_id = request_id,
         operation_id = %operation_id,
-        "offload to {} - stage 3 complete",
-        storage_name
+        "offload to {} - stage 3 complete ({} group legs)",
+        storage_name,
+        num_groups
     );
 
-    // 4. Wait for the offload request to complete
-    match notify_receiver.await {
-        Ok(_) => {
-            match transfer_pool {
-                BlockTransferPool::Disk => {
-                    kvbm_metrics.offload_blocks_d2d.inc_by(num_blocks as u64);
-                }
-                BlockTransferPool::Host => {
-                    kvbm_metrics.offload_blocks_d2h.inc_by(num_blocks as u64);
-                }
-                _ => {}
-            }
-            tracing::debug!(
-                "Offloading transfer to {} completed successfully",
-                storage_name
-            );
-        }
-        Err(_) => {
-            return Err(anyhow::anyhow!(
-                "Offloading transfer completion notification failed"
-            ));
+    // 4. Wait for ALL group legs to complete. The metrics count the
+    // completed LOGICAL op once (not once per group leg).
+    let mut failed_legs: Vec<usize> = Vec::new();
+    for (group, notify_receiver) in notify_receivers.into_iter().enumerate() {
+        if notify_receiver.await.is_err() {
+            failed_legs.push(group);
         }
     }
+    if !failed_legs.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Offloading transfer completion notification failed for group legs {failed_legs:?}"
+        ));
+    }
+    match transfer_pool {
+        BlockTransferPool::Disk => {
+            kvbm_metrics.offload_blocks_d2d.inc_by(num_blocks as u64);
+        }
+        BlockTransferPool::Host => {
+            kvbm_metrics.offload_blocks_d2h.inc_by(num_blocks as u64);
+        }
+        _ => {}
+    }
+    tracing::debug!(
+        "Offloading transfer to {} completed successfully",
+        storage_name
+    );
     tracing::debug!(
         request_id = request_id,
         operation_id = %operation_id,
@@ -1839,42 +1852,52 @@ async fn process_onboard_request(
         .map(|(src, dst)| (*src, *dst))
         .collect::<Vec<_>>();
 
-    // create transfer request
-    let block_xfer_req = BlockTransferRequest {
-        from_pool: onboard_req.src_blocks.storage_pool(),
-        to_pool: BlockTransferPool::Device,
-        blocks: block_pairs,
-        // Single-group pool set until the multi-group fan-out lands.
-        group: 0,
-        connector_req: Some(LeaderTransferRequest {
-            request_id: request_id.clone(),
-            uuid: *operation_id,
-            requirement: None,
-            request_type: RequestType::Immediate,
-        }),
+    // Issue the onboard: ONE logical op fanned out to one request PER GROUP
+    // (same block pairs; each group's worker-side pools). All legs are sent
+    // before any is awaited. Single-group (num_groups == 1) sends the one
+    // request exactly as before.
+    let num_groups = leader.num_groups();
+    let connector_req = LeaderTransferRequest {
+        request_id: request_id.clone(),
+        uuid: *operation_id,
+        requirement: None,
+        request_type: RequestType::Immediate,
     };
+    let mut notify_receivers = Vec::with_capacity(num_groups);
+    for group in 0..num_groups {
+        let block_xfer_req = BlockTransferRequest {
+            from_pool: onboard_req.src_blocks.storage_pool(),
+            to_pool: BlockTransferPool::Device,
+            blocks: block_pairs.clone(),
+            group,
+            connector_req: Some(connector_req.clone()),
+        };
+        notify_receivers.push(leader.transfer_blocks_request(block_xfer_req).await?);
+    }
 
-    let notify_receiver = leader.transfer_blocks_request(block_xfer_req).await?;
-
-    match notify_receiver.await {
-        Ok(_) => {
-            if onboard_req.src_blocks.storage_pool() == BlockTransferPool::Host {
-                kvbm_metrics
-                    .onboard_blocks_h2d
-                    .inc_by(onboard_req.src_blocks.len() as u64);
-            } else if onboard_req.src_blocks.storage_pool() == BlockTransferPool::Disk {
-                kvbm_metrics
-                    .onboard_blocks_d2d
-                    .inc_by(onboard_req.src_blocks.len() as u64);
-            }
-            tracing::debug!("Onboarding transfer completed successfully");
-        }
-        Err(_) => {
-            return Err(anyhow::anyhow!(
-                "Onboarding transfer completion notification failed"
-            ));
+    // Wait for ALL group legs; count the completed LOGICAL op once (not
+    // once per group leg).
+    let mut failed_legs: Vec<usize> = Vec::new();
+    for (group, notify_receiver) in notify_receivers.into_iter().enumerate() {
+        if notify_receiver.await.is_err() {
+            failed_legs.push(group);
         }
     }
+    if !failed_legs.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Onboarding transfer completion notification failed for group legs {failed_legs:?}"
+        ));
+    }
+    if onboard_req.src_blocks.storage_pool() == BlockTransferPool::Host {
+        kvbm_metrics
+            .onboard_blocks_h2d
+            .inc_by(onboard_req.src_blocks.len() as u64);
+    } else if onboard_req.src_blocks.storage_pool() == BlockTransferPool::Disk {
+        kvbm_metrics
+            .onboard_blocks_d2d
+            .inc_by(onboard_req.src_blocks.len() as u64);
+    }
+    tracing::debug!("Onboarding transfer completed successfully");
 
     Ok(())
 }

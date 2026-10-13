@@ -239,11 +239,13 @@ pub struct TransferContext {
     /// [`HostTransferSemantics`]).
     host_transfer_semantics: HostTransferSemantics,
 
-    /// The BAR window's io mapping (host base, device base, length) for the
-    /// DirectIo executor's pointer translation. Set once at pool construction
-    /// (after the host tier's allocate); interior-mutable because the wiring
-    /// lands after the context is shared.
-    host_tier_io_mapping: std::sync::Mutex<Option<(usize, u64, usize)>>,
+    /// The host tier's BAR window io mappings (host base, device base,
+    /// length) for the DirectIo executor's pointer translation — one entry
+    /// per allocated window (per-group tier pools allocate one disjoint
+    /// window per group). Set once at pool construction (after the host
+    /// tier's allocates); interior-mutable because the wiring lands after
+    /// the context is shared.
+    host_tier_io_mappings: std::sync::Mutex<Vec<(usize, u64, usize)>>,
 }
 
 impl TransferContext {
@@ -315,7 +317,7 @@ impl TransferContext {
             cuda_event_worker: Some(cuda_event_worker),
             cancel_token,
             host_transfer_semantics: HostTransferSemantics::default(),
-            host_tier_io_mapping: std::sync::Mutex::new(None),
+            host_tier_io_mappings: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -371,15 +373,19 @@ impl TransferContext {
         self.host_transfer_semantics = semantics;
     }
 
-    /// Wire the BAR window's io mapping (host base, device base, length) for
-    /// the DirectIo executor's pointer translation. Idempotent.
-    pub fn set_host_tier_io_mapping(&self, mapping: (usize, u64, usize)) {
-        *self.host_tier_io_mapping.lock().unwrap() = Some(mapping);
+    /// Wire the host tier's BAR window io mappings (host base, device base,
+    /// length) for the DirectIo executor's pointer translation — one entry
+    /// per allocated window. Multi-group tier pools allocate one window per
+    /// group (disjoint ranges); legacy single-group registers exactly one.
+    /// Idempotent (replaces the previous set).
+    pub fn set_host_tier_io_mappings(&self, mappings: Vec<(usize, u64, usize)>) {
+        *self.host_tier_io_mappings.lock().unwrap() = mappings;
     }
 
-    /// The wired io mapping, if any.
-    pub fn host_tier_io_mapping(&self) -> Option<(usize, u64, usize)> {
-        *self.host_tier_io_mapping.lock().unwrap()
+    /// The wired io mappings (empty when none — e.g. the local
+    /// KvManagerModel path, or staged transfers where no registration ran).
+    pub fn host_tier_io_mappings(&self) -> Vec<(usize, u64, usize)> {
+        self.host_tier_io_mappings.lock().unwrap().clone()
     }
 
     /// Adjust a compile-time transfer strategy for this context's host-tier

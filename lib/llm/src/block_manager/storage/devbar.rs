@@ -633,7 +633,16 @@ pub struct DevbarAllocator {
     /// The io mapping stashed by the last Bar/Bdf allocate (present only when
     /// the IOMEMORY registration succeeded): (host base, device base, length).
     /// The worker holds the allocator, not the storage — this is the channel.
+    /// Per-group tier pools read it after EACH allocate (each window has its
+    /// own mapping).
     io_mapping: std::sync::Mutex<Option<(usize, u64, usize)>>,
+    /// Byte offset (from the configured region offset) already carved out of
+    /// the aperture by previous Bar/Bdf allocates. Sequential allocates must
+    /// get DISJOINT windows — per-group tier pools allocate one window per
+    /// group, and two windows at the same aperture offset would alias the
+    /// same physical BAR bytes. Mock/Vmm/Pinned allocations are independent
+    /// mappings and never touch this cursor.
+    aperture_cursor: std::sync::Mutex<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -726,6 +735,7 @@ impl DevbarAllocator {
                 region: Some(DevbarRegion::Mock),
                 device_id,
                 io_mapping: std::sync::Mutex::new(None),
+                aperture_cursor: std::sync::Mutex::new(0),
             });
         }
 
@@ -738,6 +748,7 @@ impl DevbarAllocator {
                 region: Some(DevbarRegion::Vmm),
                 device_id,
                 io_mapping: std::sync::Mutex::new(None),
+                aperture_cursor: std::sync::Mutex::new(0),
             });
         }
 
@@ -776,6 +787,7 @@ impl DevbarAllocator {
                 }),
                 device_id,
                 io_mapping: std::sync::Mutex::new(None),
+                aperture_cursor: std::sync::Mutex::new(0),
             });
         }
 
@@ -783,6 +795,7 @@ impl DevbarAllocator {
             region: None,
             device_id,
             io_mapping: std::sync::Mutex::new(None),
+            aperture_cursor: std::sync::Mutex::new(0),
         })
     }
 
@@ -792,6 +805,7 @@ impl DevbarAllocator {
             region: Some(DevbarRegion::Mock),
             device_id,
             io_mapping: std::sync::Mutex::new(None),
+            aperture_cursor: std::sync::Mutex::new(0),
         }
     }
 
@@ -801,6 +815,7 @@ impl DevbarAllocator {
             region: Some(DevbarRegion::Bar { path, offset }),
             device_id,
             io_mapping: std::sync::Mutex::new(None),
+            aperture_cursor: std::sync::Mutex::new(0),
         }
     }
 
@@ -810,6 +825,7 @@ impl DevbarAllocator {
             region: Some(DevbarRegion::Vmm),
             device_id,
             io_mapping: std::sync::Mutex::new(None),
+            aperture_cursor: std::sync::Mutex::new(0),
         }
     }
 
@@ -879,32 +895,80 @@ impl DevbarAllocator {
 
 impl StorageAllocator<DevbarStorage> for DevbarAllocator {
     fn allocate(&self, size: usize) -> Result<DevbarStorage, StorageError> {
-        let storage = match &self.region {
-            Some(DevbarRegion::Bar { path, offset }) => {
-                DevbarStorage::from_bar(path.clone(), *offset, size, self.device_id)
+        // Bar/Bdf carve sequential, page-rounded windows out of one aperture
+        // (two windows at the same offset would alias the same physical BAR
+        // bytes). The carve is rolled back if the mapping fails so a failed
+        // allocate does not permanently consume the aperture.
+        let carve = match &self.region {
+            Some(DevbarRegion::Bar { offset, .. }) | Some(DevbarRegion::Bdf { offset, .. }) => {
+                Some(self.reserve_aperture(*offset, size))
             }
-            Some(DevbarRegion::Bdf {
-                bdf,
-                offset,
-                explicit_index,
-            }) => {
-                let path = select_resource_file(
+            _ => None,
+        };
+        let mapped = match (&self.region, carve) {
+            (Some(DevbarRegion::Bar { path, .. }), Some((carve_offset, _))) => {
+                DevbarStorage::from_bar(path.clone(), carve_offset, size, self.device_id)
+            }
+            (
+                Some(DevbarRegion::Bdf {
+                    bdf,
+                    explicit_index,
+                    ..
+                }),
+                Some((carve_offset, _)),
+            ) => {
+                match select_resource_file(
                     bdf,
                     size,
                     *explicit_index,
                     Path::new("/sys/bus/pci/devices"),
-                )?;
-                DevbarStorage::from_bar(path, *offset, size, self.device_id)
+                ) {
+                    Ok(path) => DevbarStorage::from_bar(path, carve_offset, size, self.device_id),
+                    Err(e) => Err(e),
+                }
             }
-            Some(DevbarRegion::Mock) => DevbarStorage::mock(size, self.device_id),
-            Some(DevbarRegion::Vmm) => DevbarStorage::from_vmm(size, self.device_id),
-            None => DevbarStorage::pinned_fallback(size, Some(self.device_id)),
-        }?;
+            (Some(DevbarRegion::Mock), _) => DevbarStorage::mock(size, self.device_id),
+            (Some(DevbarRegion::Vmm), _) => DevbarStorage::from_vmm(size, self.device_id),
+            (None, _) => DevbarStorage::pinned_fallback(size, Some(self.device_id)),
+            _ => unreachable!("carve is set exactly when the region is Bar/Bdf"),
+        };
+        let storage = match mapped {
+            Ok(storage) => storage,
+            Err(e) => {
+                if let Some((_, consumed)) = carve {
+                    self.rollback_aperture(consumed);
+                }
+                return Err(e);
+            }
+        };
         // Stash the io mapping for the worker's wiring (the worker holds the
         // allocator, not the storage). Set unconditionally: None clears a
         // stale mapping from a previous allocate (strictly more robust).
+        // Per-group tier pools read it after EACH allocate — every window
+        // carries its own mapping.
         *self.io_mapping.lock().unwrap() = storage.io_mapping();
         Ok(storage)
+    }
+}
+
+impl DevbarAllocator {
+    /// Reserve the next Bar/Bdf aperture window: carve offset (absolute mmap
+    /// offset) plus the page-rounded consumption to roll back on failure.
+    fn reserve_aperture(&self, base_offset: u64, size: usize) -> (u64, u64) {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        // sysconf cannot fail for _SC_PAGESIZE on Linux; a 0 would mean a
+        // broken libc — guard anyway so div_ceil never panics.
+        let page = page.max(1);
+        let consumed = (size as u64).div_ceil(page) * page;
+        let mut cursor = self.aperture_cursor.lock().unwrap();
+        let carve = base_offset + *cursor;
+        *cursor += consumed;
+        (carve, consumed)
+    }
+
+    /// Undo a reserve whose mapping failed.
+    fn rollback_aperture(&self, consumed: u64) {
+        *self.aperture_cursor.lock().unwrap() -= consumed;
     }
 }
 

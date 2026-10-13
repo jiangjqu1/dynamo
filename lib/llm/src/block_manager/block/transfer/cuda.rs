@@ -686,14 +686,15 @@ where
     Source: BlockDataProvider,
     Target: BlockDataProviderMut,
 {
-    let (host_base, io_dev_base, win_len) = ctx.host_tier_io_mapping().ok_or_else(|| {
-        TransferError::ExecutionError(
+    let windows = ctx.host_tier_io_mappings();
+    if windows.is_empty() {
+        return Err(TransferError::ExecutionError(
             "direct-io executor: no io mapping wired (the IOMEMORY registration did not run, or \
              the local KvManagerModel path which does not wire it — direct transfers are \
              supported on the distributed worker path)"
                 .into(),
-        )
-    })?;
+        ));
+    }
 
     if sources.is_empty() && targets.is_empty() {
         return Ok(());
@@ -719,19 +720,30 @@ where
     // guard with exactly these Drop semantics.
     let _io_sync_guard = BounceSyncGuard(stream);
 
-    // Translate a host-tier block pointer into the window's device VA,
-    // range-checked against the window span.
+    // Translate a host-tier block pointer into its window's device VA,
+    // range-checked against the registered windows. Multi-group tier pools
+    // allocate one DISJOINT window per group, so the containing window is
+    // unambiguous; a legacy single-group tier has exactly one.
     let translate = |ptr: *const u8, size: usize| -> Result<u64, TransferError> {
         let addr = ptr as usize;
-        if addr < host_base || addr.saturating_add(size) > host_base.saturating_add(win_len) {
-            return Err(TransferError::ExecutionError(format!(
-                "direct-io executor: block [0x{addr:x}, 0x{:x}) outside the window \
-                 [0x{host_base:x}, 0x{:x})",
-                addr.saturating_add(size),
-                host_base.saturating_add(win_len)
-            )));
-        }
-        Ok(io_dev_base + (addr - host_base) as u64)
+        windows
+            .iter()
+            .find(|&&(host_base, _, win_len)| {
+                addr >= host_base && addr.saturating_add(size) <= host_base.saturating_add(win_len)
+            })
+            .map(|&(host_base, io_dev_base, _)| io_dev_base + (addr - host_base) as u64)
+            .ok_or_else(|| {
+                let spans = windows
+                    .iter()
+                    .map(|&(base, _, len)| format!("[0x{base:x}, 0x{:x})", base + len))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                TransferError::ExecutionError(format!(
+                    "direct-io executor: block [0x{addr:x}, 0x{:x}) outside every registered \
+                     window ({spans})",
+                    addr.saturating_add(size)
+                ))
+            })
     };
 
     match strategy {
