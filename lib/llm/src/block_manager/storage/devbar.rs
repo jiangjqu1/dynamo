@@ -898,7 +898,8 @@ impl StorageAllocator<DevbarStorage> for DevbarAllocator {
         // Bar/Bdf carve sequential, page-rounded windows out of one aperture
         // (two windows at the same offset would alias the same physical BAR
         // bytes). The carve is rolled back if the mapping fails so a failed
-        // allocate does not permanently consume the aperture.
+        // allocate does not permanently consume the aperture — LIFO-safely:
+        // only the MOST RECENT reservation rewinds (see rollback_aperture).
         let carve = match &self.region {
             Some(DevbarRegion::Bar { offset, .. }) | Some(DevbarRegion::Bdf { offset, .. }) => {
                 Some(self.reserve_aperture(*offset, size))
@@ -906,7 +907,7 @@ impl StorageAllocator<DevbarStorage> for DevbarAllocator {
             _ => None,
         };
         let mapped = match (&self.region, carve) {
-            (Some(DevbarRegion::Bar { path, .. }), Some((carve_offset, _))) => {
+            (Some(DevbarRegion::Bar { path, .. }), Some((carve_offset, _, _))) => {
                 DevbarStorage::from_bar(path.clone(), carve_offset, size, self.device_id)
             }
             (
@@ -915,18 +916,14 @@ impl StorageAllocator<DevbarStorage> for DevbarAllocator {
                     explicit_index,
                     ..
                 }),
-                Some((carve_offset, _)),
-            ) => {
-                match select_resource_file(
-                    bdf,
-                    size,
-                    *explicit_index,
-                    Path::new("/sys/bus/pci/devices"),
-                ) {
-                    Ok(path) => DevbarStorage::from_bar(path, carve_offset, size, self.device_id),
-                    Err(e) => Err(e),
-                }
-            }
+                Some((carve_offset, _, _)),
+            ) => select_resource_file(
+                bdf,
+                size,
+                *explicit_index,
+                Path::new("/sys/bus/pci/devices"),
+            )
+            .and_then(|path| DevbarStorage::from_bar(path, carve_offset, size, self.device_id)),
             (Some(DevbarRegion::Mock), _) => DevbarStorage::mock(size, self.device_id),
             (Some(DevbarRegion::Vmm), _) => DevbarStorage::from_vmm(size, self.device_id),
             (None, _) => DevbarStorage::pinned_fallback(size, Some(self.device_id)),
@@ -935,8 +932,8 @@ impl StorageAllocator<DevbarStorage> for DevbarAllocator {
         let storage = match mapped {
             Ok(storage) => storage,
             Err(e) => {
-                if let Some((_, consumed)) = carve {
-                    self.rollback_aperture(consumed);
+                if let Some((_, reserved_end, consumed)) = carve {
+                    self.rollback_aperture(reserved_end, consumed);
                 }
                 return Err(e);
             }
@@ -952,9 +949,11 @@ impl StorageAllocator<DevbarStorage> for DevbarAllocator {
 }
 
 impl DevbarAllocator {
-    /// Reserve the next Bar/Bdf aperture window: carve offset (absolute mmap
-    /// offset) plus the page-rounded consumption to roll back on failure.
-    fn reserve_aperture(&self, base_offset: u64, size: usize) -> (u64, u64) {
+    /// Reserve the next Bar/Bdf aperture window: the absolute carve offset
+    /// (mmap offset), the reserved end (cursor value after this reserve —
+    /// the LIFO rollback watermark), and the page-rounded consumption to
+    /// roll back on failure.
+    fn reserve_aperture(&self, base_offset: u64, size: usize) -> (u64, u64, u64) {
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
         // sysconf cannot fail for _SC_PAGESIZE on Linux; a 0 would mean a
         // broken libc — guard anyway so div_ceil never panics.
@@ -963,12 +962,29 @@ impl DevbarAllocator {
         let mut cursor = self.aperture_cursor.lock().unwrap();
         let carve = base_offset + *cursor;
         *cursor += consumed;
-        (carve, consumed)
+        (carve, *cursor, consumed)
     }
 
-    /// Undo a reserve whose mapping failed.
-    fn rollback_aperture(&self, consumed: u64) {
-        *self.aperture_cursor.lock().unwrap() -= consumed;
+    /// Undo a reserve whose mapping failed. LIFO-safe: the rewind only
+    /// applies when this reservation is still the most recent one — under
+    /// interleaved allocates (A reserves, B reserves, A fails), rewinding
+    /// below B's start would let a later allocate alias B's window, i.e.
+    /// physical BAR aliasing. In that case the failed window is leaked
+    /// (aperture bytes reserved but unused — bounded by the failed request)
+    /// and loudly logged instead.
+    fn rollback_aperture(&self, reserved_end: u64, consumed: u64) {
+        let mut cursor = self.aperture_cursor.lock().unwrap();
+        if *cursor == reserved_end {
+            *cursor -= consumed;
+        } else {
+            tracing::warn!(
+                reserved_end,
+                cursor = *cursor,
+                consumed,
+                "aperture rollback skipped: cursor moved past this reservation \
+                 (interleaved allocate?); leaking {consumed} aperture bytes"
+            );
+        }
     }
 }
 
@@ -1074,6 +1090,92 @@ mod tests {
         let err = DevbarStorage::from_bar(file.path().to_path_buf(), 1, 512, 7)
             .expect_err("unaligned offset must be rejected");
         assert!(matches!(err, StorageError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn aperture_cursor_carves_disjoint_page_rounded_windows_and_rolls_back() {
+        let allocator = DevbarAllocator::bar(PathBuf::from("/dev/null"), 4096, 0);
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        assert!(page > 0);
+
+        // First reserve: 100 bytes page-rounds to a full page.
+        let (carve0, end0, consumed0) = allocator.reserve_aperture(4096, 100);
+        assert_eq!(carve0, 4096);
+        assert_eq!(consumed0, page);
+        assert_eq!(end0, page);
+
+        // Second reserve starts at the previous window's END (disjoint).
+        let (carve1, end1, consumed1) = allocator.reserve_aperture(4096, page as usize);
+        assert_eq!(carve1, 4096 + page);
+        assert_eq!(end1, 2 * page);
+        assert_eq!(consumed1, page);
+
+        // LIFO rollback of the MOST RECENT reservation restores the cursor.
+        allocator.rollback_aperture(end1, consumed1);
+        assert_eq!(*allocator.aperture_cursor.lock().unwrap(), page);
+
+        // ...so the next reserve REUSES the rolled-back offset.
+        let (carve2, end2, consumed2) = allocator.reserve_aperture(4096, 16);
+        assert_eq!(carve2, 4096 + page);
+        assert_eq!(end2, 2 * page);
+        assert_eq!(consumed2, page);
+
+        // A STALE rollback (an earlier, no-longer-most-recent reservation)
+        // must NOT rewind below the newer reservation's start — rewinding
+        // would let a later allocate alias the newer window (physical BAR
+        // aliasing). The window is leaked and loudly logged instead.
+        allocator.rollback_aperture(end0, consumed0);
+        assert_eq!(*allocator.aperture_cursor.lock().unwrap(), 2 * page);
+    }
+
+    #[test]
+    fn aperture_cursor_two_bar_allocates_get_disjoint_roundtripping_windows() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("DYN_KVBM_DEVBAR_MEM_TYPE") };
+
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let size = 1024; // per-allocation request; page-rounded to `page` in the carve
+        let aperture_len = 4 * page; // room for both page-rounded windows
+
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        use std::io::{Seek as _, Write as _};
+        file.write_all(&vec![0u8; aperture_len])
+            .expect("size the aperture");
+        file.flush().expect("flush");
+        file.rewind().expect("rewind");
+
+        let allocator = DevbarAllocator::bar(file.path().to_path_buf(), 0, 7);
+        let mut storage_a = allocator.allocate(size).expect("first bar allocate");
+        let mut storage_b = allocator.allocate(size).expect("second bar allocate");
+
+        // Distinct physical windows: write a different pattern through each
+        // storage and verify neither observes the other's bytes. Two
+        // allocations carved at the SAME aperture offset (the pre-cursor
+        // behavior) would alias both onto the same physical bytes.
+        unsafe {
+            let pa = storage_a.as_mut_ptr();
+            let pb = storage_b.as_mut_ptr();
+            for i in 0..size {
+                std::ptr::write_volatile(pa.add(i), 0xA0);
+            }
+            for i in 0..size {
+                std::ptr::write_volatile(pb.add(i), 0xB0);
+            }
+            for i in 0..size {
+                assert_eq!(std::ptr::read_volatile(pa.add(i)), 0xA0);
+            }
+            for i in 0..size {
+                assert_eq!(std::ptr::read_volatile(pb.add(i)), 0xB0);
+            }
+        }
+
+        // Both windows roundtrip through the Storage API as well.
+        storage_a.memset(0x11, 0, size).unwrap();
+        storage_b.memset(0x22, 0, size).unwrap();
+        unsafe {
+            assert_eq!(std::ptr::read_volatile(Storage::as_ptr(&storage_a)), 0x11);
+            assert_eq!(std::ptr::read_volatile(Storage::as_ptr(&storage_b)), 0x22);
+        }
     }
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
