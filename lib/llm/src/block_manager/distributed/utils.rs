@@ -21,9 +21,18 @@ pub struct WorkerMetadata {
     /// (the Σ scalar). Modern single-group workers send a 1-element vec; the
     /// empty-vs-single distinction is meaningful downstream, hence no
     /// `skip_serializing_if`.
+    ///
+    /// Compatibility coverage of `#[serde(default)]`: it rescues a missing
+    /// field on self-describing decode paths (JSON) and covers the
+    /// new-worker → old-leader direction on ZMQ (bincode ignores trailing
+    /// bytes). KNOWN GAP: old-worker → new-leader over ZMQ is NOT covered —
+    /// the handshake decodes with bincode positional
+    /// (`decode_from_slice`, zmq.rs), so a 2-field legacy payload fails
+    /// with UnexpectedEnd before the empty-vec fallback can apply.
     // Compatibility: workers < hybrid-multigroup send no field (N-2 window,
-    // lib/llm/AGENTS.md). TODO(hybrid-multigroup): remove the empty-vec
-    // fallback when N-2 no longer includes multigroup-less workers.
+    // lib/llm/AGENTS.md). TODO(hybrid-multigroup): add a legacy-layout
+    // fallback at the zmq.rs decode site, then remove this fallback when
+    // N-2 no longer includes multigroup-less workers.
     #[serde(default)]
     pub bytes_per_block_per_group: Vec<usize>,
 }
@@ -99,15 +108,30 @@ impl BlockTransferRequest {
 /// each position across workers — the multi-group analog of the legacy
 /// scalar Σ (`adjust policy for DP/PP if needed` still applies).
 ///
-/// The result length is the shortest input. TP workers of one set must agree
-/// on the group count; in particular a legacy peer (empty vec) truncates the
-/// result to empty, which sends the caller to the legacy scalar path rather
-/// than silently dropping that peer's contribution.
+/// The result length is the shortest input. Modern workers of one set must
+/// agree on the group count — a debug_assert (chosen over a warn: release
+/// keeps the bounded degradation, dev/test builds fail loudly) flags a
+/// misconfigured set whose non-empty vecs have unequal lengths. A zero
+/// length is a legitimate legacy peer, not a mismatch: any legacy peer
+/// truncates the result to empty, which sends the caller to the legacy
+/// scalar path rather than silently dropping that peer's contribution.
 pub(crate) fn aggregate_worker_bytes_per_group<'a, I>(per_worker: I) -> Vec<usize>
 where
     I: IntoIterator<Item = &'a [usize]>,
 {
     let per_worker: Vec<&[usize]> = per_worker.into_iter().collect();
+    let mut modern_group_counts: Vec<usize> = per_worker
+        .iter()
+        .filter(|groups| !groups.is_empty())
+        .map(|groups| groups.len())
+        .collect();
+    modern_group_counts.sort_unstable();
+    modern_group_counts.dedup();
+    debug_assert!(
+        modern_group_counts.len() <= 1,
+        "workers disagree on the HMA group count (misconfigured TP set): got lengths {:?}",
+        modern_group_counts
+    );
     let Some(group_count) = per_worker.iter().map(|groups| groups.len()).min() else {
         return Vec::new();
     };

@@ -35,28 +35,31 @@ fn compute_num_blocks(
     }
 }
 
-/// `compute_num_blocks` bounded by the device pool: host/disk blocks share
-/// the device block index, so a tier can never size above the device count.
-fn compute_num_blocks_bounded(
-    num_device_blocks: usize,
-    num_blocks_config: &KvbmLeaderNumBlocksConfig,
-    bytes_per_block: usize,
-) -> usize {
-    num_device_blocks.min(compute_num_blocks(num_blocks_config, bytes_per_block))
-}
-
 /// Handshake sizing: element-wise Σ across TP workers of each group's
 /// `bytes_per_block` (multi-group analog of the legacy scalar Σ), then one
-/// shared block count per tier bounded by the device count.
+/// shared block count per tier from the Σ total — one host/disk "block
+/// unit" spans all groups.
+///
+/// Tier sizing is deliberately UNBOUNDED by the device count: offload
+/// targets come from the tier pool's free-list allocation
+/// (`offload.rs` `target_pool.allocate_blocks`), and onboarding matches
+/// cached blocks by sequence hash onto arbitrary newly-assigned device
+/// blocks — there is no positional device↔host index mapping, so a tier
+/// larger than the device pool is a normal, validated configuration
+/// (e.g. a 24 GiB host tier behind a ~10 GiB device KV pool).
 ///
 /// Compatibility: workers < hybrid-multigroup send no per-group values
 /// (empty vecs) — the scalar `bytes_per_block` Σ is authoritative there,
 /// which is also what a mixed legacy/modern TP set degrades to (any legacy
-/// peer empties the aggregate; every version emits the scalar).
-/// TODO(hybrid-multigroup): remove the scalar fallback when N-2 no longer
-/// includes multigroup-less workers.
+/// peer empties the aggregate; every version emits the scalar). This
+/// scalar fallback is reachable on the ZMQ path only for a modern leader
+/// decoding legacy payloads via a future zmq.rs shim — see the KNOWN GAP
+/// note on `WorkerMetadata::bytes_per_block_per_group` (bincode is
+/// positional, so `#[serde(default)]` alone cannot decode a 2-field
+/// payload). TODO(hybrid-multigroup): fix the zmq.rs legacy decode and
+/// remove the scalar fallback when N-2 no longer includes multigroup-less
+/// workers.
 fn compute_leader_block_counts(
-    num_device_blocks: usize,
     host_cfg: &KvbmLeaderNumBlocksConfig,
     disk_cfg: &KvbmLeaderNumBlocksConfig,
     workers: &[WorkerMetadata],
@@ -74,8 +77,8 @@ fn compute_leader_block_counts(
     };
 
     LeaderMetadata {
-        num_host_blocks: compute_num_blocks_bounded(num_device_blocks, host_cfg, bytes_per_block),
-        num_disk_blocks: compute_num_blocks_bounded(num_device_blocks, disk_cfg, bytes_per_block),
+        num_host_blocks: compute_num_blocks(host_cfg, bytes_per_block),
+        num_disk_blocks: compute_num_blocks(disk_cfg, bytes_per_block),
     }
 }
 
@@ -199,17 +202,11 @@ impl KvbmLeader {
                 cancel.clone(),
                 move |workers: &[WorkerMetadata]| -> LeaderMetadata {
                     // Record device blocks: min across workers
-                    let min_device_blocks = workers.iter().map(|w| w.num_device_blocks).min();
-                    if let Some(min_dev) = min_device_blocks {
+                    if let Some(min_dev) = workers.iter().map(|w| w.num_device_blocks).min() {
                         num_device_blocks_cell.store(min_dev, Ordering::Release);
                     }
 
-                    let metadata = compute_leader_block_counts(
-                        min_device_blocks.unwrap_or(0),
-                        &host_cfg,
-                        &disk_cfg,
-                        workers,
-                    );
+                    let metadata = compute_leader_block_counts(&host_cfg, &disk_cfg, workers);
 
                     // store into leader state
                     num_host_blocks_cell.store(metadata.num_host_blocks, Ordering::Release);
@@ -310,7 +307,6 @@ mod tests {
             vec![12_845_056, 76_972_032],
         )];
         let meta = compute_leader_block_counts(
-            1_000,
             &window_cfg(WINDOW_BYTES),
             &window_cfg(WINDOW_BYTES),
             &workers,
@@ -320,22 +316,38 @@ mod tests {
     }
 
     #[test]
-    fn tier_sizing_is_bounded_by_the_device_block_count() {
-        // Host/disk blocks share the device block index: a tier can never
-        // size above `num_device_blocks`, byte window notwithstanding.
+    fn tier_sizing_is_not_bounded_by_the_device_block_count() {
+        // RESTORED old behavior: a tier may exceed the device pool. Tier
+        // pools allocate from free lists and onboarding matches by sequence
+        // hash — no positional device↔host mapping — so a 24 GiB host tier
+        // behind a small device KV pool is a normal configuration.
         let workers = [worker(
             100,
             GROUP_TOTAL_BYTES_PER_BLOCK,
             vec![12_845_056, 76_972_032],
         )];
         let meta = compute_leader_block_counts(
-            100,
             &window_cfg(WINDOW_BYTES),
             &window_cfg(WINDOW_BYTES),
             &workers,
         );
-        assert_eq!(meta.num_host_blocks, 100);
-        assert_eq!(meta.num_disk_blocks, 100);
+        assert_eq!(meta.num_host_blocks, 286);
+        assert!(meta.num_host_blocks > 100);
+        assert_eq!(meta.num_disk_blocks, 286);
+    }
+
+    #[test]
+    fn block_override_is_not_capped_by_the_device_count() {
+        // DYN_KVBM_*_OVERRIDE_NUM_BLOCKS passes through compute_num_blocks
+        // verbatim; it must not be silently clipped to the device count.
+        let workers = [worker(100, GROUP_TOTAL_BYTES_PER_BLOCK, vec![])];
+        let override_cfg = KvbmLeaderNumBlocksConfig {
+            cache_size_in_gb: 0.0,
+            num_blocks_overriden: 5_000,
+        };
+        let meta = compute_leader_block_counts(&override_cfg, &override_cfg, &workers);
+        assert_eq!(meta.num_host_blocks, 5_000);
+        assert_eq!(meta.num_disk_blocks, 5_000);
     }
 
     #[test]
@@ -349,7 +361,6 @@ mod tests {
             worker(1_000, 1, half_groups),
         ];
         let meta = compute_leader_block_counts(
-            1_000,
             &window_cfg(WINDOW_BYTES),
             &window_cfg(WINDOW_BYTES),
             &workers,
@@ -361,11 +372,9 @@ mod tests {
     #[test]
     fn legacy_peers_reproduce_the_scalar_formula() {
         // Pre-multigroup peers report empty per-group vecs; the leader falls
-        // back to the scalar Σ — today's formula, with the bound not binding
-        // (7M device blocks > 5,981,445).
+        // back to the scalar Σ — exactly today's formula.
         let workers = [worker(7_000_000, 4096, vec![])];
         let meta = compute_leader_block_counts(
-            7_000_000,
             &window_cfg(24_500_000_000.0),
             &window_cfg(24_500_000_000.0),
             &workers,
@@ -382,14 +391,12 @@ mod tests {
     fn mixed_legacy_and_modern_set_falls_back_to_scalar_sum() {
         // One legacy peer drags the element-wise aggregate to empty; the
         // scalar Σ (which the conservative writer always emits) drives
-        // sizing instead — never a silent partial-group sum. Device bound
-        // not binding (7M device blocks > 1,993,815).
+        // sizing instead — never a silent partial-group sum.
         let workers = [
             worker(7_000_000, 4_096, vec![]),
             worker(7_000_000, 8_192, vec![100, 200]),
         ];
         let meta = compute_leader_block_counts(
-            7_000_000,
             &window_cfg(24_500_000_000.0),
             &window_cfg(24_500_000_000.0),
             &workers,
