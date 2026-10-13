@@ -559,8 +559,10 @@ pub struct LayerGroup {
     pub inner_dim: usize,
     pub dtype_width_bytes: usize,
     pub is_mamba: bool,
-    /// Indices into the registration-order tensor list; strictly increasing,
-    /// and across all groups a partition of `0..tensors.len()`.
+    /// Indices into the registration-order tensor list; strictly
+    /// increasing within the group, and across all groups an exact
+    /// partition of `0..tensors.len()` (each index claimed exactly once;
+    /// cross-group order is free, so interleaved groups are valid).
     pub tensor_indices: Vec<usize>,
 }
 
@@ -875,10 +877,14 @@ impl KvbmWorkerConfig {
             _ => {}
         }
 
-        // Grouped configs: the groups must partition the registered tensor
-        // list in registration order, and `active_save_layers` is bounded by
-        // the number of registered tensors. Ungrouped (legacy) configs are
-        // not subject to the bound.
+        // Grouped configs: each group's `tensor_indices` must be strictly
+        // increasing WITHIN the group, and across groups every registered
+        // tensor must be claimed by exactly one group (union, no
+        // duplicates, no gaps). Cross-group ordering is irrelevant — each
+        // group's layout consumes only its own tensors — so interleaved
+        // groups (hybrid attention layers inside a mamba span) are valid.
+        // `active_save_layers` is bounded by the number of registered
+        // tensors. Ungrouped (legacy) configs are not subject to the bound.
         if !self.groups.is_empty() {
             for (group_idx, group) in self.groups.iter().enumerate() {
                 if group.tensor_indices.is_empty() {
@@ -909,21 +915,39 @@ impl KvbmWorkerConfig {
                 );
             }
 
-            // A single ordered pass: the concatenation of the groups'
-            // indices must be exactly 0..tensors.len(), which enforces
-            // strict increase, disjointness, and registration order.
-            let mut expected = 0usize;
+            // Exact partition: with the covered-count check above, ruling
+            // out out-of-range and duplicate claims here also rules out
+            // gaps (len distinct in-range indices claimed == every index
+            // claimed). Within a group the indices must be strictly
+            // increasing, i.e. registration order; across groups any
+            // order is fine.
+            let mut claimed = vec![false; self.tensors.len()];
             for (group_idx, group) in self.groups.iter().enumerate() {
-                for &tensor_idx in &group.tensor_indices {
-                    if tensor_idx != expected {
+                for (pos, &tensor_idx) in group.tensor_indices.iter().enumerate() {
+                    if tensor_idx >= self.tensors.len() {
                         anyhow::bail!(
-                            "LayerGroup {} tensor indices must be strictly increasing and follow registration order; expected index {}, got {}",
+                            "LayerGroup {} references tensor index {} but only {} tensors are registered",
                             group_idx,
-                            expected,
+                            tensor_idx,
+                            self.tensors.len()
+                        );
+                    }
+                    if claimed[tensor_idx] {
+                        anyhow::bail!(
+                            "LayerGroup {} claims tensor index {} which is already claimed by another group; groups must partition the registered tensors with no duplicates",
+                            group_idx,
                             tensor_idx
                         );
                     }
-                    expected += 1;
+                    if pos > 0 && tensor_idx <= group.tensor_indices[pos - 1] {
+                        anyhow::bail!(
+                            "LayerGroup {} tensor indices must be strictly increasing within the group; got {} after {}",
+                            group_idx,
+                            tensor_idx,
+                            group.tensor_indices[pos - 1]
+                        );
+                    }
+                    claimed[tensor_idx] = true;
                 }
             }
 
@@ -1152,9 +1176,9 @@ impl KvbmWorker {
                 let mut subset = Vec::with_capacity(group.tensor_indices.len());
                 for &i in &group.tensor_indices {
                     // Defense-in-depth: `validate()` already enforces the
-                    // exact partition this checks (groups cover
-                    // 0..tensors.len() in registration order), so the
-                    // missing-arm case is unreachable in practice.
+                    // exact partition this checks (each registered index
+                    // is claimed by exactly one group), so the missing-arm
+                    // case is unreachable in practice.
                     let Some(storage) = remaining[i].take() else {
                         return Err(anyhow::anyhow!(
                             "layer group {group_idx}: tensor index {i} already consumed by an earlier group (groups must partition the tensor list)"
@@ -1707,7 +1731,66 @@ mod layer_group_tests {
     }
 
     #[test]
-    fn validate_groups_reject_non_registration_order() {
+    fn validate_groups_accept_interleaved_hma_partition() {
+        // The hybrid fp4 pattern: attention layers at positions 3 and 6
+        // inside the mamba span. The groups' concatenation
+        // ([0,1,2,4,5] ++ [3,6]) is NOT monotonic, but each group's own
+        // indices are strictly increasing and together they claim every
+        // registered tensor exactly once — a valid partition.
+        let tensors: Vec<Arc<dyn TorchTensor>> = vec![
+            Arc::new(FakeTensor {
+                shape: vec![8, 128],
+            }), // 0 mamba
+            Arc::new(FakeTensor {
+                shape: vec![8, 128],
+            }), // 1 mamba
+            Arc::new(FakeTensor {
+                shape: vec![8, 128],
+            }), // 2 mamba
+            Arc::new(FakeTensor {
+                shape: vec![2, 4, 16, 64],
+            }), // 3 attention
+            Arc::new(FakeTensor {
+                shape: vec![8, 128],
+            }), // 4 mamba
+            Arc::new(FakeTensor {
+                shape: vec![8, 128],
+            }), // 5 mamba
+            Arc::new(FakeTensor {
+                shape: vec![2, 4, 16, 64],
+            }), // 6 attention
+        ];
+        let mut mamba = LayerGroup::mamba(5, 128);
+        mamba.tensor_indices = vec![0, 1, 2, 4, 5];
+        let mut attn = LayerGroup::attention(2, 16, 2, 64, 2);
+        attn.tensor_indices = vec![3, 6];
+
+        // Mamba-first group order (the fp4's actual registration layout).
+        let config = KvbmWorkerConfig::builder()
+            .cancel_token(CancellationToken::new())
+            .num_device_blocks(4)
+            .tensors(tensors.clone())
+            .groups(vec![mamba.clone(), attn.clone()])
+            .active_save_layers(Some(2))
+            .build()
+            .expect("grouped config should build");
+        assert!(config.validate().is_ok());
+
+        // Cross-group order is irrelevant: the attention group may also
+        // come first.
+        let reordered = KvbmWorkerConfig::builder()
+            .cancel_token(CancellationToken::new())
+            .num_device_blocks(4)
+            .tensors(tensors)
+            .groups(vec![attn, mamba])
+            .active_save_layers(Some(2))
+            .build()
+            .expect("grouped config should build");
+        assert!(reordered.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_groups_reject_within_group_disorder() {
         let tensors: Vec<Arc<dyn TorchTensor>> = vec![
             Arc::new(FakeTensor {
                 shape: vec![2, 4, 16, 64],
@@ -1727,8 +1810,97 @@ mod layer_group_tests {
             .expect("config should build");
         let err = config.validate().unwrap_err().to_string();
         assert!(
-            err.contains("registration order"),
-            "expected registration-order error, got: {err}"
+            err.contains("strictly increasing within the group"),
+            "expected within-group order error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_groups_reject_duplicate_index_across_groups() {
+        // Both groups claim tensor 0; the covered-count check passes (3
+        // claims over 3 tensors) so the duplicate itself must be caught.
+        let tensors: Vec<Arc<dyn TorchTensor>> = vec![
+            Arc::new(FakeTensor {
+                shape: vec![2, 4, 16, 64],
+            }),
+            Arc::new(FakeTensor {
+                shape: vec![2, 4, 16, 64],
+            }),
+            Arc::new(FakeTensor {
+                shape: vec![2, 4, 16, 64],
+            }),
+        ];
+        let mut first = LayerGroup::attention(2, 16, 2, 64, 2);
+        first.tensor_indices = vec![0, 1];
+        let mut second = LayerGroup::attention(1, 16, 2, 64, 2);
+        second.tensor_indices = vec![0];
+        let config = KvbmWorkerConfig::builder()
+            .cancel_token(CancellationToken::new())
+            .num_device_blocks(4)
+            .tensors(tensors)
+            .groups(vec![first, second])
+            .build()
+            .expect("config should build");
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("already claimed by another group"),
+            "expected duplicate-claim error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_groups_reject_gap_in_coverage() {
+        // No group claims tensor 2: the covered-count check (2 claims
+        // over 3 tensors) reports the broken partition.
+        let tensors: Vec<Arc<dyn TorchTensor>> = vec![
+            Arc::new(FakeTensor {
+                shape: vec![2, 4, 16, 64],
+            }),
+            Arc::new(FakeTensor {
+                shape: vec![2, 4, 16, 64],
+            }),
+            Arc::new(FakeTensor {
+                shape: vec![2, 4, 16, 64],
+            }),
+        ];
+        let mut attn = LayerGroup::attention(1, 16, 2, 64, 2);
+        attn.tensor_indices = vec![0];
+        let mut mamba = LayerGroup::mamba(1, 128);
+        mamba.tensor_indices = vec![1];
+        let config = KvbmWorkerConfig::builder()
+            .cancel_token(CancellationToken::new())
+            .num_device_blocks(4)
+            .tensors(tensors)
+            .groups(vec![attn, mamba])
+            .build()
+            .expect("config should build");
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("partition"),
+            "expected partition error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_groups_reject_out_of_range_index() {
+        // Covered-count matches (1 claim over 1 tensor), but the claimed
+        // index is beyond the registered tensor list.
+        let tensors: Vec<Arc<dyn TorchTensor>> = vec![Arc::new(FakeTensor {
+            shape: vec![2, 4, 16, 64],
+        })];
+        let mut attn = LayerGroup::attention(1, 16, 2, 64, 2);
+        attn.tensor_indices = vec![7];
+        let config = KvbmWorkerConfig::builder()
+            .cancel_token(CancellationToken::new())
+            .num_device_blocks(4)
+            .tensors(tensors)
+            .groups(vec![attn])
+            .build()
+            .expect("config should build");
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("but only 1 tensors are registered"),
+            "expected out-of-range error, got: {err}"
         );
     }
 
