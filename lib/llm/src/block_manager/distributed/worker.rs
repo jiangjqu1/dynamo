@@ -915,13 +915,12 @@ impl KvbmWorkerConfig {
                 );
             }
 
-            // Exact partition: with the covered-count check above, ruling
-            // out out-of-range and duplicate claims here also rules out
-            // gaps (len distinct in-range indices claimed == every index
-            // claimed). Within a group the indices must be strictly
-            // increasing, i.e. registration order; across groups any
-            // order is fine.
-            let mut claimed = vec![false; self.tensors.len()];
+            // Exact partition: with the covered-count check above, having
+            // as many distinct in-range claims as registered tensors
+            // means every index is claimed exactly once. Within a group
+            // the indices must be strictly increasing, i.e. registration
+            // order; across groups any order is fine.
+            let mut claimed_by = vec![Option::<(usize, usize)>::None; self.tensors.len()];
             for (group_idx, group) in self.groups.iter().enumerate() {
                 for (pos, &tensor_idx) in group.tensor_indices.iter().enumerate() {
                     if tensor_idx >= self.tensors.len() {
@@ -932,11 +931,13 @@ impl KvbmWorkerConfig {
                             self.tensors.len()
                         );
                     }
-                    if claimed[tensor_idx] {
+                    if let Some((prev_group, prev_pos)) = claimed_by[tensor_idx] {
                         anyhow::bail!(
-                            "LayerGroup {} claims tensor index {} which is already claimed by another group; groups must partition the registered tensors with no duplicates",
+                            "LayerGroup {} claims tensor index {} which is already claimed (by group {} at position {}); groups must partition the registered tensors with no duplicates",
                             group_idx,
-                            tensor_idx
+                            tensor_idx,
+                            prev_group,
+                            prev_pos
                         );
                     }
                     if pos > 0 && tensor_idx <= group.tensor_indices[pos - 1] {
@@ -947,7 +948,7 @@ impl KvbmWorkerConfig {
                             group.tensor_indices[pos - 1]
                         );
                     }
-                    claimed[tensor_idx] = true;
+                    claimed_by[tensor_idx] = Some((group_idx, pos));
                 }
             }
 
@@ -1818,7 +1819,8 @@ mod layer_group_tests {
     #[test]
     fn validate_groups_reject_duplicate_index_across_groups() {
         // Both groups claim tensor 0; the covered-count check passes (3
-        // claims over 3 tensors) so the duplicate itself must be caught.
+        // claims over 3 tensors) so the duplicate itself must be caught,
+        // with the message naming the earlier claim's group and position.
         let tensors: Vec<Arc<dyn TorchTensor>> = vec![
             Arc::new(FakeTensor {
                 shape: vec![2, 4, 16, 64],
@@ -1843,8 +1845,8 @@ mod layer_group_tests {
             .expect("config should build");
         let err = config.validate().unwrap_err().to_string();
         assert!(
-            err.contains("already claimed by another group"),
-            "expected duplicate-claim error, got: {err}"
+            err.contains("already claimed (by group 0 at position 0)"),
+            "expected duplicate-claim error naming the earlier claim, got: {err}"
         );
     }
 

@@ -287,34 +287,9 @@ class KvConnectorWorker:
         else:
             kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
 
-        # Hybrid (HMA) handoff: pass the per-group plan so the Rust worker
-        # derives per-group geometry, and the attention-layer count so the
-        # save trigger fires at the last ATTENTION layer with the offload
-        # enqueue deferred to wait_for_save (mamba bytes are only final
-        # post-forward). Attention-only registrations pass None for all
-        # three and keep the legacy path byte-identical.
-        if recurrent_layer_count > 0 and self.group_plans:
-            group_of_layer: Optional[list[int]] = self.group_plans[0].group_of_layer
-            group_specs: Optional[list[tuple[bool, Optional[int]]]] = []
-            for plan in self.group_plans:
-                if plan.is_mamba and plan.layer_names:
-                    first_tensor = name_to_tensor[plan.layer_names[0]]
-                    # Physical per-block row bytes of the group's dense
-                    # int8 [B, C] state tensor. vLLM's spec page_size is
-                    # padded metadata (Phase 1 probe proved it); the
-                    # tensor's own shape is ground truth.
-                    page_bytes: Optional[int] = int(first_tensor.shape[1])
-                else:
-                    # Attention groups: Rust infers the geometry from the
-                    # group's first tensor (page tokens fall back to the
-                    # registration page_size).
-                    page_bytes = None
-                group_specs.append((plan.is_mamba, page_bytes))
-            active_save_layers: Optional[int] = attention_layer_count
-        else:
-            group_of_layer = None
-            group_specs = None
-            active_save_layers = None
+        group_of_layer, group_specs, active_save_layers = self._hybrid_handoff(
+            name_to_tensor, attention_layer_count, recurrent_layer_count
+        )
 
         # Register with connector using ordered data
         self._connector.register_kv_caches(
@@ -330,6 +305,48 @@ class KvConnectorWorker:
             group_specs=group_specs,
             active_save_layers=active_save_layers,
         )
+
+    def _hybrid_handoff(
+        self,
+        name_to_tensor: dict[str, torch.Tensor],
+        attention_layer_count: int,
+        recurrent_layer_count: int,
+    ) -> tuple[
+        Optional[list[int]],
+        Optional[list[tuple[bool, Optional[int]]]],
+        Optional[int],
+    ]:
+        """Build the hybrid (HMA) registration handoff for the Rust worker.
+
+        Returns ``(group_of_layer, group_specs, active_save_layers)`` so
+        the Rust worker derives per-group geometry and the save trigger
+        fires at the last ATTENTION layer with the offload enqueue
+        deferred to wait_for_save (mamba bytes are only final
+        post-forward). Attention-only registrations return ``None`` for
+        all three and keep the legacy Rust path byte-identical.
+        """
+        if recurrent_layer_count <= 0 or not self.group_plans:
+            return None, None, None
+        # Every plan shares the SAME group_of_layer list (GroupPlan's
+        # docstring: one list parallel to the registration order), so
+        # plan[0]'s view is the one authoritative mapping.
+        group_of_layer: Optional[list[int]] = self.group_plans[0].group_of_layer
+        group_specs: list[tuple[bool, Optional[int]]] = []
+        for plan in self.group_plans:
+            if plan.is_mamba and plan.layer_names:
+                first_tensor = name_to_tensor[plan.layer_names[0]]
+                # Physical per-block row bytes of the group's dense
+                # int8 [B, C] state tensor. vLLM's spec page_size is
+                # padded metadata (Phase 1 probe proved it); the
+                # tensor's own shape is ground truth.
+                page_bytes: Optional[int] = int(first_tensor.shape[1])
+            else:
+                # Attention groups: Rust infers the geometry from the
+                # group's first tensor (page tokens fall back to the
+                # registration page_size).
+                page_bytes = None
+            group_specs.append((plan.is_mamba, page_bytes))
+        return group_of_layer, group_specs, attention_layer_count
 
     def bind_connector_metadata(self, data: bytes) -> None:
         """Set the connector metadata from the scheduler.

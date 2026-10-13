@@ -168,25 +168,42 @@ impl KvConnectorWorker {
     /// next iteration's metadata overwrites them. No fresh event sync is
     /// possible at bind time — the enqueue proceeds unsynced and the
     /// affected requests are named in a warning so the staleness is
-    /// visible. Returns the number of flushed operations.
-    fn flush_held_offload_operations(&mut self) -> usize {
+    /// visible.
+    ///
+    /// A slot whose held stores were never enqueued is vacuously
+    /// complete (un-enqueued holds are not in the slot's operation
+    /// list), so `get_finished` may already have reaped it during the
+    /// forward-less step. Enqueuing into a reaped slot would panic the
+    /// scheduler client's hard `expect`, so those operations are dropped
+    /// with a warning naming the request and operation instead.
+    fn flush_held_offload_operations(&mut self) {
         if self.offloading_operations.is_empty() {
-            return 0;
+            return;
         }
-        let request_ids: Vec<&str> = self
-            .offloading_operations
-            .iter()
-            .map(|op| op.request_id.as_str())
-            .collect();
+        let held = std::mem::take(&mut self.offloading_operations);
+        let request_ids: Vec<&str> = held.iter().map(|op| op.request_id.as_str()).collect();
         tracing::warn!(
             iteration = self.iteration,
             request_ids = ?request_ids,
             num_operations = request_ids.len(),
             "enqueuing offload operations held from a previous iteration without a fresh event sync (that iteration never reached wait_for_save)"
         );
-        let held = self.offloading_operations.len();
-        self.enqueue_offload_operations();
-        held
+        for operation in held {
+            if !self.connector.has_slot(&operation.request_id) {
+                tracing::warn!(
+                    request_id = %operation.request_id,
+                    operation_id = %operation.uuid,
+                    "slot already reaped; dropping stale held offload op"
+                );
+                continue;
+            }
+            tracing::debug!(
+                request_id = %operation.request_id,
+                operation_id = %operation.uuid,
+                "Enqueuing held offload operation to scheduler"
+            );
+            self.connector.enqueue_request(operation);
+        }
     }
 }
 
@@ -248,6 +265,17 @@ fn build_layer_groups(
     for (group_id, (is_mamba, page_bytes)) in group_specs.iter().enumerate() {
         let tensor_indices = std::mem::take(&mut indices_per_group[group_id]);
         if *is_mamba {
+            if tensor_indices.is_empty() && page_bytes.is_none() {
+                // An empty group has no state tensor to derive the
+                // physical row size from; name the emptiness instead of
+                // letting the page_bytes requirement misreport the
+                // problem. (Non-empty builds pass empty groups through —
+                // KvbmWorkerConfig::validate() owns their rejection with
+                // a "has no tensor indices" error that names the group.)
+                anyhow::bail!(
+                    "mamba layer group {group_id} has no layers in group_of_layer; an empty mamba group has no state tensor to derive page_bytes from"
+                );
+            }
             let Some(page_bytes) = page_bytes else {
                 anyhow::bail!(
                     "mamba layer group {group_id} requires page_bytes (the physical per-block row size of its state tensor)"
@@ -514,9 +542,13 @@ impl Worker for KvConnectorWorker {
     /// arrives, sync its event and enqueue the offload operations — the
     /// exact historical path. Hybrid (HMA): mamba/GDN layers never call
     /// this, so the last ATTENTION layer's save arrives before mamba
-    /// bytes are final. Sync the attention event at
-    /// `active_save_layers`, but HOLD the offload enqueue for
-    /// [`Worker::wait_for_save`], which runs after the full forward pass.
+    /// bytes are final. Fire the trigger (log that the offload
+    /// operations are held) but do NOT sync any event here —
+    /// `layers_complete - 1` is a registration-position index, which for
+    /// interleaved layouts points at a mamba-layer event, and nothing
+    /// consumes that fence: the enqueue goes to
+    /// [`Worker::wait_for_save`], whose fresh post-forward event is the
+    /// real ordering guarantee.
     fn save_kv_layer(&mut self, _layer_name: String) -> anyhow::Result<()> {
         self.layers_complete += 1;
         let trigger_at = self
@@ -531,15 +563,24 @@ impl Worker for KvConnectorWorker {
             "save_kv_layer called"
         );
         if self.layers_complete == trigger_at {
-            // Sync the last ATTENTION layer's event (attention bytes are
-            // final here; hybrid mamba bytes are not, but their groups
-            // are not enqueued until wait_for_save's fresh event).
-            event_sync_blocking(self.layer_events[self.layers_complete - 1]);
             if self.active_save_layers.is_none() {
+                // Attention-only (legacy): sync the last layer's event
+                // and enqueue — byte-identical to the historical path.
+                event_sync_blocking(self.layer_events[self.layers_complete - 1]);
                 self.enqueue_offload_operations();
+            } else {
+                // Hybrid: hold — no event sync at the trigger (the
+                // index above is a registration position, not an
+                // attention-layer position); wait_for_save enqueues
+                // after the full forward pass behind a fresh event
+                // that covers every registered layer.
+                tracing::debug!(
+                    iteration = self.iteration,
+                    trigger_at,
+                    pending_offload_ops = self.offloading_operations.len(),
+                    "hybrid save trigger fired; offload ops held for wait_for_save"
+                );
             }
-            // hybrid: hold — wait_for_save enqueues after the full
-            // forward pass, once mamba-group bytes are final.
         }
         Ok(())
     }
@@ -818,10 +859,12 @@ mod tests {
     // a `Py<PyAny>`, so keeping `new` alive pulls `_Py_DecRef` into the
     // link, and the extension-module feature deliberately omits
     // libpython. The trigger's `event_sync_blocking` (cuEventSynchronize)
-    // additionally needs a live CUDA context. Both paths are exercised on
-    // the GPU node (Task 8). What IS testable on CPU is the registration
-    // -> LayerGroup mapping below, which is where the fp4's interleaved
-    // layout and the physical mamba page_bytes must survive.
+    // additionally needs a live CUDA context. Both paths are exercised
+    // on the GPU node (Task 8; see the phase-2 plan doc
+    // Research/2026-10-13-kvbm-hybrid-multigroup-phase2-plan.md). What IS
+    // testable on CPU is the registration -> LayerGroup mapping below,
+    // which is where the fp4's interleaved layout and the physical
+    // mamba page_bytes must survive.
 
     #[test]
     fn build_layer_groups_none_inputs_keep_legacy_path() {
@@ -931,6 +974,95 @@ mod tests {
         assert!(
             err.contains("group id 5 but only 1 groups"),
             "expected unknown-group error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_layer_groups_spec_position_defines_group_identity() {
+        // Tensor 0 belongs to group id 1 (mamba), tensor 1 to group id 0
+        // (attention): the SPEC's position defines a group's kind, not
+        // whichever id appears first in group_of_layer.
+        let group_of_layer = vec![1, 0];
+        let group_specs = vec![(false, None), (true, Some(96))];
+        let groups = build_layer_groups(
+            Some(&group_of_layer),
+            Some(&group_specs),
+            2,
+            16,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(groups.len(), 2);
+        assert!(!groups[0].is_mamba());
+        assert_eq!(groups[0].tensor_indices, vec![1]);
+        assert_eq!(groups[0].page_bytes, 16); // attention: page_size fallback
+        assert!(groups[1].is_mamba());
+        assert_eq!(groups[1].tensor_indices, vec![0]);
+        assert_eq!(groups[1].page_bytes, 96);
+    }
+
+    #[test]
+    fn build_layer_groups_unreferenced_spec_id_yields_empty_group() {
+        // A spec id never referenced by group_of_layer builds an
+        // empty-indices group; KvbmWorkerConfig::validate() is what
+        // rejects it downstream, naming the group.
+        let group_of_layer = vec![0, 0];
+        let group_specs = vec![(false, None), (true, Some(96))];
+        let groups = build_layer_groups(
+            Some(&group_of_layer),
+            Some(&group_specs),
+            2,
+            16,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].tensor_indices, vec![0, 1]);
+        assert!(groups[1].tensor_indices.is_empty());
+
+        let config = KvbmWorkerConfig::builder()
+            .cancel_token(tokio_util::sync::CancellationToken::new())
+            .num_device_blocks(4)
+            .groups(groups)
+            .build()
+            .expect("config should build");
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("LayerGroup 1 has no tensor indices"),
+            "expected validate()'s empty-group rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_layer_groups_empty_mamba_spec_without_page_bytes_names_emptiness() {
+        // Without the emptiness check this would misreport the problem
+        // as a missing page_bytes.
+        let group_of_layer = vec![0, 0];
+        let group_specs = vec![(false, None), (true, None)];
+        let err = build_layer_groups(
+            Some(&group_of_layer),
+            Some(&group_specs),
+            2,
+            16,
+            1,
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("mamba layer group 1 has no layers in group_of_layer"),
+            "expected empty-group error naming the group, got: {err}"
+        );
+        assert!(
+            !err.contains("requires page_bytes"),
+            "the emptiness error must fire before the page_bytes error: {err}"
         );
     }
 

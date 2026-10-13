@@ -6,7 +6,8 @@
 The kvbm package in this environment resolves to a site-packages install
 whose built ``_core`` extension is absent from the source tree, so the
 module under test is loaded directly from its source file instead of via
-a package import.
+a package import. The vLLM spec/config fakes are shared via
+``conftest.py``.
 """
 
 import importlib.util
@@ -14,6 +15,8 @@ import sys
 from pathlib import Path
 
 import pytest
+
+from tests.unit.kvbm.conftest import FakeGroup, FakeKVCacheConfig
 
 pytestmark = [
     pytest.mark.unit,
@@ -35,34 +38,6 @@ _spec.loader.exec_module(group_plan)
 
 GroupPlan = group_plan.GroupPlan
 derive_layer_groups = group_plan.derive_layer_groups
-
-
-class MambaSpec:
-    """Named after vLLM's hybrid recurrent-state spec class (name is the contract)."""
-
-    def __init__(self, page_size):
-        self.page_size = page_size
-
-
-class AttnSpec:
-    def __init__(self, page_size):
-        self.page_size = page_size
-
-
-_SPEC_BY_KIND = {"mamba": MambaSpec, "attn": AttnSpec}
-
-
-class FakeGroup:
-    def __init__(self, layer_names, kind, page_size):
-        self.layer_names = layer_names
-        self.kv_cache_spec = _SPEC_BY_KIND[kind](page_size)
-
-
-class FakeKVCacheConfig:
-    """Stands in for vLLM's KVCacheConfig (the .kv_cache_groups holder)."""
-
-    def __init__(self, groups):
-        self.kv_cache_groups = groups
 
 
 def test_two_groups_partition_in_layer_order():

@@ -9,22 +9,19 @@ Rust PyO3 connector for hybrid models, and pass ``None`` for all three
 for attention-only models so the legacy path stays byte-identical. The
 mamba ``page_bytes`` must come from the physical tensor shape, not the
 vLLM spec's page size. The Rust connector is faked here — these tests
-assert the REGISTRATION ARGUMENTS, not Rust behavior.
-
-Like ``test_group_derivation.py``, the module under test is loaded from
-source; its heavy ``kvbm`` imports (nixl / the built ``_core``
-extension) are stubbed, and the ``torch.cuda`` event API is patched so
-the tests run on CPU.
+assert the REGISTRATION ARGUMENTS, not Rust behavior. Shared fakes and
+the source-module loader live in ``conftest.py``.
 """
-
-import importlib.util
-import sys
-import types
-from pathlib import Path
-from typing import Optional
 
 import pytest
 import torch
+
+from tests.unit.kvbm.conftest import (
+    _FAKE_EVENT_HANDLE,
+    FakeGroup,
+    FakeKVCacheConfig,
+    FakeVllmConfig,
+)
 
 pytestmark = [
     pytest.mark.unit,
@@ -33,136 +30,22 @@ pytestmark = [
     pytest.mark.kvbm,
 ]
 
-_VLLM_INTEGRATION_DIR = (
-    Path(__file__).resolve().parents[3]
-    / "lib/bindings/kvbm/python/kvbm/vllm_integration"
-)
-
-_FAKE_EVENT_HANDLE = 4242
+_MAMBA_LAYERS = (0, 1, 2, 4, 5)
+_ATTN_LAYERS = (3, 6)
 
 
-class FakeCudaEvent:
-    """Stand-in for torch.cuda.Event (CPU-only test environment)."""
-
-    def __init__(self, enable_timing=False, interprocess=False):
-        self.record_count = 0
-
-    def record(self, stream=None):
-        self.record_count += 1
-
-    @property
-    def cuda_event(self):
-        return _FAKE_EVENT_HANDLE
-
-
-class FakeRustKvConnectorWorker:
-    """Recording stand-in for kvbm.vllm_integration.rust.KvConnectorWorker."""
-
-    def __init__(self, drt, engine_id):
-        self.drt = drt
-        self.engine_id = engine_id
-        self.register_calls: list[dict] = []
-        self.wait_for_save_handles: list[int] = []
-
-    def register_kv_caches(self, *args, **kwargs):
-        self.register_calls.append({"args": args, "kwargs": kwargs})
-
-    def wait_for_save(self, event_handle):
-        self.wait_for_save_handles.append(event_handle)
-
-    def bind_connector_metadata(self, data: bytes) -> None:
-        pass
-
-    def clear_connector_metadata(self) -> None:
-        pass
-
-    def save_kv_layer(self, layer_name: str, kv_layer) -> None:
-        pass
-
-    def get_finished(self, finished_req_ids):
-        return set(), set()
-
-
-class MambaSpec:
-    """Named after vLLM's hybrid recurrent-state spec class."""
-
-    def __init__(self, page_size):
-        self.page_size = page_size
-
-
-class AttnSpec:
-    def __init__(self, page_size):
-        self.page_size = page_size
-
-
-class FakeGroup:
-    def __init__(self, layer_names, kind, page_size):
-        self.layer_names = layer_names
-        self.kv_cache_spec = {"mamba": MambaSpec, "attn": AttnSpec}[kind](page_size)
-
-
-class FakeKVCacheConfig:
-    def __init__(self, groups):
-        self.kv_cache_groups = groups
-
-
-class FakeVllmConfig:
-    """Stands in for vllm.config.VllmConfig (attribute surface only)."""
-
-    def __init__(self, kv_cache_config: Optional[FakeKVCacheConfig]):
-        cache_config = types.SimpleNamespace(block_size=16, cache_dtype="auto")
-        model_config = types.SimpleNamespace(use_mla=False, dtype=torch.uint8)
-        self.cache_config = cache_config
-        self.model_config = model_config
-        self.kv_cache_config = kv_cache_config
-
-
-@pytest.fixture(name="connector_worker_module")
-def load_connector_worker_module(monkeypatch):
-    """Load connector_worker.py from source with kvbm's heavy imports stubbed.
-
-    The real ``kvbm`` package import pulls in nixl and the built ``_core``
-    extension; a fake package hierarchy lets the module under test resolve
-    ``kvbm.utils``, the relative ``.group_plan`` import, and
-    ``kvbm.vllm_integration.rust`` without them. monkeypatch restores
-    sys.modules after each test.
-    """
-    kvbm_pkg = types.ModuleType("kvbm")
-    kvbm_pkg.__path__ = []
-    monkeypatch.setitem(sys.modules, "kvbm", kvbm_pkg)
-
-    utils_mod = types.ModuleType("kvbm.utils")
-    utils_mod.is_dyn_runtime_enabled = lambda: False
-    utils_mod.nvtx_annotate = lambda category: (lambda func: func)
-    monkeypatch.setitem(sys.modules, "kvbm.utils", utils_mod)
-
-    vllm_integration = types.ModuleType("kvbm.vllm_integration")
-    vllm_integration.__path__ = []
-    monkeypatch.setitem(sys.modules, "kvbm.vllm_integration", vllm_integration)
-
-    group_plan_spec = importlib.util.spec_from_file_location(
-        "kvbm.vllm_integration.group_plan",
-        _VLLM_INTEGRATION_DIR / "group_plan.py",
-    )
-    group_plan = importlib.util.module_from_spec(group_plan_spec)
-    monkeypatch.setitem(sys.modules, group_plan_spec.name, group_plan)
-    group_plan_spec.loader.exec_module(group_plan)
-
-    rust_mod = types.ModuleType("kvbm.vllm_integration.rust")
-    rust_mod.KvConnectorWorker = FakeRustKvConnectorWorker
-    monkeypatch.setitem(sys.modules, "kvbm.vllm_integration.rust", rust_mod)
-
-    worker_spec = importlib.util.spec_from_file_location(
-        "kvbm.vllm_integration.connector_worker",
-        _VLLM_INTEGRATION_DIR / "connector_worker.py",
-    )
-    worker_mod = importlib.util.module_from_spec(worker_spec)
-    monkeypatch.setitem(sys.modules, worker_spec.name, worker_mod)
-    worker_spec.loader.exec_module(worker_mod)
-
-    monkeypatch.setattr(torch.cuda, "Event", FakeCudaEvent)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
-    return worker_mod
+def _fp4_names() -> list[str]:
+    """Registration-order layer names for the fp4 pattern."""
+    kinds = {
+        0: "mamba",
+        1: "mamba",
+        2: "mamba",
+        3: "self_attn",
+        4: "mamba",
+        5: "mamba",
+        6: "self_attn",
+    }
+    return [f"model.layers.{i}.{kinds[i]}" for i in sorted(kinds)]
 
 
 def _fp4_kv_caches() -> dict:
@@ -174,9 +57,9 @@ def _fp4_kv_caches() -> dict:
     the page_bytes assertion.
     """
     kv_caches: dict = {}
-    for i in (0, 1, 2, 4, 5):
+    for i in _MAMBA_LAYERS:
         kv_caches[f"model.layers.{i}.mamba"] = [torch.zeros(4, 96, dtype=torch.uint8)]
-    for i in (3, 6):
+    for i in _ATTN_LAYERS:
         kv_caches[f"model.layers.{i}.self_attn"] = torch.zeros(
             2, 4, 16, 64, dtype=torch.uint8
         )
@@ -186,18 +69,12 @@ def _fp4_kv_caches() -> dict:
 def _fp4_config() -> FakeVllmConfig:
     groups = [
         FakeGroup(
-            [
-                "model.layers.0.mamba",
-                "model.layers.1.mamba",
-                "model.layers.2.mamba",
-                "model.layers.4.mamba",
-                "model.layers.5.mamba",
-            ],
+            [f"model.layers.{i}.mamba" for i in _MAMBA_LAYERS],
             "mamba",
             page_size=100,  # padded spec value: NOT the physical row (96)
         ),
         FakeGroup(
-            ["model.layers.3.self_attn", "model.layers.6.self_attn"],
+            [f"model.layers.{i}.self_attn" for i in _ATTN_LAYERS],
             "attn",
             page_size=16,
         ),
@@ -222,15 +99,7 @@ def test_hybrid_registration_passes_groups_and_active_save_layers(
     args, kwargs = call["args"], call["kwargs"]
 
     # Ordered registration: 7 layers sorted by layer index.
-    assert [name for name, _t in args[4]] == [
-        "model.layers.0.mamba",
-        "model.layers.1.mamba",
-        "model.layers.2.mamba",
-        "model.layers.3.self_attn",
-        "model.layers.4.mamba",
-        "model.layers.5.mamba",
-        "model.layers.6.self_attn",
-    ]
+    assert [name for name, _t in args[4]] == _fp4_names()
     # Mamba entries are the normalized flat raw tensors ([B, C]).
     assert tuple(args[4][0][1].shape) == (4, 96)
 
@@ -245,6 +114,39 @@ def test_hybrid_registration_passes_groups_and_active_save_layers(
     assert kwargs["group_of_layer"] == [0, 0, 0, 1, 0, 0, 1]
     assert kwargs["group_specs"] == [(True, 96), (False, None)]
     assert kwargs["active_save_layers"] == 2
+
+
+def test_hybrid_handoff_derives_physical_mamba_page_bytes(
+    connector_worker_module,
+):
+    # Direct unit test of the handoff payload construction (no CUDA, no
+    # register flow): the mamba page_bytes must come from the physical
+    # tensor shape even when the spec's page_size says otherwise.
+    module = connector_worker_module
+    worker = _make_worker(module, FakeVllmConfig(kv_cache_config=None))
+    worker.group_plans = module.derive_layer_groups(
+        FakeKVCacheConfig(_fp4_config().kv_cache_config.kv_cache_groups),
+        _fp4_names(),
+    )
+
+    name_to_tensor = {
+        f"model.layers.{i}.mamba": torch.zeros(4, 96, dtype=torch.uint8)
+        for i in _MAMBA_LAYERS
+    }
+    name_to_tensor.update(
+        {f"model.layers.{i}.self_attn": torch.zeros(2, 4, 16, 64) for i in _ATTN_LAYERS}
+    )
+
+    group_of_layer, group_specs, active = worker._hybrid_handoff(
+        name_to_tensor, attention_layer_count=2, recurrent_layer_count=5
+    )
+    assert group_of_layer == [0, 0, 0, 1, 0, 0, 1]
+    assert group_specs == [(True, 96), (False, None)]
+    assert active == 2
+
+    # Attention-only: all three None.
+    result = worker._hybrid_handoff(name_to_tensor, 2, recurrent_layer_count=0)
+    assert result == (None, None, None)
 
 
 def test_attention_only_registration_keeps_legacy_payload(
