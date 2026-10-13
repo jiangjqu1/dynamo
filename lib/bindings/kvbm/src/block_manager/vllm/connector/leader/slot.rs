@@ -1560,6 +1560,8 @@ impl LocalTransferEngine {
                             from_pool: BlockTransferPool::Device, // Use valid Device->Host transfer type
                             to_pool: BlockTransferPool::Host,     // (offload path, but no blocks)
                             blocks: vec![],                       // Empty - nothing to transfer
+                            // Error-recovery unblock: single-group pool set.
+                            group: 0,
                             connector_req: Some(LeaderTransferRequest {
                                 request_id: request_id.clone(),
                                 uuid: operation_id,
@@ -1758,6 +1760,8 @@ where
         from_pool: BlockTransferPool::Device,
         to_pool: transfer_pool,
         blocks: block_pairs,
+        // Single-group pool set until the multi-group fan-out lands.
+        group: 0,
         connector_req: Some(LeaderTransferRequest {
             request_id: offload_req.request_id.clone(),
             uuid: offload_req.operation_id,
@@ -1840,6 +1844,8 @@ async fn process_onboard_request(
         from_pool: onboard_req.src_blocks.storage_pool(),
         to_pool: BlockTransferPool::Device,
         blocks: block_pairs,
+        // Single-group pool set until the multi-group fan-out lands.
+        group: 0,
         connector_req: Some(LeaderTransferRequest {
             request_id: request_id.clone(),
             uuid: *operation_id,

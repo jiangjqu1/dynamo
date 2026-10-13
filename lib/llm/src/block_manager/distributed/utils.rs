@@ -63,11 +63,15 @@ pub struct ConnectorRequestLeader {
     pub transfer_type: ConnectorTransferType,
 }
 
-#[derive(Serialize, Deserialize, Debug, Getters, Clone)]
+#[derive(Serialize, Deserialize, Debug, Getters, Clone, PartialEq, Eq)]
 pub struct BlockTransferRequest {
     pub from_pool: BlockTransferPool,
     pub to_pool: BlockTransferPool,
     pub blocks: Vec<(usize, usize)>,
+
+    /// Phase 2 multi-group: which HMA group's pools this request addresses.
+    #[serde(default)]
+    pub group: usize,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connector_req: Option<LeaderTransferRequest>,
@@ -84,6 +88,8 @@ impl BlockTransferRequest {
             from_pool,
             to_pool,
             blocks,
+            // Legacy constructor: single-group (group 0) semantics.
+            group: 0,
             connector_req: None,
         }
     }
@@ -98,6 +104,8 @@ impl BlockTransferRequest {
             from_pool,
             to_pool,
             blocks,
+            // Legacy constructor: single-group (group 0) semantics.
+            group: 0,
             connector_req: Some(connector_req),
         }
     }
@@ -132,6 +140,18 @@ where
         "workers disagree on the HMA group count (misconfigured TP set): got lengths {:?}",
         modern_group_counts
     );
+    if modern_group_counts.len() > 1 {
+        // Release-mode companion to the debug_assert: a misconfigured TP set
+        // must not silently truncate to the shortest member's group count
+        // (dropping groups). Degrade to the conservative scalar Σ (empty
+        // result routes the caller to the legacy path) instead.
+        tracing::warn!(
+            "workers disagree on the HMA group count (misconfigured TP set): got lengths {:?}; \
+             falling back to the scalar bytes-per-block sum",
+            modern_group_counts
+        );
+        return Vec::new();
+    }
     let Some(group_count) = per_worker.iter().map(|groups| groups.len()).min() else {
         return Vec::new();
     };
@@ -185,6 +205,33 @@ mod tests {
         };
         let encoded = serde_json::to_string(&meta).unwrap();
         assert!(encoded.contains(r#""bytes_per_block_per_group":[4096]"#));
+    }
+
+    #[test]
+    fn transfer_request_group_defaults_to_zero_and_roundtrips() {
+        // THE N-2 contract (lib/llm/AGENTS.md): a legacy peer's request JSON
+        // carries no `group` field; the tolerant reader must decode it to
+        // group 0 (the single-group legacy pool set), never fail.
+        let legacy: BlockTransferRequest = serde_json::from_str(
+            r#"{"from_pool":"Device","to_pool":"Host","blocks":[[1,2],[3,4]]}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.group, 0);
+        assert_eq!(legacy.blocks, vec![(1, 2), (3, 4)]);
+
+        // An explicit group roundtrips through the JSON transport the leader
+        // uses for transfer requests.
+        let grouped = BlockTransferRequest {
+            from_pool: BlockTransferPool::Device,
+            to_pool: BlockTransferPool::Host,
+            blocks: vec![(5, 6)],
+            group: 2,
+            connector_req: None,
+        };
+        let encoded = serde_json::to_string(&grouped).unwrap();
+        assert!(encoded.contains(r#""group":2"#));
+        let decoded: BlockTransferRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, grouped);
     }
 
     #[test]

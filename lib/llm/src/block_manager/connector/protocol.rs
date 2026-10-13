@@ -91,7 +91,7 @@ pub enum SchedulerRequirement {
 }
 
 /// Issued by the leader, received by the TransferEngine.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LeaderTransferRequest {
     pub request_id: String,
     pub uuid: uuid::Uuid,

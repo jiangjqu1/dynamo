@@ -214,6 +214,9 @@ impl ConnectorTransferBatcher {
                     from_pool: *request.from_pool(),
                     to_pool: *request.to_pool(),
                     blocks: batch.to_vec(),
+                    // A batch is a fragment of the SAME logical request, so it
+                    // addresses the same group's pools.
+                    group: request.group,
                     connector_req: None,
                 };
                 handler.execute_transfer_direct(batch_request)
@@ -234,11 +237,19 @@ impl ConnectorTransferBatcher {
 }
 
 /// A handler for all block transfers. Wraps a group of `BlockTransferPoolManager`s.
+///
+/// Phase 2 multi-group: each tier holds one pool list PER HMA group
+/// (indexed by group id). Every request carries a `group` tag selecting
+/// which group's pool pair the transfer addresses; legacy single-group
+/// deployments register exactly one group (index 0) and behave identically.
 #[derive(Clone)]
 pub struct BlockTransferHandler {
-    device: Option<LocalBlockDataList<DeviceStorage>>,
-    host: Option<LocalBlockDataList<DevbarStorage>>,
-    disk: Option<LocalBlockDataList<DiskStorage>>,
+    /// Device pool lists, indexed by group id.
+    device: Vec<Option<LocalBlockDataList<DeviceStorage>>>,
+    /// Host (tier-2) pool lists, indexed by group id.
+    host: Vec<Option<LocalBlockDataList<DevbarStorage>>>,
+    /// Disk (tier-3) pool lists, indexed by group id.
+    disk: Vec<Option<LocalBlockDataList<DiskStorage>>>,
     context: Arc<TransferContext>,
     scheduler_client: Option<TransferSchedulerClient>,
     batcher: ConnectorTransferBatcher,
@@ -251,9 +262,9 @@ pub struct BlockTransferHandler {
 
 impl BlockTransferHandler {
     pub fn new(
-        device_blocks: Option<Vec<LocalBlock<DeviceStorage, BasicMetadata>>>,
-        host_blocks: Option<Vec<LocalBlock<DevbarStorage, BasicMetadata>>>,
-        disk_blocks: Option<Vec<LocalBlock<DiskStorage, BasicMetadata>>>,
+        device_blocks: Vec<Option<Vec<LocalBlock<DeviceStorage, BasicMetadata>>>>,
+        host_blocks: Vec<Option<Vec<LocalBlock<DevbarStorage, BasicMetadata>>>>,
+        disk_blocks: Vec<Option<Vec<LocalBlock<DiskStorage, BasicMetadata>>>>,
         context: Arc<TransferContext>,
         scheduler_client: Option<TransferSchedulerClient>,
         nccl_config: NcclConfig,
@@ -265,9 +276,12 @@ impl BlockTransferHandler {
         };
 
         Ok(Self {
-            device: Self::get_local_data(device_blocks),
-            host: Self::get_local_data(host_blocks),
-            disk: Self::get_local_data(disk_blocks),
+            device: device_blocks
+                .into_iter()
+                .map(Self::get_local_data)
+                .collect(),
+            host: host_blocks.into_iter().map(Self::get_local_data).collect(),
+            disk: disk_blocks.into_iter().map(Self::get_local_data).collect(),
             context,
             scheduler_client,
             batcher: ConnectorTransferBatcher::new(),
@@ -280,6 +294,31 @@ impl BlockTransferHandler {
     /// Returns the transfer mode (sharded or replicated)
     pub fn transfer_mode(&self) -> TransferMode {
         self.transfer_mode
+    }
+
+    /// Number of HMA groups whose pool lists are registered on this handler.
+    pub fn num_groups(&self) -> usize {
+        self.device.len().max(self.host.len()).max(self.disk.len())
+    }
+
+    /// Resolve one group's pool list, with an actionable bounds/uninitialized
+    /// error (the group tag arrives from the wire — never index blindly).
+    fn pool_for_group<'a, S: Storage>(
+        lists: &'a [Option<LocalBlockDataList<S>>],
+        group: usize,
+        role: &str,
+    ) -> Result<&'a LocalBlockDataList<S>> {
+        let Some(list) = lists.get(group) else {
+            return Err(anyhow::anyhow!(
+                "{} pool: group {} out of range ({} groups registered)",
+                role,
+                group,
+                lists.len()
+            ));
+        };
+        list.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("{} pool manager not initialized (group {})", role, group)
+        })
     }
 
     fn get_local_data<S: Storage>(
@@ -300,11 +339,11 @@ impl BlockTransferHandler {
         })
     }
 
-    /// Initiate a transfer between two pools.
+    /// Initiate a transfer between two pools of the request's group.
     async fn begin_transfer<Source, Target>(
         &self,
-        source_pool_list: &Option<LocalBlockDataList<Source>>,
-        target_pool_list: &Option<LocalBlockDataList<Target>>,
+        source_pool_lists: &[Option<LocalBlockDataList<Source>>],
+        target_pool_lists: &[Option<LocalBlockDataList<Target>>],
         request: BlockTransferRequest,
     ) -> Result<tokio::sync::oneshot::Receiver<()>>
     where
@@ -318,12 +357,8 @@ impl BlockTransferHandler {
         LocalBlockData<Source>: BlockDataProvider<Locality = locality::Local>,
         LocalBlockData<Target>: BlockDataProviderMut<Locality = locality::Local>,
     {
-        let Some(source_pool_list) = source_pool_list else {
-            return Err(anyhow::anyhow!("Source pool manager not initialized"));
-        };
-        let Some(target_pool_list) = target_pool_list else {
-            return Err(anyhow::anyhow!("Target pool manager not initialized"));
-        };
+        let source_pool_list = Self::pool_for_group(source_pool_lists, request.group, "Source")?;
+        let target_pool_list = Self::pool_for_group(target_pool_lists, request.group, "Target")?;
 
         // Extract the `from` and `to` indices from the request.
         let source_idxs = request.blocks().iter().map(|(from, _)| *from);
@@ -475,10 +510,7 @@ impl BlockTransferHandler {
     async fn broadcast_device_blocks(&self, request: &BlockTransferRequest) -> Result<()> {
         use crate::block_manager::block::transfer::{NcclGroup, bcast_block};
 
-        let device_blocks = self
-            .device
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Device blocks required for broadcast"))?;
+        let device_pool = Self::pool_for_group(&self.device, request.group, "Device")?;
 
         // Get raw CUstream from the CudaStream wrapper
         let stream = self.context.stream().cu_stream();
@@ -501,7 +533,7 @@ impl BlockTransferHandler {
         let group = unsafe { NcclGroup::new()? };
 
         for &block_idx in &dst_indices {
-            let block = &device_blocks[block_idx];
+            let block = &device_pool[block_idx];
             unsafe {
                 bcast_block(block, 0, comm.as_raw(), stream)?;
             }

@@ -266,10 +266,12 @@ async fn perform_allocation_and_build_handler(
         None
     };
 
+    // Single-group legacy construction: one pool list per tier. The real
+    // per-group construction lands with the grouped pool path below.
     let handler = BlockTransferHandler::new(
-        device_blocks,
-        host_blocks,
-        disk_blocks,
+        vec![device_blocks],
+        vec![host_blocks],
+        vec![disk_blocks],
         transfer_context,
         scheduler_client,
         worker_config.nccl_config,
