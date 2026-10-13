@@ -35,6 +35,50 @@ fn compute_num_blocks(
     }
 }
 
+/// `compute_num_blocks` bounded by the device pool: host/disk blocks share
+/// the device block index, so a tier can never size above the device count.
+fn compute_num_blocks_bounded(
+    num_device_blocks: usize,
+    num_blocks_config: &KvbmLeaderNumBlocksConfig,
+    bytes_per_block: usize,
+) -> usize {
+    num_device_blocks.min(compute_num_blocks(num_blocks_config, bytes_per_block))
+}
+
+/// Handshake sizing: element-wise Σ across TP workers of each group's
+/// `bytes_per_block` (multi-group analog of the legacy scalar Σ), then one
+/// shared block count per tier bounded by the device count.
+///
+/// Compatibility: workers < hybrid-multigroup send no per-group values
+/// (empty vecs) — the scalar `bytes_per_block` Σ is authoritative there,
+/// which is also what a mixed legacy/modern TP set degrades to (any legacy
+/// peer empties the aggregate; every version emits the scalar).
+/// TODO(hybrid-multigroup): remove the scalar fallback when N-2 no longer
+/// includes multigroup-less workers.
+fn compute_leader_block_counts(
+    num_device_blocks: usize,
+    host_cfg: &KvbmLeaderNumBlocksConfig,
+    disk_cfg: &KvbmLeaderNumBlocksConfig,
+    workers: &[WorkerMetadata],
+) -> LeaderMetadata {
+    let per_group = aggregate_worker_bytes_per_group(
+        workers
+            .iter()
+            .map(|worker| worker.bytes_per_block_per_group.as_slice()),
+    );
+
+    let bytes_per_block: usize = if per_group.is_empty() {
+        workers.iter().map(|worker| worker.bytes_per_block).sum()
+    } else {
+        per_group.iter().sum()
+    };
+
+    LeaderMetadata {
+        num_host_blocks: compute_num_blocks_bounded(num_device_blocks, host_cfg, bytes_per_block),
+        num_disk_blocks: compute_num_blocks_bounded(num_device_blocks, disk_cfg, bytes_per_block),
+    }
+}
+
 #[derive(Builder, Clone, Debug)]
 pub struct KvbmLeaderConfig {
     /// The world size.
@@ -155,23 +199,23 @@ impl KvbmLeader {
                 cancel.clone(),
                 move |workers: &[WorkerMetadata]| -> LeaderMetadata {
                     // Record device blocks: min across workers
-                    if let Some(min_dev) = workers.iter().map(|w| w.num_device_blocks).min() {
+                    let min_device_blocks = workers.iter().map(|w| w.num_device_blocks).min();
+                    if let Some(min_dev) = min_device_blocks {
                         num_device_blocks_cell.store(min_dev, Ordering::Release);
                     }
 
-                    // For TP, sum bytes_per_block; adjust policy for DP/PP if needed.
-                    let bytes_per_block: usize = workers.iter().map(|w| w.bytes_per_block).sum();
-                    let num_host_blocks = compute_num_blocks(&host_cfg, bytes_per_block);
-                    let num_disk_blocks = compute_num_blocks(&disk_cfg, bytes_per_block);
+                    let metadata = compute_leader_block_counts(
+                        min_device_blocks.unwrap_or(0),
+                        &host_cfg,
+                        &disk_cfg,
+                        workers,
+                    );
 
                     // store into leader state
-                    num_host_blocks_cell.store(num_host_blocks, Ordering::Release);
-                    num_disk_blocks_cell.store(num_disk_blocks, Ordering::Release);
+                    num_host_blocks_cell.store(metadata.num_host_blocks, Ordering::Release);
+                    num_disk_blocks_cell.store(metadata.num_disk_blocks, Ordering::Release);
 
-                    LeaderMetadata {
-                        num_host_blocks,
-                        num_disk_blocks,
-                    }
+                    metadata
                 },
             )
             .await;
@@ -225,5 +269,132 @@ impl KvbmLeader {
             _ = notified => true,
             _ = sleep(Duration::from_secs(self.config.leader_init_timeout_secs)) => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window_cfg(window_bytes: f64) -> KvbmLeaderNumBlocksConfig {
+        KvbmLeaderNumBlocksConfig {
+            cache_size_in_gb: window_bytes / 1_000_000_000.0,
+            num_blocks_overriden: 0,
+        }
+    }
+
+    fn worker(
+        num_device_blocks: usize,
+        bytes_per_block: usize,
+        groups: Vec<usize>,
+    ) -> WorkerMetadata {
+        WorkerMetadata {
+            num_device_blocks,
+            bytes_per_block,
+            bytes_per_block_per_group: groups,
+        }
+    }
+
+    // 24 GiB window in bytes: floor(25,769,803,776 / 89,817,088) = 286.
+    const WINDOW_BYTES: f64 = 25_769_803_776.0;
+    // attention 12,845,056 + mamba 76,972,032 B/block.
+    const GROUP_TOTAL_BYTES_PER_BLOCK: usize = 89_817_088;
+
+    #[test]
+    fn per_group_sizing_sums_groups_into_one_shared_block_count() {
+        // One modern worker, two groups: the Σ of per-group bytes-per-block
+        // sizes ONE shared block count for both tiers.
+        let workers = [worker(
+            1_000,
+            GROUP_TOTAL_BYTES_PER_BLOCK,
+            vec![12_845_056, 76_972_032],
+        )];
+        let meta = compute_leader_block_counts(
+            1_000,
+            &window_cfg(WINDOW_BYTES),
+            &window_cfg(WINDOW_BYTES),
+            &workers,
+        );
+        assert_eq!(meta.num_host_blocks, 286);
+        assert_eq!(meta.num_disk_blocks, 286);
+    }
+
+    #[test]
+    fn tier_sizing_is_bounded_by_the_device_block_count() {
+        // Host/disk blocks share the device block index: a tier can never
+        // size above `num_device_blocks`, byte window notwithstanding.
+        let workers = [worker(
+            100,
+            GROUP_TOTAL_BYTES_PER_BLOCK,
+            vec![12_845_056, 76_972_032],
+        )];
+        let meta = compute_leader_block_counts(
+            100,
+            &window_cfg(WINDOW_BYTES),
+            &window_cfg(WINDOW_BYTES),
+            &workers,
+        );
+        assert_eq!(meta.num_host_blocks, 100);
+        assert_eq!(meta.num_disk_blocks, 100);
+    }
+
+    #[test]
+    fn tp_workers_sum_element_wise_before_sizing() {
+        // Two TP workers each holding half of both groups. The element-wise
+        // Σ reconstructs the full per-group sizes; the per-worker scalars
+        // are deliberately wrong to prove the per-group path drives sizing.
+        let half_groups = vec![6_422_528, 38_486_016];
+        let workers = [
+            worker(1_000, 1, half_groups.clone()),
+            worker(1_000, 1, half_groups),
+        ];
+        let meta = compute_leader_block_counts(
+            1_000,
+            &window_cfg(WINDOW_BYTES),
+            &window_cfg(WINDOW_BYTES),
+            &workers,
+        );
+        assert_eq!(meta.num_host_blocks, 286);
+        assert_eq!(meta.num_disk_blocks, 286);
+    }
+
+    #[test]
+    fn legacy_peers_reproduce_the_scalar_formula() {
+        // Pre-multigroup peers report empty per-group vecs; the leader falls
+        // back to the scalar Σ — today's formula, with the bound not binding
+        // (7M device blocks > 5,981,445).
+        let workers = [worker(7_000_000, 4096, vec![])];
+        let meta = compute_leader_block_counts(
+            7_000_000,
+            &window_cfg(24_500_000_000.0),
+            &window_cfg(24_500_000_000.0),
+            &workers,
+        );
+        assert_eq!(meta.num_host_blocks, 5_981_445); // floor(24.5e9 / 4096) = 5,981,445.3125
+        assert_eq!(
+            meta.num_host_blocks,
+            compute_num_blocks(&window_cfg(24_500_000_000.0), 4096)
+        );
+        assert_eq!(meta.num_disk_blocks, 5_981_445);
+    }
+
+    #[test]
+    fn mixed_legacy_and_modern_set_falls_back_to_scalar_sum() {
+        // One legacy peer drags the element-wise aggregate to empty; the
+        // scalar Σ (which the conservative writer always emits) drives
+        // sizing instead — never a silent partial-group sum. Device bound
+        // not binding (7M device blocks > 1,993,815).
+        let workers = [
+            worker(7_000_000, 4_096, vec![]),
+            worker(7_000_000, 8_192, vec![100, 200]),
+        ];
+        let meta = compute_leader_block_counts(
+            7_000_000,
+            &window_cfg(24_500_000_000.0),
+            &window_cfg(24_500_000_000.0),
+            &workers,
+        );
+        assert_eq!(meta.num_host_blocks, 1_993_815); // floor(24.5e9 / 12,288) = 1,993,815.104
+        assert_eq!(meta.num_disk_blocks, 1_993_815);
     }
 }

@@ -280,6 +280,9 @@ async fn perform_allocation_and_build_handler(
 struct WorkerMetadataHandler {
     num_device_blocks: usize,
     bytes_per_block: usize,
+    /// One entry per HMA group, in registration order; empty only for a
+    /// legacy caller that never derived per-group geometries.
+    bytes_per_block_per_group: Vec<usize>,
 }
 
 #[async_trait]
@@ -289,6 +292,7 @@ impl Handler for WorkerMetadataHandler {
             &WorkerMetadata {
                 num_device_blocks: self.num_device_blocks,
                 bytes_per_block: self.bytes_per_block,
+                bytes_per_block_per_group: self.bytes_per_block_per_group.clone(),
             },
             bincode::config::standard(),
         )?;
@@ -882,6 +886,7 @@ impl KvbmWorker {
             page_size,
             dtype_width_bytes,
             bytes_per_block,
+            bytes_per_block_per_group,
         ) = if config.groups.is_empty() {
             let (layout_type, num_layers, outer_dim, inner_dim) = match config.device_layout_type {
                 LayoutType::FullyContiguous => {
@@ -950,6 +955,8 @@ impl KvbmWorker {
                 config.page_size,
                 config.dtype_width_bytes,
                 bytes_per_block,
+                // Modern single-group worker: one group, one vec entry.
+                vec![bytes_per_block],
             )
         } else {
             // Grouped path: derive each group's geometry — mamba groups
@@ -986,6 +993,10 @@ impl KvbmWorker {
                 .iter()
                 .map(|geometry| geometry.bytes_per_block)
                 .sum();
+            let bytes_per_block_per_group: Vec<usize> = geometries
+                .iter()
+                .map(|geometry| geometry.bytes_per_block)
+                .collect();
 
             // STAGING (Task 4): pool construction still consumes only the
             // FIRST group's geometry; per-group layouts are not threaded
@@ -1001,6 +1012,7 @@ impl KvbmWorker {
                 first.page_size,
                 first.dtype_width_bytes,
                 bytes_per_block,
+                bytes_per_block_per_group,
             )
         };
 
@@ -1023,6 +1035,7 @@ impl KvbmWorker {
             Self::run_blocking_layout_initialization(
                 config,
                 bytes_per_block,
+                bytes_per_block_per_group,
                 device_layout,
                 layout_builder,
                 layout_type,
@@ -1032,6 +1045,7 @@ impl KvbmWorker {
             Self::run_non_blocking_layout_initialization(
                 config,
                 bytes_per_block,
+                bytes_per_block_per_group,
                 device_layout,
                 layout_builder,
                 layout_type,
@@ -1048,6 +1062,7 @@ impl KvbmWorker {
     async fn run_blocking_layout_initialization(
         config: KvbmWorkerConfig,
         bytes_per_block: usize,
+        bytes_per_block_per_group: Vec<usize>,
         device_layout: Box<dyn NixlLayout<StorageType = DeviceStorage>>,
         layout_builder: LayoutConfigBuilder,
         layout_type: LayoutType,
@@ -1081,6 +1096,7 @@ impl KvbmWorker {
                     layout_ready_tx_cell,
                     scheduler_client,
                     bytes_per_block,
+                    bytes_per_block_per_group,
                 )
             },
             cancel_token.clone(),
@@ -1099,6 +1115,7 @@ impl KvbmWorker {
     async fn run_non_blocking_layout_initialization(
         config: KvbmWorkerConfig,
         bytes_per_block: usize,
+        bytes_per_block_per_group: Vec<usize>,
         device_layout: Box<dyn NixlLayout<StorageType = DeviceStorage> + Send + 'static>,
         layout_builder: LayoutConfigBuilder,
         layout_type: LayoutType,
@@ -1143,6 +1160,7 @@ impl KvbmWorker {
                         layout_ready_tx_cell,
                         scheduler,
                         bytes_per_block,
+                        bytes_per_block_per_group,
                     );
 
                     // If worker_task returns Result, handle/log it inside the spawned task.
@@ -1205,6 +1223,7 @@ impl KvbmWorker {
         layout_ready_tx: tokio::sync::Mutex<Option<oneshot::Sender<String>>>,
         scheduler_client: Option<TransferSchedulerClient>,
         bytes_per_block: usize,
+        bytes_per_block_per_group: Vec<usize>,
     ) -> anyhow::Result<()> {
         let worker_id = config.device_id;
         // Readiness gating for ping
@@ -1230,6 +1249,7 @@ impl KvbmWorker {
             Arc::new(WorkerMetadataHandler {
                 num_device_blocks: config.num_device_blocks,
                 bytes_per_block,
+                bytes_per_block_per_group,
             }) as Arc<dyn Handler>,
         );
 

@@ -11,10 +11,21 @@ pub const ZMQ_WORKER_METADATA_MESSAGE: &str = "worker_metadata";
 pub const ZMQ_LEADER_METADATA_MESSAGE: &str = "leader_metadata";
 pub const ZMQ_TRANSFER_BLOCKS_MESSAGE: &str = "transfer_blocks";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerMetadata {
     pub num_device_blocks: usize,
     pub bytes_per_block: usize,
+    /// Multi-group: physical bytes-per-block per HMA layer group, in group
+    /// registration order. Empty = legacy peer (a worker from before the
+    /// hybrid-multigroup wire) — readers must fall back to `bytes_per_block`
+    /// (the Σ scalar). Modern single-group workers send a 1-element vec; the
+    /// empty-vs-single distinction is meaningful downstream, hence no
+    /// `skip_serializing_if`.
+    // Compatibility: workers < hybrid-multigroup send no field (N-2 window,
+    // lib/llm/AGENTS.md). TODO(hybrid-multigroup): remove the empty-vec
+    // fallback when N-2 no longer includes multigroup-less workers.
+    #[serde(default)]
+    pub bytes_per_block_per_group: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,5 +91,131 @@ impl BlockTransferRequest {
             blocks,
             connector_req: Some(connector_req),
         }
+    }
+}
+
+/// Element-wise Σ of per-group `bytes_per_block` across TP workers: group
+/// `i` covers the same layers on every worker of a set, so the leader sums
+/// each position across workers — the multi-group analog of the legacy
+/// scalar Σ (`adjust policy for DP/PP if needed` still applies).
+///
+/// The result length is the shortest input. TP workers of one set must agree
+/// on the group count; in particular a legacy peer (empty vec) truncates the
+/// result to empty, which sends the caller to the legacy scalar path rather
+/// than silently dropping that peer's contribution.
+pub(crate) fn aggregate_worker_bytes_per_group<'a, I>(per_worker: I) -> Vec<usize>
+where
+    I: IntoIterator<Item = &'a [usize]>,
+{
+    let per_worker: Vec<&[usize]> = per_worker.into_iter().collect();
+    let Some(group_count) = per_worker.iter().map(|groups| groups.len()).min() else {
+        return Vec::new();
+    };
+    (0..group_count)
+        .map(|group| per_worker.iter().map(|groups| groups[group]).sum())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_json_without_per_group_field_deserializes_empty() {
+        // THE N-2 contract (lib/llm/AGENTS.md): workers from before the
+        // hybrid-multigroup wire send no `bytes_per_block_per_group`; the
+        // tolerant reader must decode them to an empty vec (the legacy-peer
+        // marker), never fail.
+        let meta: WorkerMetadata =
+            serde_json::from_str(r#"{"num_device_blocks":100,"bytes_per_block":4096}"#).unwrap();
+        assert_eq!(meta.num_device_blocks, 100);
+        assert_eq!(meta.bytes_per_block, 4096);
+        assert_eq!(meta.bytes_per_block_per_group, Vec::<usize>::new());
+    }
+
+    #[test]
+    fn multi_group_json_roundtrips_both_fields() {
+        let meta: WorkerMetadata = serde_json::from_str(
+            r#"{"num_device_blocks":100,"bytes_per_block":89817088,"bytes_per_block_per_group":[12845056,76972032]}"#,
+        )
+        .unwrap();
+        assert_eq!(meta.bytes_per_block_per_group, vec![12_845_056, 76_972_032]);
+
+        let encoded = serde_json::to_string(&meta).unwrap();
+        // Conservative writer: the Σ scalar stays on the wire for legacy
+        // readers, and the per-group vec roundtrips.
+        assert!(encoded.contains(r#""bytes_per_block":89817088"#));
+        assert!(encoded.contains(r#""bytes_per_block_per_group":[12845056,76972032]"#));
+        let decoded: WorkerMetadata = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, meta);
+    }
+
+    #[test]
+    fn single_group_worker_encodes_an_explicit_one_element_vec() {
+        // No skip_serializing_if: empty vec (= legacy peer) and 1-element
+        // vec (= modern single group) must stay distinguishable downstream.
+        let meta = WorkerMetadata {
+            num_device_blocks: 100,
+            bytes_per_block: 4096,
+            bytes_per_block_per_group: vec![4096],
+        };
+        let encoded = serde_json::to_string(&meta).unwrap();
+        assert!(encoded.contains(r#""bytes_per_block_per_group":[4096]"#));
+    }
+
+    #[test]
+    fn bincode_roundtrip_matches_the_zmq_transport_encoding() {
+        let meta = WorkerMetadata {
+            num_device_blocks: 100,
+            bytes_per_block: 89_817_088,
+            bytes_per_block_per_group: vec![12_845_056, 76_972_032],
+        };
+        let bytes = bincode::serde::encode_to_vec(&meta, bincode::config::standard()).unwrap();
+        let (decoded, _) = bincode::serde::decode_from_slice::<WorkerMetadata, _>(
+            &bytes,
+            bincode::config::standard(),
+        )
+        .unwrap();
+        assert_eq!(decoded, meta);
+    }
+
+    #[test]
+    fn aggregation_sums_element_wise_across_tp_workers() {
+        let per_worker = [vec![100, 200], vec![100, 200]];
+        assert_eq!(
+            aggregate_worker_bytes_per_group(per_worker.iter().map(|v| v.as_slice())),
+            vec![200, 400]
+        );
+    }
+
+    #[test]
+    fn aggregation_of_a_single_worker_is_itself() {
+        let per_worker = [vec![100, 200]];
+        assert_eq!(
+            aggregate_worker_bytes_per_group(per_worker.iter().map(|v| v.as_slice())),
+            vec![100, 200]
+        );
+    }
+
+    #[test]
+    fn aggregation_of_all_legacy_peers_is_empty() {
+        let per_worker = [Vec::<usize>::new(), Vec::<usize>::new()];
+        assert_eq!(
+            aggregate_worker_bytes_per_group(per_worker.iter().map(|v| v.as_slice())),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn one_legacy_peer_downgrades_the_whole_set() {
+        // Mixed-version TP set during an N-2 rolling update: the legacy
+        // peer's empty vec truncates the element-wise sum to zero groups, so
+        // the caller falls back to the scalar Σ every version emits — never
+        // a silent partial-group sum.
+        let per_worker = [Vec::<usize>::new(), vec![100, 200]];
+        assert_eq!(
+            aggregate_worker_bytes_per_group(per_worker.iter().map(|v| v.as_slice())),
+            Vec::<usize>::new()
+        );
     }
 }
