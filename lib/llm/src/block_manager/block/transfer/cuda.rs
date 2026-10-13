@@ -11,9 +11,10 @@ use cudarc::driver::CudaStream;
 use cudarc::driver::result as cuda_result;
 use cudarc::driver::sys::{CUevent_flags, CUresult, cuMemcpyHtoDAsync_v2};
 use dynamo_runtime::config::environment_names::cuda as env_cuda;
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::sync::OnceLock;
 
 // Global storage for kernel function - store as usize to avoid Send/Sync issues
 static COPY_KERNEL_MODULE: Mutex<Option<usize>> = Mutex::new(None);
@@ -211,20 +212,43 @@ unsafe fn launch_copy_kernel_direct(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CachedBlockDimensions {
     num_layers: usize,
     num_outer_dims: usize,
     layer_size: usize,
 }
 
-static BLOCK_DIMENSIONS_CACHE: OnceLock<CachedBlockDimensions> = OnceLock::new();
+/// Key: `(num_layers, num_outer_dims, layer_size)`.
+type BlockDimensionsCache = Mutex<HashMap<(usize, usize, usize), CachedBlockDimensions>>;
+
+/// Kernel-dims cache, keyed by the full geometry triple. The historical
+/// process-wide single-slot cache froze the FIRST transferred block's
+/// dims for the whole process lifetime; with multi-group pools
+/// (per-group layouts) a group-1 batch would then launch group-0's
+/// frozen `layer_size` and layer count — wrong address/size pairs,
+/// corruption. Keying per geometry gives every distinct group geometry
+/// its own entry; the map is bounded by the number of distinct
+/// geometries, so no eviction is needed. Key collisions across groups
+/// are impossible for distinct `(num_layers, num_outer_dims, layer_size)`
+/// triples and harmless for identical triples (same dims means the same
+/// kernel behavior).
+static BLOCK_DIMENSIONS_CACHE: LazyLock<BlockDimensionsCache> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn get_cached_block_dimensions<T: BlockDataProvider>(
     block: &T,
 ) -> Result<CachedBlockDimensions, TransferError> {
-    Ok(*BLOCK_DIMENSIONS_CACHE
-        .get_or_init(|| calculate_block_dimensions_from_layout(block).unwrap()))
+    let dims = calculate_block_dimensions_from_layout(block)?;
+    // Poisoning-tolerant lock recovery (the `lora::load_estimator`
+    // precedent): the dims are pure layout reads, always safe to cache
+    // and use even after another thread's panic.
+    let mut cache = BLOCK_DIMENSIONS_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    Ok(*cache
+        .entry((dims.num_layers, dims.num_outer_dims, dims.layer_size))
+        .or_insert(dims))
 }
 
 fn calculate_block_dimensions_from_layout<T: BlockDataProvider>(
@@ -255,8 +279,25 @@ where
     Destination: BlockDataProviderMut,
 {
     let _context_guard = stream.context().bind_to_thread();
-    // Get cached dimensions (calculated once per program lifetime!)
+    // Per-batch geometry: the cache is keyed by the CURRENT batch's dims,
+    // so every distinct group geometry launches with its own dims (the
+    // historical process-wide cache froze the first-ever block's dims —
+    // corruption across groups).
     let dims = get_cached_block_dimensions(&sources[0])?;
+
+    // A custom-kernel batch moves ONE group's blocks: every source must
+    // share the head block's geometry, or the single-`layer_size` launch
+    // would compute wrong address/size pairs (debug-checked; release
+    // builds keep the historical trust in batch homogeneity).
+    #[cfg(debug_assertions)]
+    for (i, src) in sources.iter().enumerate() {
+        let d = calculate_block_dimensions_from_layout(src)?;
+        debug_assert_eq!(
+            (d.num_layers, d.num_outer_dims, d.layer_size),
+            (dims.num_layers, dims.num_outer_dims, dims.layer_size),
+            "custom-kernel batch mixes geometries (block {i})"
+        );
+    }
 
     // Use cached dimensions
     let (src_addresses, dst_addresses) =
@@ -411,6 +452,84 @@ impl Drop for BounceSyncGuard<'_> {
     }
 }
 
+/// Prefix-sum segment offsets plus the image total for a staged
+/// LayerSeparate block: `offsets[i]` is segment `i`'s byte offset within
+/// the block's bounce image, walked over the ACTUAL per-`(layer, outer)`
+/// sizes in layer-major-then-outer order — the same order
+/// `block_copy_segments` and `collect_kv_addresses` walk, and the order
+/// a `FullyContiguous` image interleaves regions in.
+///
+/// Equivalence: for uniform segment sizes `s` this reproduces the
+/// historical uniform math byte-for-byte — `offsets[i] == i * s` (the
+/// old `(layer * num_outer + outer) * (size / seg_count)`) and
+/// `total == segment_sizes.len() * s` (the old
+/// `layer_view(0, 0) * layers * outer`) — so uniform-geometry groups
+/// stage identically to the previous executor.
+fn staged_segment_offsets(segment_sizes: &[usize]) -> Result<(Vec<usize>, usize), TransferError> {
+    let mut offsets = Vec::with_capacity(segment_sizes.len());
+    let mut total = 0usize;
+    for &size in segment_sizes {
+        offsets.push(total);
+        total = total.checked_add(size).ok_or_else(|| {
+            TransferError::ExecutionError(format!(
+                "staged executor: segment offset overflow: sum of {} segment sizes exceeds usize",
+                segment_sizes.len()
+            ))
+        })?;
+    }
+    Ok((offsets, total))
+}
+
+/// The actual per-`(layer, outer)` layer-view sizes of a block, in
+/// layer-major-then-outer order — the same walk `block_copy_segments`
+/// and `collect_kv_addresses` use, so the staged DMA legs and the other
+/// executors agree on segment order.
+fn layer_view_sizes<T: BlockDataProvider>(block: &T) -> Result<Vec<usize>, TransferError> {
+    let data = block.block_data();
+    let mut sizes = Vec::with_capacity(data.num_layers() * data.num_outer_dims());
+    for layer_idx in 0..data.num_layers() {
+        for outer_idx in 0..data.num_outer_dims() {
+            sizes.push(data.layer_view(layer_idx, outer_idx)?.size());
+        }
+    }
+    Ok(sizes)
+}
+
+/// One block's staged-bounce image plan: the block's total image size
+/// plus, for LayerSeparate blocks, the actual per-`(layer, outer)`
+/// segment sizes and their prefix-sum offsets within the image (empty
+/// vectors for fully-contiguous blocks, which stage whole).
+struct StagedBlockPlan {
+    size: usize,
+    segment_sizes: Vec<usize>,
+    segment_offsets: Vec<usize>,
+}
+
+/// The staged-bounce image plan for one block, computed from the block's
+/// ACTUAL layer-view sizes: a fully-contiguous block stages as one
+/// whole-block image (`block_view` size); a LayerSeparate block's image
+/// is the SUM of its actual per-`(layer, outer)` sizes — not the
+/// historical uniform `layer_view(0, 0) * layers * outer` product — so
+/// mixed-size layouts keep packing correctly (uniform-geometry groups
+/// stay byte-identical; see `staged_segment_offsets`).
+fn staged_block_plan<T: BlockDataProvider>(block: &T) -> Result<StagedBlockPlan, TransferError> {
+    if block.block_data().is_fully_contiguous() {
+        let data = block.block_data();
+        return Ok(StagedBlockPlan {
+            size: data.block_view()?.size(),
+            segment_sizes: Vec::new(),
+            segment_offsets: Vec::new(),
+        });
+    }
+    let segment_sizes = layer_view_sizes(block)?;
+    let (segment_offsets, size) = staged_segment_offsets(&segment_sizes)?;
+    Ok(StagedBlockPlan {
+        size,
+        segment_sizes,
+        segment_offsets,
+    })
+}
+
 /// Staged batch copy for raw-MMIO host tiers (the BAR-aperture expander
 /// path): the driver permits no GPU-side access to the window, so every
 /// block stages through a pinned bounce with CPU memcpy legs. Fully
@@ -452,33 +571,18 @@ where
         assert_strategy_valid::<Source, Target>(strategy);
     }
 
-    // Per-block view sizes, collected once: a block view covers the whole
-    // block, so `size` is the block's total byte size. A LayerSeparate block
-    // has no whole-block view; its total is the uniform segment size times
-    // the segment count (the same product `block_view` computes for
-    // contiguous blocks).
-    let mut sizes = Vec::with_capacity(sources.len());
+    // Per-block staged-bounce image plans, collected once: a
+    // fully-contiguous block stages whole (its `block_view` size); a
+    // LayerSeparate block's image is the SUM of its actual per-`(layer,
+    // outer)` layer-view sizes — byte-identical to the historical uniform
+    // `seg * layers * outer` product for uniform-geometry groups, correct
+    // for mixed sizes (see `staged_block_plan`).
+    let mut plans = Vec::with_capacity(sources.len());
     let mut total = 0usize;
     for src in sources {
-        let s_data = src.block_data();
-        let size = if s_data.is_fully_contiguous() {
-            s_data.block_view()?.size()
-        } else {
-            let seg_size = s_data.layer_view(0, 0)?.size();
-            seg_size
-                .checked_mul(s_data.num_layers())
-                .and_then(|intermediate| intermediate.checked_mul(s_data.num_outer_dims()))
-                .ok_or_else(|| {
-                    TransferError::ExecutionError(format!(
-                        "staged executor: block size overflow: seg={seg_size} * layers={} * \
-                         outer_dims={}",
-                        s_data.num_layers(),
-                        s_data.num_outer_dims()
-                    ))
-                })?
-        };
-        sizes.push(size);
-        total += size;
+        let plan = staged_block_plan(src)?;
+        total += plan.size;
+        plans.push(plan);
     }
 
     let stream = ctx.stream();
@@ -504,7 +608,7 @@ where
             // with Xid 31), so these legs never touch CUDA.
             let mut offset = 0usize;
             for (idx, src) in sources.iter().enumerate() {
-                let size = sizes[idx];
+                let size = plans[idx].size;
                 let s_view = src.block_data().block_view()?;
                 debug_assert_eq!(s_view.size(), size);
                 // SAFETY: `s_view` covers `size` readable bytes and the
@@ -518,14 +622,17 @@ where
 
             // DMA legs: bounce -> device, async on the stream. When the
             // device block is LayerSeparate, copy per-`(layer, outer)`
-            // segment: the bounce mirrors the window's FullyContiguous
-            // layout, so each segment lands at its logical offset.
+            // segment at its prefix-sum offset in the bounce image: the
+            // image mirrors the window's FullyContiguous interleaving
+            // (layer-major then outer), so each segment lands at its
+            // logical offset — byte-identical to the historical
+            // `i * (size / seg_count)` offsets for uniform-geometry
+            // groups.
             let mut offset = 0usize;
             for (idx, dst) in targets.iter_mut().enumerate() {
-                let size = sizes[idx];
-                let d_data = dst.block_data_mut();
-                if d_data.is_fully_contiguous() {
-                    let mut d_view = d_data.block_view_mut()?;
+                let size = plans[idx].size;
+                if dst.block_data().is_fully_contiguous() {
+                    let mut d_view = dst.block_data_mut().block_view_mut()?;
                     debug_assert_eq!(d_view.size(), size);
                     // SAFETY: the bounce holds `size` readable bytes at `offset`
                     // and `d_view` covers `size` writable device bytes; the
@@ -534,19 +641,28 @@ where
                         cuda_memcpy_h2d(bounce_base.add(offset), d_view.as_mut_ptr(), size, stream)
                     }?;
                 } else {
-                    let seg_count = d_data.num_layers() * d_data.num_outer_dims();
-                    let seg_size = size / seg_count;
+                    // The plan walks the TARGET's actual layer-view sizes
+                    // (the window-side plan sized the image; the debug
+                    // assert pins the two sides to the same geometry).
+                    let plan = staged_block_plan(&*dst)?;
+                    debug_assert_eq!(
+                        plan.size, size,
+                        "staged executor: device block image size != window block size"
+                    );
+                    let d_data = dst.block_data_mut();
+                    let mut seg = 0usize;
                     for layer_idx in 0..d_data.num_layers() {
                         for outer_idx in 0..d_data.num_outer_dims() {
                             let d_view = d_data.layer_view(layer_idx, outer_idx)?;
-                            let seg_off = offset
-                                + (layer_idx * d_data.num_outer_dims() + outer_idx) * seg_size;
-                            debug_assert_eq!(d_view.size(), seg_size);
+                            let seg_size = plan.segment_sizes[seg];
+                            let seg_off = offset + plan.segment_offsets[seg];
+                            seg += 1;
                             // SAFETY: the bounce holds `seg_size` readable
-                            // bytes at `seg_off`; the pointer is only handed
-                            // to the driver (the DMA writes the device bytes,
-                            // Rust never dereferences it); the regions do not
-                            // overlap (the bounce is host memory, the block is
+                            // bytes at `seg_off` (the per-block plans sized
+                            // it); the pointer is only handed to the driver
+                            // (the DMA writes the device bytes, Rust never
+                            // dereferences it); the regions do not overlap
+                            // (the bounce is host memory, the block is
                             // device memory).
                             unsafe {
                                 cuda_memcpy_h2d(
@@ -558,6 +674,7 @@ where
                             }?;
                         }
                     }
+                    debug_assert_eq!(seg, plan.segment_sizes.len());
                 }
                 offset += size;
             }
@@ -576,11 +693,14 @@ where
         TransferStrategy::CudaStagedD2H => {
             // DMA legs first: device -> bounce, async on the stream. When the
             // device block is LayerSeparate, copy per-`(layer, outer)`
-            // segment: the bounce mirrors the window's FullyContiguous
-            // layout, so each segment lands at its logical offset.
+            // segment at its prefix-sum offset in the bounce image: the
+            // image mirrors the window's FullyContiguous interleaving
+            // (layer-major then outer) — byte-identical to the historical
+            // `i * (size / seg_count)` offsets for uniform-geometry
+            // groups.
             let mut offset = 0usize;
             for (idx, src) in sources.iter().enumerate() {
-                let size = sizes[idx];
+                let size = plans[idx].size;
                 let s_data = src.block_data();
                 if s_data.is_fully_contiguous() {
                     let s_view = s_data.block_view()?;
@@ -592,14 +712,17 @@ where
                         cuda_memcpy_d2h(s_view.as_ptr(), bounce_base.add(offset), size, stream)
                     }?;
                 } else {
-                    let seg_count = s_data.num_layers() * s_data.num_outer_dims();
-                    let seg_size = size / seg_count;
+                    // The plan was precomputed from THIS source block's
+                    // actual layer-view sizes, so the DMA legs consume it
+                    // directly.
+                    let plan = &plans[idx];
+                    let mut seg = 0usize;
                     for layer_idx in 0..s_data.num_layers() {
                         for outer_idx in 0..s_data.num_outer_dims() {
                             let s_view = s_data.layer_view(layer_idx, outer_idx)?;
-                            let seg_off = offset
-                                + (layer_idx * s_data.num_outer_dims() + outer_idx) * seg_size;
-                            debug_assert_eq!(s_view.size(), seg_size);
+                            let seg_size = plan.segment_sizes[seg];
+                            let seg_off = offset + plan.segment_offsets[seg];
+                            seg += 1;
                             // SAFETY: `s_view` covers `seg_size` readable
                             // device bytes and the bounce has
                             // `total >= seg_off + seg_size` writable bytes;
@@ -614,6 +737,7 @@ where
                             }?;
                         }
                     }
+                    debug_assert_eq!(seg, plan.segment_sizes.len());
                 }
                 offset += size;
             }
@@ -632,7 +756,7 @@ where
             // CPU writes are exactly where tier-2 data belongs.
             let mut offset = 0usize;
             for (idx, dst) in targets.iter_mut().enumerate() {
-                let size = sizes[idx];
+                let size = plans[idx].size;
                 let mut d_view = dst.block_data_mut().block_view_mut()?;
                 debug_assert_eq!(d_view.size(), size);
                 // SAFETY: the bounce holds `size` readable bytes at `offset`
@@ -752,6 +876,13 @@ where
             // mapping. Per-segment: the device tier may be LayerSeparate.
             for (src, dst) in sources.iter().zip(targets.iter_mut()) {
                 let segments = block_copy_segments(src, dst)?;
+                // The per-pair segments must tile the block's whole image
+                // (sum to the actual layer-view sizes' total).
+                debug_assert_eq!(
+                    segments.iter().map(|&(_, _, size)| size).sum::<usize>(),
+                    staged_block_plan(src)?.size,
+                    "direct-io executor: segments do not sum to the block image size"
+                );
                 for (s_ptr, d_ptr, seg) in segments {
                     let s_dev = translate(s_ptr, seg)?;
                     // SAFETY: the device block data outlives the transfer
@@ -773,6 +904,13 @@ where
             // mapping. Per-segment: the device tier may be LayerSeparate.
             for (src, dst) in sources.iter().zip(targets.iter_mut()) {
                 let segments = block_copy_segments(src, dst)?;
+                // The per-pair segments must tile the block's whole image
+                // (sum to the actual layer-view sizes' total).
+                debug_assert_eq!(
+                    segments.iter().map(|&(_, _, size)| size).sum::<usize>(),
+                    staged_block_plan(src)?.size,
+                    "direct-io executor: segments do not sum to the block image size"
+                );
                 for (s_ptr, d_ptr, seg) in segments {
                     let d_dev = translate(d_ptr, seg)?;
                     // SAFETY: the device block data outlives the transfer
@@ -1677,5 +1815,166 @@ mod tests {
                 println!("Transfer with alignment {} took {:?}", alignment, duration);
             }
         }
+    }
+}
+
+/// CPU-runnable tests (no CUDA device needed, unlike the
+/// `testing-cuda`-gated `tests` module above): the kernel-dims cache and
+/// the staged segment-plan math exercised against CPU-mocked blocks.
+#[cfg(test)]
+mod cpu_tests {
+    use super::*;
+    use crate::block_manager::block::locality::Local;
+    use crate::block_manager::block::{BasicMetadata, Block, BlockData};
+    use crate::block_manager::layout::{FullyContiguous, LayerSeparate, LayoutConfig};
+    use crate::block_manager::storage::tests::{NullDeviceAllocator, NullDeviceStorage};
+    use std::sync::Arc;
+
+    fn make_config(num_layers: usize, outer_dim: usize, inner_dim: usize) -> LayoutConfig {
+        LayoutConfig {
+            num_blocks: 2,
+            num_layers,
+            outer_dim,
+            page_size: 4,
+            inner_dim,
+            alignment: 1,
+            dtype_width_bytes: 2,
+        }
+    }
+
+    fn fc_block(config: LayoutConfig) -> Block<NullDeviceStorage, Local, BasicMetadata> {
+        let layout = FullyContiguous::allocate(config, &NullDeviceAllocator).unwrap();
+        let data = BlockData::new(Arc::new(layout), 0, 0, 0);
+        Block::new(data, BasicMetadata::default()).unwrap()
+    }
+
+    fn ls_block(config: LayoutConfig) -> Block<NullDeviceStorage, Local, BasicMetadata> {
+        let layout = LayerSeparate::allocate(config, &NullDeviceAllocator, true).unwrap();
+        let data = BlockData::new(Arc::new(layout), 0, 0, 0);
+        Block::new(data, BasicMetadata::default()).unwrap()
+    }
+
+    /// The kernel-dims cache must key per geometry: a second group's
+    /// blocks (different layer count / layer size) must get THEIR dims,
+    /// not the first-ever transferred block's frozen dims. This is the
+    /// cross-group corruption regression (the historical process-wide
+    /// single-slot cache failed here).
+    #[test]
+    fn block_dimensions_cache_keys_per_geometry() {
+        // Group A: 4 layers, 2 outer dims, layer_size = 4 * 64 * 2 = 512.
+        let block_a = fc_block(make_config(4, 2, 64));
+        // Group B: 8 layers, 1 outer dim, layer_size = 4 * 32 * 2 = 256.
+        let block_b = fc_block(make_config(8, 1, 32));
+
+        let dims_a = get_cached_block_dimensions(&block_a).unwrap();
+        assert_eq!(
+            (dims_a.num_layers, dims_a.num_outer_dims, dims_a.layer_size),
+            (4, 2, 512)
+        );
+
+        let dims_b = get_cached_block_dimensions(&block_b).unwrap();
+        assert_eq!(
+            (dims_b.num_layers, dims_b.num_outer_dims, dims_b.layer_size),
+            (8, 1, 256),
+            "second geometry must not reuse the first block's frozen dims"
+        );
+
+        // Repeat lookups stay per-geometry and stable.
+        assert_eq!(get_cached_block_dimensions(&block_a).unwrap(), dims_a);
+        assert_eq!(get_cached_block_dimensions(&block_b).unwrap(), dims_b);
+    }
+
+    /// Uniform segment sizes must plan byte-identically to the
+    /// historical uniform math: `offsets[i] == i * seg_size` (the old
+    /// `(layer * num_outer + outer) * (size / seg_count)`) and
+    /// `total == seg_count * seg_size` (the old
+    /// `layer_view(0, 0) * layers * outer`). Uniform-geometry groups
+    /// stage exactly as before.
+    #[test]
+    fn staged_segment_offsets_uniform_equivalence() {
+        let seg_size = 512usize;
+        for seg_count in [1usize, 2, 6, 13] {
+            let sizes = vec![seg_size; seg_count];
+            let (offsets, total) = staged_segment_offsets(&sizes).unwrap();
+            assert_eq!(total, seg_size * seg_count);
+            for (i, &off) in offsets.iter().enumerate() {
+                assert_eq!(off, i * seg_size, "uniform offset mismatch at {i}");
+            }
+        }
+    }
+
+    /// Mixed per-segment sizes (the new capability) plan as running
+    /// prefix sums; degenerate shapes (no segments, one segment) and the
+    /// empty image stay well-defined.
+    #[test]
+    fn staged_segment_offsets_mixed_sizes() {
+        let (offsets, total) = staged_segment_offsets(&[2usize, 3, 5, 7]).unwrap();
+        assert_eq!(offsets, vec![0, 2, 5, 10]);
+        assert_eq!(total, 17);
+
+        let (offsets, total) = staged_segment_offsets(&[]).unwrap();
+        assert!(offsets.is_empty());
+        assert_eq!(total, 0);
+
+        let (offsets, total) = staged_segment_offsets(&[9]).unwrap();
+        assert_eq!(offsets, vec![0]);
+        assert_eq!(total, 9);
+    }
+
+    /// The prefix walk must fail (not wrap) when the image size
+    /// overflows usize.
+    #[test]
+    fn staged_segment_offsets_overflow_errors() {
+        assert!(staged_segment_offsets(&[usize::MAX, 1]).is_err());
+    }
+
+    /// A fully-contiguous block stages whole (no segments, `block_view`
+    /// size); a LayerSeparate block of the SAME geometry plans the same
+    /// image size (the bounce image mirrors the window's
+    /// fully-contiguous layout) and, for a uniform geometry, offsets
+    /// byte-identical to the historical uniform math.
+    #[test]
+    fn staged_block_plan_matches_legacy_uniform_math() {
+        // 3 layers x 2 outer dims, segment = 4 * 16 * 2 = 128 bytes.
+        let config = || make_config(3, 2, 16);
+        let legacy_seg = 128usize;
+        let legacy_size = legacy_seg * 3 * 2;
+
+        let fc = fc_block(config());
+        let plan = staged_block_plan(&fc).unwrap();
+        assert!(plan.segment_sizes.is_empty());
+        assert!(plan.segment_offsets.is_empty());
+        assert_eq!(plan.size, fc.block_data().block_view().unwrap().size());
+        assert_eq!(plan.size, legacy_size);
+
+        let ls = ls_block(config());
+        let plan = staged_block_plan(&ls).unwrap();
+        assert_eq!(plan.segment_sizes, vec![legacy_seg; 6]);
+        assert_eq!(plan.size, legacy_size);
+        for (i, &off) in plan.segment_offsets.iter().enumerate() {
+            assert_eq!(off, i * legacy_seg, "uniform plan offset mismatch at {i}");
+        }
+    }
+
+    /// The staged helper's per-segment sizes agree with
+    /// `block_copy_segments` (the layout-agnostic decomposition the
+    /// direct-io executor and the custom kernel use) — same
+    /// layer-major-then-outer walk, same sizes, same total.
+    #[test]
+    fn layer_view_sizes_agrees_with_block_copy_segments() {
+        let config = make_config(3, 2, 16);
+        let src = ls_block(config.clone());
+        let mut dst = ls_block(config);
+
+        let sizes = layer_view_sizes(&src).unwrap();
+        let segments = block_copy_segments(&src, &mut dst).unwrap();
+        assert_eq!(sizes.len(), segments.len());
+        for (&size, &(_, _, seg_size)) in sizes.iter().zip(segments.iter()) {
+            assert_eq!(size, seg_size);
+        }
+        assert_eq!(
+            sizes.iter().sum::<usize>(),
+            staged_block_plan(&src).unwrap().size
+        );
     }
 }
