@@ -117,12 +117,12 @@ impl BlockTransferRequest {
 /// scalar Σ (`adjust policy for DP/PP if needed` still applies).
 ///
 /// The result length is the shortest input. Modern workers of one set must
-/// agree on the group count — a debug_assert (chosen over a warn: release
-/// keeps the bounded degradation, dev/test builds fail loudly) flags a
-/// misconfigured set whose non-empty vecs have unequal lengths. A zero
-/// length is a legitimate legacy peer, not a mismatch: any legacy peer
-/// truncates the result to empty, which sends the caller to the legacy
-/// scalar path rather than silently dropping that peer's contribution.
+/// agree on the group count — a debug_assert fails dev/test builds loudly,
+/// and release warns and degrades the set to the scalar path (empty result)
+/// instead of silently truncating groups. A zero length is a legitimate
+/// legacy peer, not a mismatch: any legacy peer truncates the result to
+/// empty, which sends the caller to the legacy scalar path rather than
+/// silently dropping that peer's contribution.
 pub(crate) fn aggregate_worker_bytes_per_group<'a, I>(per_worker: I) -> Vec<usize>
 where
     I: IntoIterator<Item = &'a [usize]>,

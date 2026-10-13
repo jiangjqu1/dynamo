@@ -296,11 +296,6 @@ impl BlockTransferHandler {
         self.transfer_mode
     }
 
-    /// Number of HMA groups whose pool lists are registered on this handler.
-    pub fn num_groups(&self) -> usize {
-        self.device.len().max(self.host.len()).max(self.disk.len())
-    }
-
     /// Resolve one group's pool list, with an actionable bounds/uninitialized
     /// error (the group tag arrives from the wire — never index blindly).
     fn pool_for_group<'a, S: Storage>(
@@ -310,7 +305,7 @@ impl BlockTransferHandler {
     ) -> Result<&'a LocalBlockDataList<S>> {
         let Some(list) = lists.get(group) else {
             return Err(anyhow::anyhow!(
-                "{} pool: group {} out of range ({} groups registered)",
+                "{} pool: group {} out of range ({} group(s) registered)",
                 role,
                 group,
                 lists.len()

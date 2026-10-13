@@ -184,6 +184,12 @@ pub struct ConnectorSlotManager<R: RequestKey> {
     kvbm_metrics: KvbmMetrics,
     /// Minimum priority threshold for host offload filtering (read once at init)
     offload_min_priority: u32,
+    /// HMA group count, captured from the leader ONCE at construction. All
+    /// three constructors await the worker handshake first, so this is the
+    /// post-handshake value; the SAME capture is handed to every slot (which
+    /// records one metadata op per leg) and to the transfer engine (which
+    /// sends one wire leg per group), keeping the two sides in lockstep.
+    num_groups: usize,
 }
 
 impl std::fmt::Debug for ConnectorSlotManager<String> {
@@ -228,7 +234,12 @@ impl<R: RequestKey> ConnectorSlotManager<R> {
 
         let (xfer_tx, xfer_rx) = mpsc::unbounded_channel();
 
-        let mut xfer_engine = LocalTransferEngine::new(block_manager.clone(), leader, xfer_rx);
+        // Post-handshake capture (see the field doc): one shared group count
+        // for slots and the transfer engine.
+        let num_groups = leader.num_groups();
+
+        let mut xfer_engine =
+            LocalTransferEngine::new(block_manager.clone(), leader, num_groups, xfer_rx);
         let primary_token = get_current_cancel_token();
         let primary_token_clone = primary_token.clone();
         let runtime_primary = get_current_tokio_handle();
@@ -260,6 +271,7 @@ impl<R: RequestKey> ConnectorSlotManager<R> {
             cache_stats,
             kvbm_metrics: kvbm_metrics.clone(),
             offload_min_priority,
+            num_groups,
         }
     }
 
@@ -310,6 +322,7 @@ impl<R: RequestKey> SlotManager<R> for ConnectorSlotManager<R> {
             self.xfer_tx.clone(),
             self.cache_stats.clone(),
             self.offload_min_priority,
+            self.num_groups,
         );
         self.slots
             .lock()
@@ -415,9 +428,18 @@ pub struct VllmConnectorSlot {
     /// Stored block priorities from previous apply_scheduler_output calls.
     /// Used as fallback when priorities=None in subsequent chunked prefill iterations.
     stored_block_priorities: HashMap<BlockId, u32>,
+
+    /// HMA group count captured by the slot manager from the leader's
+    /// handshake state at slot-manager construction (post-handshake; the
+    /// same capture the transfer engine uses). Each offload/onboard op
+    /// records ONE metadata operation per group so the worker-side
+    /// rendezvous — one Worker + one Transfer per `(request_id, uuid)` —
+    /// matches every wire leg.
+    num_groups: usize,
 }
 
 impl VllmConnectorSlot {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         request_id: String,
         tokens: Tokens,
@@ -426,6 +448,7 @@ impl VllmConnectorSlot {
         xfer_tx: mpsc::UnboundedSender<LocalTransferRequest>,
         cache_stats: Arc<CacheStatsTracker>,
         offload_min_priority: u32,
+        num_groups: usize,
     ) -> Self {
         assert!(!tokens.is_empty(), "tokens must be non-empty");
         let block_size = block_manager.block_size();
@@ -456,10 +479,12 @@ impl VllmConnectorSlot {
             offload_min_priority,
             offload_terminated_at_block: None,
             stored_block_priorities: HashMap::new(),
+            num_groups: num_groups.max(1),
         }
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     fn new_for_test(
         request_id: String,
         tokens: Tokens,
@@ -468,6 +493,7 @@ impl VllmConnectorSlot {
         xfer_tx: mpsc::UnboundedSender<LocalTransferRequest>,
         cache_stats: Arc<CacheStatsTracker>,
         offload_min_priority: u32,
+        num_groups: usize,
     ) -> Self {
         assert!(!tokens.is_empty(), "tokens must be non-empty");
         let sequence = TokenBlockSequence::new(tokens, block_size as u32, Some(salt_hash));
@@ -494,6 +520,7 @@ impl VllmConnectorSlot {
             offload_min_priority,
             offload_terminated_at_block: None,
             stored_block_priorities: HashMap::new(),
+            num_groups: num_groups.max(1),
         }
     }
 
@@ -1322,12 +1349,21 @@ impl VllmConnectorSlot {
             operation_id,
         ));
 
-        let worker_req = WorkerTransferRequest {
-            request_id: self.request_id.clone(),
-            uuid: operation_id,
-            transfer_type: TransferType::Store,
-            request_type: RequestType::Scheduled,
-        };
+        // ONE metadata operation PER GROUP LEG, each with its deterministic
+        // per-leg uuid — the transfer engine stamps the same uuids on the
+        // wire legs, and the worker-side rendezvous (one Worker + one
+        // Transfer per `(request_id, uuid)`) requires the 1:1 match.
+        // Group 0's leg uuid IS the logical op uuid, so single-group
+        // deployments record exactly the same op as before.
+        for group in 0..self.num_groups {
+            let worker_req = WorkerTransferRequest {
+                request_id: self.request_id.clone(),
+                uuid: derive_leg_uuid(operation_id, group),
+                transfer_type: TransferType::Store,
+                request_type: RequestType::Scheduled,
+            };
+            self.append_pending_operation(worker_req);
+        }
 
         if let Err(e) = self.xfer_tx.send(xfer_req) {
             tracing::error!("Failed to send transfer request: {:?}", e);
@@ -1337,11 +1373,10 @@ impl VllmConnectorSlot {
             )));
         }
 
-        self.append_pending_operation(worker_req);
-
         tracing::debug!(
             request_id = self.request_id,
             operation_id = %operation_id,
+            legs = self.num_groups,
             "offloading {} blocks to host",
             block_ids.len()
         );
@@ -1367,12 +1402,20 @@ impl VllmConnectorSlot {
             operation_id,
         ));
 
-        let worker_req = WorkerTransferRequest {
-            request_id: self.request_id.clone(),
-            uuid: operation_id,
-            transfer_type: TransferType::Load,
-            request_type: RequestType::Immediate,
-        };
+        // ONE metadata operation PER GROUP LEG, each with its deterministic
+        // per-leg uuid — the transfer engine stamps the same uuids on the
+        // wire legs; the leader's metadata counts Immediate ops per request
+        // (expected_immediate_ops) and the worker's slot completion counts
+        // ops per request, so an onboard finishes only when ALL legs did.
+        for group in 0..self.num_groups {
+            let worker_req = WorkerTransferRequest {
+                request_id: self.request_id.clone(),
+                uuid: derive_leg_uuid(operation_id, group),
+                transfer_type: TransferType::Load,
+                request_type: RequestType::Immediate,
+            };
+            self.append_pending_operation(worker_req);
+        }
 
         if let Err(e) = self.xfer_tx.send(xfer_req) {
             tracing::error!("Failed to send transfer request: {:?}", e);
@@ -1382,11 +1425,10 @@ impl VllmConnectorSlot {
             )));
         }
 
-        self.append_pending_operation(worker_req);
-
         tracing::debug!(
             request_id = self.request_id,
             operation_id = %operation_id,
+            legs = self.num_groups,
             "start onboarding {} blocks from {:?} to device",
             num_blocks,
             src_storage_pool,
@@ -1407,6 +1449,29 @@ impl VllmConnectorSlot {
 enum LocalTransferRequest {
     Offload(LocalOffloadRequest),
     Onboard(LocalOnboardRequest),
+}
+
+/// Deterministic per-leg uuid for group `group` of the logical op `logical`:
+/// the logical uuid with its low 7 bytes XOR-folded with the group index
+/// (the version/variant nibbles in bytes 6/8 stay untouched, so the result
+/// remains a well-formed v4-shaped uuid).
+///
+/// Determinism is the load-bearing property: the leader-side slot records
+/// one metadata operation PER LEG with `derive_leg_uuid(op, g)`, and the
+/// transfer engine stamps the SAME uuid on each group's wire request —
+/// without threading state between them. The worker-side connector
+/// scheduler rendezvous keys on `(request_id, uuid)` and supports exactly
+/// one Worker + one Transfer per uuid, so N legs sharing one uuid would
+/// panic ("invalid combination of request sources") or park a controller
+/// forever. Group 0 folds to the logical uuid unchanged, keeping
+/// single-group deployments byte-identical on the wire.
+fn derive_leg_uuid(logical: uuid::Uuid, group: usize) -> uuid::Uuid {
+    let mut bytes = *logical.as_bytes();
+    let group_le = (group as u64).to_le_bytes();
+    for (i, b) in group_le.iter().enumerate().take(7) {
+        bytes[9 + i] ^= b;
+    }
+    uuid::Uuid::from_bytes(bytes)
 }
 
 struct LocalOffloadRequest {
@@ -1465,6 +1530,12 @@ impl LocalOnboardRequest {
 struct LocalTransferEngine {
     block_manager: VllmBlockManager,
     leader: Arc<KvbmLeader>,
+    /// HMA group count captured from the leader at engine construction —
+    /// the SAME capture the slot manager stamps into every slot, so the
+    /// metadata ops (one per leg) and the wire legs always agree. Must be
+    /// constructed after the worker handshake (all callers await
+    /// `wait_worker_sync_ready` first).
+    num_groups: usize,
     xfer_rx: mpsc::UnboundedReceiver<LocalTransferRequest>,
 }
 
@@ -1472,11 +1543,13 @@ impl LocalTransferEngine {
     pub fn new(
         block_manager: VllmBlockManager,
         leader: Arc<KvbmLeader>,
+        num_groups: usize,
         xfer_rx: mpsc::UnboundedReceiver<LocalTransferRequest>,
     ) -> Self {
         Self {
             block_manager,
             leader,
+            num_groups,
             xfer_rx,
         }
     }
@@ -1508,20 +1581,26 @@ impl LocalTransferEngine {
         let block_manager_offload = self.block_manager.clone();
         let leader_offload = Arc::clone(&self.leader);
         let leader_onboard = Arc::clone(&self.leader);
+        let num_groups_onboard = self.num_groups;
+        let num_groups_offload = self.num_groups;
 
         let kvbm_metrics_onboard = kvbm_metrics.clone();
         let kvbm_metrics_offload = kvbm_metrics.clone();
 
         let onboard_task = CriticalTaskExecutionHandle::new_with_runtime(
-            |cancellation_token_onboard| async move {
+            move |cancellation_token_onboard| async move {
                 while let Some(req) = onboard_rx.recv().await {
                     if cancellation_token_onboard.is_cancelled() {
                         tracing::debug!("LocalOnboardTask: received cancellation signal");
                         break;
                     }
-                    if let Err(e) =
-                        process_onboard_request(req, &leader_onboard, kvbm_metrics_onboard.clone())
-                            .await
+                    if let Err(e) = process_onboard_request(
+                        req,
+                        &leader_onboard,
+                        num_groups_onboard,
+                        kvbm_metrics_onboard.clone(),
+                    )
+                    .await
                     {
                         tracing::error!("LocalOnboardTask: error processing request: {:?}", e);
                     }
@@ -1534,7 +1613,7 @@ impl LocalTransferEngine {
         )
         .unwrap();
         let offload_task = CriticalTaskExecutionHandle::new_with_runtime(
-            |cancellation_token_offload| async move {
+            move |cancellation_token_offload| async move {
                 while let Some(req) = offload_rx.recv().await {
                     if cancellation_token_offload.is_cancelled() {
                         tracing::debug!("LocalOffloadTask: received cancellation signal");
@@ -1548,35 +1627,41 @@ impl LocalTransferEngine {
                         req,
                         &block_manager_offload,
                         &leader_offload,
+                        num_groups_offload,
                         kvbm_metrics_offload.clone(),
                     )
                     .await
                     {
                         tracing::error!("LocalOffloadTask: error processing request: {:?}", e);
 
-                        // Create a fake/immediate transfer request that completes instantly.
-                        // Otherwise, worker side might stuck and cause memory leak.
-                        let fake_xfer = BlockTransferRequest {
-                            from_pool: BlockTransferPool::Device, // Use valid Device->Host transfer type
-                            to_pool: BlockTransferPool::Host,     // (offload path, but no blocks)
-                            blocks: vec![],                       // Empty - nothing to transfer
-                            // Error-recovery unblock: single-group pool set.
-                            group: 0,
-                            connector_req: Some(LeaderTransferRequest {
-                                request_id: request_id.clone(),
-                                uuid: operation_id,
-                                requirement: None,
-                                request_type: RequestType::Immediate, // Immediate = completes instantly
-                            }),
-                        };
+                        // Create fake/immediate transfer requests that complete
+                        // instantly — ONE PER GROUP LEG. Otherwise, the worker
+                        // side might get stuck and leak memory: the slot already
+                        // recorded N metadata ops for this request, and each
+                        // parked rendezvous must be unblocked with its own leg
+                        // uuid (group 0's leg uuid IS the logical op uuid).
+                        for group in 0..num_groups_offload {
+                            let fake_xfer = BlockTransferRequest {
+                                from_pool: BlockTransferPool::Device, // Use valid Device->Host transfer type
+                                to_pool: BlockTransferPool::Host, // (offload path, but no blocks)
+                                blocks: vec![],                   // Empty - nothing to transfer
+                                group,
+                                connector_req: Some(LeaderTransferRequest {
+                                    request_id: request_id.clone(),
+                                    uuid: derive_leg_uuid(operation_id, group),
+                                    requirement: None,
+                                    request_type: RequestType::Immediate, // Immediate = completes instantly
+                                }),
+                            };
 
-                        match leader_offload.transfer_blocks_request(fake_xfer).await {
-                            Ok(notify_receiver) => {
-                                // Wait for the fake transfer to "complete" (should be instant)
-                                let _ = notify_receiver.await;
-                            }
-                            Err(_xfer_err) => {
-                                // Failed to create completion notification - error already logged above
+                            match leader_offload.transfer_blocks_request(fake_xfer).await {
+                                Ok(notify_receiver) => {
+                                    // Wait for the fake transfer to "complete" (should be instant)
+                                    let _ = notify_receiver.await;
+                                }
+                                Err(_xfer_err) => {
+                                    // Failed to create completion notification - error already logged above
+                                }
                             }
                         }
                     }
@@ -1645,6 +1730,7 @@ async fn process_offload_request(
     offload_req: LocalOffloadRequest,
     block_manager: &VllmBlockManager,
     leader: &Arc<KvbmLeader>,
+    num_groups: usize,
     kvbm_metrics: KvbmMetrics,
 ) -> anyhow::Result<()> {
     let request_id = offload_req.request_id.clone();
@@ -1671,6 +1757,7 @@ async fn process_offload_request(
             block_manager.disk().unwrap(),
             BlockTransferPool::Disk,
             leader,
+            num_groups,
             kvbm_metrics,
             &request_id,
             &operation_id,
@@ -1684,6 +1771,7 @@ async fn process_offload_request(
             block_manager.host().unwrap(),
             BlockTransferPool::Host,
             leader,
+            num_groups,
             kvbm_metrics,
             &request_id,
             &operation_id,
@@ -1701,6 +1789,7 @@ async fn process_offload_to_storage<S, L, M>(
     storage_pool: &dyn BlockPool<S, L, M>,
     transfer_pool: BlockTransferPool,
     leader: &Arc<KvbmLeader>,
+    num_groups: usize,
     kvbm_metrics: KvbmMetrics,
     request_id: &str,
     operation_id: &uuid::Uuid,
@@ -1758,27 +1847,22 @@ where
 
     // 3. Issue the offload: ONE logical op fanned out to one request PER
     // GROUP (same block pairs — the tier's block ids index every group's
-    // worker-side pool; each worker holds one pool per group). All legs are
-    // sent before any is awaited. Single-group (num_groups == 1) sends the
-    // one request exactly as before.
-    let num_groups = leader.num_groups();
-    let connector_req = LeaderTransferRequest {
-        request_id: offload_req.request_id.clone(),
-        uuid: offload_req.operation_id,
-        requirement: None,
-        request_type: RequestType::Scheduled,
-    };
-    let mut notify_receivers = Vec::with_capacity(num_groups);
-    for group in 0..num_groups {
-        let block_xfer_req = BlockTransferRequest {
-            from_pool: BlockTransferPool::Device,
-            to_pool: transfer_pool,
-            blocks: block_pairs.clone(),
-            group,
-            connector_req: Some(connector_req.clone()),
-        };
-        notify_receivers.push(leader.transfer_blocks_request(block_xfer_req).await?);
-    }
+    // worker-side pool; each worker holds one pool per group), each leg with
+    // its own deterministic uuid. All legs are sent before any is awaited.
+    // Single-group (num_groups == 1) sends the one request exactly as
+    // before, with the logical op's uuid (derive_leg_uuid identity).
+    let notify_receivers = fan_out_group_legs(
+        leader,
+        num_groups,
+        &offload_req.request_id,
+        offload_req.operation_id,
+        BlockTransferPool::Device,
+        transfer_pool,
+        block_pairs,
+        RequestType::Scheduled,
+        "offload",
+    )
+    .await;
     tracing::debug!(
         request_id = request_id,
         operation_id = %operation_id,
@@ -1786,20 +1870,11 @@ where
         storage_name,
         num_groups
     );
+    let notify_receivers = notify_receivers?;
 
     // 4. Wait for ALL group legs to complete. The metrics count the
     // completed LOGICAL op once (not once per group leg).
-    let mut failed_legs: Vec<usize> = Vec::new();
-    for (group, notify_receiver) in notify_receivers.into_iter().enumerate() {
-        if notify_receiver.await.is_err() {
-            failed_legs.push(group);
-        }
-    }
-    if !failed_legs.is_empty() {
-        return Err(anyhow::anyhow!(
-            "Offloading transfer completion notification failed for group legs {failed_legs:?}"
-        ));
-    }
+    await_all_legs(notify_receivers, "offload").await?;
     match transfer_pool {
         BlockTransferPool::Disk => {
             kvbm_metrics.offload_blocks_d2d.inc_by(num_blocks as u64);
@@ -1834,9 +1909,88 @@ where
     Ok(())
 }
 
+/// Send one wire request PER GROUP LEG for a logical offload/onboard op.
+///
+/// Each leg carries its own deterministic uuid (`derive_leg_uuid`) and its
+/// group tag — the worker-side connector scheduler rendezvous keys on
+/// `(request_id, uuid)` and supports exactly one Worker + one Transfer per
+/// uuid, so legs must not share the logical op's uuid. All legs are sent
+/// before any is awaited; if a leg's send fails after earlier legs were
+/// already sent, the in-flight legs are logged as orphaned rather than
+/// silently `?`-returned past.
+#[allow(clippy::too_many_arguments)]
+async fn fan_out_group_legs(
+    leader: &KvbmLeader,
+    num_groups: usize,
+    request_id: &str,
+    operation_id: uuid::Uuid,
+    from_pool: BlockTransferPool,
+    to_pool: BlockTransferPool,
+    block_pairs: Vec<(usize, usize)>,
+    request_type: RequestType,
+    op_name: &str,
+) -> anyhow::Result<Vec<tokio::sync::oneshot::Receiver<()>>> {
+    let mut notify_receivers = Vec::with_capacity(num_groups);
+    for group in 0..num_groups {
+        let block_xfer_req = BlockTransferRequest {
+            from_pool,
+            to_pool,
+            blocks: block_pairs.clone(),
+            group,
+            connector_req: Some(LeaderTransferRequest {
+                request_id: request_id.to_string(),
+                uuid: derive_leg_uuid(operation_id, group),
+                requirement: None,
+                request_type,
+            }),
+        };
+        match leader.transfer_blocks_request(block_xfer_req).await {
+            Ok(receiver) => notify_receivers.push(receiver),
+            Err(e) => {
+                if !notify_receivers.is_empty() {
+                    tracing::error!(
+                        request_id = %request_id,
+                        operation_id = %operation_id,
+                        op_name,
+                        in_flight_legs = notify_receivers.len(),
+                        failed_group = group,
+                        "{op_name}: leg send failed after earlier legs were already in flight; \
+                         orphaning them (their acks will be dropped)"
+                    );
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(notify_receivers)
+}
+
+/// Await ALL group legs of one logical op, collecting (not short-circuiting
+/// on) failures so every in-flight leg is drained. The caller counts the
+/// logical op once, only when all legs completed.
+async fn await_all_legs(
+    notify_receivers: Vec<tokio::sync::oneshot::Receiver<()>>,
+    op_name: &str,
+) -> anyhow::Result<()> {
+    let mut failed_legs = Vec::new();
+    for (group, notify_receiver) in notify_receivers.into_iter().enumerate() {
+        if notify_receiver.await.is_err() {
+            failed_legs.push(group);
+        }
+    }
+    if failed_legs.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "{op_name} transfer completion notification failed for group legs {failed_legs:?}"
+        ))
+    }
+}
+
 async fn process_onboard_request(
     onboard_req: LocalOnboardRequest,
     leader: &Arc<KvbmLeader>,
+    num_groups: usize,
     kvbm_metrics: KvbmMetrics,
 ) -> anyhow::Result<()> {
     let request_id = &onboard_req.request_id;
@@ -1853,41 +2007,24 @@ async fn process_onboard_request(
         .collect::<Vec<_>>();
 
     // Issue the onboard: ONE logical op fanned out to one request PER GROUP
-    // (same block pairs; each group's worker-side pools). All legs are sent
-    // before any is awaited. Single-group (num_groups == 1) sends the one
-    // request exactly as before.
-    let num_groups = leader.num_groups();
-    let connector_req = LeaderTransferRequest {
-        request_id: request_id.clone(),
-        uuid: *operation_id,
-        requirement: None,
-        request_type: RequestType::Immediate,
-    };
-    let mut notify_receivers = Vec::with_capacity(num_groups);
-    for group in 0..num_groups {
-        let block_xfer_req = BlockTransferRequest {
-            from_pool: onboard_req.src_blocks.storage_pool(),
-            to_pool: BlockTransferPool::Device,
-            blocks: block_pairs.clone(),
-            group,
-            connector_req: Some(connector_req.clone()),
-        };
-        notify_receivers.push(leader.transfer_blocks_request(block_xfer_req).await?);
-    }
+    // (same block pairs; each group's worker-side pools), each leg with its
+    // own deterministic uuid. All legs are sent before any is awaited.
+    let notify_receivers = fan_out_group_legs(
+        leader,
+        num_groups,
+        request_id,
+        *operation_id,
+        onboard_req.src_blocks.storage_pool(),
+        BlockTransferPool::Device,
+        block_pairs,
+        RequestType::Immediate,
+        "onboard",
+    )
+    .await?;
 
     // Wait for ALL group legs; count the completed LOGICAL op once (not
     // once per group leg).
-    let mut failed_legs: Vec<usize> = Vec::new();
-    for (group, notify_receiver) in notify_receivers.into_iter().enumerate() {
-        if notify_receiver.await.is_err() {
-            failed_legs.push(group);
-        }
-    }
-    if !failed_legs.is_empty() {
-        return Err(anyhow::anyhow!(
-            "Onboarding transfer completion notification failed for group legs {failed_legs:?}"
-        ));
-    }
+    await_all_legs(notify_receivers, "onboard").await?;
     if onboard_req.src_blocks.storage_pool() == BlockTransferPool::Host {
         kvbm_metrics
             .onboard_blocks_h2d
@@ -1980,6 +2117,19 @@ mod connector_tests {
         VllmConnectorSlot,
         mpsc::UnboundedReceiver<LocalTransferRequest>,
     ) {
+        create_test_slot_with_groups(num_tokens, offload_min_priority, 1)
+    }
+
+    /// Variant with an explicit HMA group count (the slot's per-op leg
+    /// count for offload/onboard metadata).
+    fn create_test_slot_with_groups(
+        num_tokens: usize,
+        offload_min_priority: u32,
+        num_groups: usize,
+    ) -> (
+        VllmConnectorSlot,
+        mpsc::UnboundedReceiver<LocalTransferRequest>,
+    ) {
         let tokens: Vec<u32> = (1..=num_tokens as u32).collect();
         let (xfer_tx, xfer_rx) = mpsc::unbounded_channel();
         let cache_stats = Arc::new(CacheStatsTracker::new(None));
@@ -1991,6 +2141,7 @@ mod connector_tests {
             xfer_tx,
             cache_stats,
             offload_min_priority,
+            num_groups,
         );
         (slot, xfer_rx)
     }
@@ -2417,5 +2568,126 @@ mod connector_tests {
 
         assert_eq!(slot.num_device_blocks_allocated(), 7);
         assert_eq!(slot.device_blocks_snapshot(), &[10, 11, 12, 13, 14, 15, 16]);
+    }
+
+    // ---------------------------------------------------------------
+    // Multi-group: per-leg uuids + per-leg metadata ops
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn derive_leg_uuid_is_deterministic_leg0_identity_and_injective() {
+        let op = uuid::Uuid::new_v4();
+        let other_op = uuid::Uuid::new_v4();
+
+        // Deterministic: same inputs, same leg uuid.
+        assert_eq!(derive_leg_uuid(op, 3), derive_leg_uuid(op, 3));
+
+        // Leg 0 folds to the logical uuid — single-group deployments keep
+        // the exact same uuids on the wire as before the fan-out.
+        assert_eq!(derive_leg_uuid(op, 0), op);
+
+        // Distinct legs of one op, and same-leg uuids of distinct ops.
+        let legs: Vec<_> = (0..8).map(|g| derive_leg_uuid(op, g)).collect();
+        for g in 0..8 {
+            for h in 0..8 {
+                if g != h {
+                    assert_ne!(legs[g], legs[h], "legs {g} and {h} collided");
+                }
+                assert_ne!(
+                    derive_leg_uuid(other_op, g),
+                    derive_leg_uuid(op, g),
+                    "different ops collided on leg {g}"
+                );
+            }
+        }
+
+        // Version/variant nibbles (bytes 6/8) survive the fold: the derived
+        // uuid stays well-formed v4 / RFC4122.
+        for leg in &legs {
+            assert_eq!(leg.get_version_num(), op.get_version_num());
+            assert_eq!(leg.get_variant(), op.get_variant());
+        }
+    }
+
+    #[test]
+    fn offload_records_one_metadata_operation_per_group() {
+        let num_tokens = 96; // 3 blocks
+        let (mut slot, mut rx) = create_test_slot_with_groups(num_tokens, 0, 3);
+
+        slot.append_mutable_device_blocks(&block_ids(100, 3))
+            .unwrap();
+        slot.apply_scheduler_output(&[], &[], 0, num_tokens, None, None)
+            .unwrap();
+
+        // ONE wire request goes to the transfer engine (the engine fans it
+        // out per group); the SLOT records one metadata op per leg.
+        let offloads = drain_offload_block_ids(&mut rx);
+        assert_eq!(offloads.len(), 1, "expected exactly one offload batch");
+
+        let ops = slot.take_pending_operations().expect("pending ops");
+        assert_eq!(ops.len(), 3, "one metadata op per group leg");
+        for (group, op) in ops.iter().enumerate() {
+            assert_eq!(op.request_id, "test-req");
+            assert_eq!(op.transfer_type, TransferType::Store);
+            assert_eq!(op.request_type, RequestType::Scheduled);
+            assert_eq!(
+                op.uuid,
+                derive_leg_uuid(ops[0].uuid, group),
+                "leg {group} uuid must be the deterministic derivative of leg 0"
+            );
+        }
+        // All legs distinct, leg 0 is the logical op uuid.
+        assert_ne!(ops[0].uuid, ops[1].uuid);
+        assert_ne!(ops[0].uuid, ops[2].uuid);
+        assert_eq!(ops[0].uuid, derive_leg_uuid(ops[0].uuid, 0));
+    }
+
+    /// Minimal [`AnyBlocks`] stand-in so onboard metadata recording can be
+    /// tested without real tier blocks.
+    struct TestAnyBlocks {
+        ids: Vec<BlockId>,
+        pool: BlockTransferPool,
+    }
+
+    impl AnyBlocks for TestAnyBlocks {
+        fn len(&self) -> usize {
+            self.ids.len()
+        }
+
+        fn storage_pool(&self) -> BlockTransferPool {
+            self.pool
+        }
+
+        fn block_ids(&self) -> Vec<BlockId> {
+            self.ids.clone()
+        }
+    }
+
+    #[test]
+    fn onboard_records_one_metadata_operation_per_group() {
+        let (mut slot, _rx) = create_test_slot_with_groups(96, 0, 2);
+
+        slot.onboard_blocks(
+            Box::new(TestAnyBlocks {
+                ids: vec![500, 501],
+                pool: BlockTransferPool::Host,
+            }),
+            vec![0, 1],
+        )
+        .unwrap();
+
+        let ops = slot.take_pending_operations().expect("pending ops");
+        assert_eq!(ops.len(), 2, "one metadata op per group leg");
+        for (group, op) in ops.iter().enumerate() {
+            assert_eq!(op.request_id, "test-req");
+            assert_eq!(op.transfer_type, TransferType::Load);
+            // Immediate ops: the leader's metadata counts them per request
+            // into expected_immediate_ops, and the worker's slot completion
+            // counts ops per request — so the onboard finishes only when
+            // ALL legs did.
+            assert_eq!(op.request_type, RequestType::Immediate);
+            assert_eq!(op.uuid, derive_leg_uuid(ops[0].uuid, group));
+        }
+        assert_ne!(ops[0].uuid, ops[1].uuid);
     }
 }

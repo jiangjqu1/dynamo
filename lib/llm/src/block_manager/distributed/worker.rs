@@ -1151,6 +1151,10 @@ impl KvbmWorker {
             {
                 let mut subset = Vec::with_capacity(group.tensor_indices.len());
                 for &i in &group.tensor_indices {
+                    // Defense-in-depth: `validate()` already enforces the
+                    // exact partition this checks (groups cover
+                    // 0..tensors.len() in registration order), so the
+                    // missing-arm case is unreachable in practice.
                     let Some(storage) = remaining[i].take() else {
                         return Err(anyhow::anyhow!(
                             "layer group {group_idx}: tensor index {i} already consumed by an earlier group (groups must partition the tensor list)"
@@ -1218,7 +1222,8 @@ impl KvbmWorker {
 
         let scheduler_client = config.scheduler_client.clone();
 
-        let worker_config = config.clone();
+        // Move (not clone) — `config` has no further readers here.
+        let worker_config = config;
         // start background worker task to do layout allocation for host or disk
         let task = CriticalTaskExecutionHandle::new(
             move |cancel_token| {
