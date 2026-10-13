@@ -287,6 +287,35 @@ class KvConnectorWorker:
         else:
             kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
 
+        # Hybrid (HMA) handoff: pass the per-group plan so the Rust worker
+        # derives per-group geometry, and the attention-layer count so the
+        # save trigger fires at the last ATTENTION layer with the offload
+        # enqueue deferred to wait_for_save (mamba bytes are only final
+        # post-forward). Attention-only registrations pass None for all
+        # three and keep the legacy path byte-identical.
+        if recurrent_layer_count > 0 and self.group_plans:
+            group_of_layer: Optional[list[int]] = self.group_plans[0].group_of_layer
+            group_specs: Optional[list[tuple[bool, Optional[int]]]] = []
+            for plan in self.group_plans:
+                if plan.is_mamba and plan.layer_names:
+                    first_tensor = name_to_tensor[plan.layer_names[0]]
+                    # Physical per-block row bytes of the group's dense
+                    # int8 [B, C] state tensor. vLLM's spec page_size is
+                    # padded metadata (Phase 1 probe proved it); the
+                    # tensor's own shape is ground truth.
+                    page_bytes: Optional[int] = int(first_tensor.shape[1])
+                else:
+                    # Attention groups: Rust infers the geometry from the
+                    # group's first tensor (page tokens fall back to the
+                    # registration page_size).
+                    page_bytes = None
+                group_specs.append((plan.is_mamba, page_bytes))
+            active_save_layers: Optional[int] = attention_layer_count
+        else:
+            group_of_layer = None
+            group_specs = None
+            active_save_layers = None
+
         # Register with connector using ordered data
         self._connector.register_kv_caches(
             num_device_blocks,
@@ -297,6 +326,9 @@ class KvConnectorWorker:
             raw_event_handles,
             outer_dim=layout.outer_dim,
             inner_dim=layout.inner_dim,
+            group_of_layer=group_of_layer,
+            group_specs=group_specs,
+            active_save_layers=active_save_layers,
         )
 
     def bind_connector_metadata(self, data: bytes) -> None:
@@ -357,6 +389,23 @@ class KvConnectorWorker:
         """
         self.events[layer_name].record(torch.cuda.current_stream())
         self._connector.save_kv_layer(layer_name, kv_layer)
+
+    def wait_for_save(self) -> None:
+        """Signal that the step's full forward pass finished saving.
+
+        Hybrid (HMA) models only: vLLM calls this once per step after the
+        forward pass. Mamba/GDN layers never call ``save_kv_layer``, so
+        their state bytes are only final now — the Rust worker deferred
+        the offload enqueue to the fresh event recorded here, which
+        covers every registered layer. Attention-only models keep the
+        legacy path (trigger and enqueue at the last attention layer)
+        and return without touching Rust.
+        """
+        if not self.mamba_layer_names:
+            return
+        event = torch.cuda.Event(enable_timing=False, interprocess=False)
+        event.record(torch.cuda.current_stream())
+        self._connector.wait_for_save(event.cuda_event)
 
     def get_finished(
         self, finished_req_ids: set[str]

@@ -18,7 +18,7 @@ use crate::{
     extract_distributed_runtime_from_obj, get_current_cancel_token, get_current_tokio_handle,
 };
 use anyhow;
-use dynamo_llm::block_manager::distributed::{KvbmWorker, KvbmWorkerConfig};
+use dynamo_llm::block_manager::distributed::{KvbmWorker, KvbmWorkerConfig, LayerGroup};
 use dynamo_llm::block_manager::layout::LayoutType;
 use dynamo_llm::block_manager::storage::torch::TorchTensor;
 use dynamo_runtime::DistributedRuntime;
@@ -39,6 +39,9 @@ pub trait Worker: Send + Sync {
         disk_layout_type: Option<LayoutType>,
         outer_dim: Option<usize>,
         inner_dim: Option<usize>,
+        group_of_layer: Option<Vec<usize>>,
+        group_specs: Option<Vec<(bool, Option<usize>)>>,
+        active_save_layers: Option<usize>,
     ) -> anyhow::Result<()>;
 
     fn bind_connector_metadata(&mut self, metadata: Vec<u8>) -> anyhow::Result<()>;
@@ -46,6 +49,13 @@ pub trait Worker: Send + Sync {
     fn clear_connector_metadata(&mut self);
 
     fn save_kv_layer(&mut self, layer_name: String) -> anyhow::Result<()>;
+
+    /// Hybrid (HMA) save trigger: vLLM calls this once per step after the
+    /// forward pass, with a freshly recorded event whose completion covers
+    /// ALL registered layers (mamba/GDN state bytes are only final then).
+    /// Attention-only registrations ignore it — their offload enqueue
+    /// already happened at the last `save_kv_layer`.
+    fn wait_for_save(&mut self, event_handle: u64) -> anyhow::Result<()>;
 
     fn get_finished(
         &mut self,
@@ -73,6 +83,15 @@ pub struct KvConnectorWorker {
     bound: bool,
     iteration: u64,
     layers_complete: usize,
+
+    /// Hybrid (HMA) trigger: the number of layers that call
+    /// `save_kv_layer` (attention layers; mamba/GDN layers never do).
+    /// `None` = attention-only legacy behavior: trigger and enqueue at
+    /// the last registered layer. `Some(n)` = sync the last attention
+    /// layer's event when the n-th save arrives, but defer the offload
+    /// enqueue to `wait_for_save` (post-forward, when mamba bytes are
+    /// final).
+    active_save_layers: Option<usize>,
 
     /// cuda events created by the python side
     layer_events: Vec<u64>,
@@ -112,10 +131,145 @@ impl KvConnectorWorker {
             bound: false,
             iteration: 0,
             layers_complete: 0,
+            active_save_layers: None,
             kv_cache_layers: Vec::new(),
             layer_events: Vec::new(),
         })
     }
+
+    /// Hand the iteration's offload operations to the scheduler. The
+    /// operations are taken (not borrowed): once enqueued, the field must
+    /// be empty so a missing trigger never double-enqueues.
+    fn enqueue_offload_operations(&mut self) {
+        let offloading_operations = std::mem::take(&mut self.offloading_operations);
+
+        tracing::trace!(
+            iteration = self.iteration,
+            num_operations = offloading_operations.len(),
+            "Enqueuing {} offload operations",
+            offloading_operations.len()
+        );
+
+        for operation in &offloading_operations {
+            tracing::debug!(
+                request_id = %operation.request_id,
+                operation_id = %operation.uuid,
+                "Enqueuing offload operation to scheduler"
+            );
+            self.connector.enqueue_request(operation.clone());
+        }
+    }
+
+    /// Enqueue offload operations still held from a previous iteration.
+    ///
+    /// Hybrid registrations defer the enqueue to `wait_for_save`; a step
+    /// that never runs a forward pass (e.g. `no_forward`) skips it, so
+    /// the held operations would otherwise be silently dropped when the
+    /// next iteration's metadata overwrites them. No fresh event sync is
+    /// possible at bind time — the enqueue proceeds unsynced and the
+    /// affected requests are named in a warning so the staleness is
+    /// visible. Returns the number of flushed operations.
+    fn flush_held_offload_operations(&mut self) -> usize {
+        if self.offloading_operations.is_empty() {
+            return 0;
+        }
+        let request_ids: Vec<&str> = self
+            .offloading_operations
+            .iter()
+            .map(|op| op.request_id.as_str())
+            .collect();
+        tracing::warn!(
+            iteration = self.iteration,
+            request_ids = ?request_ids,
+            num_operations = request_ids.len(),
+            "enqueuing offload operations held from a previous iteration without a fresh event sync (that iteration never reached wait_for_save)"
+        );
+        let held = self.offloading_operations.len();
+        self.enqueue_offload_operations();
+        held
+    }
+}
+
+/// Build the HMA [`LayerGroup`]s for a hybrid registration.
+///
+/// `group_of_layer` (parallel to the registered tensors, in registration
+/// order) assigns each tensor to a group id; `group_specs` carries
+/// `(is_mamba, page_bytes)` per group in group-id order. `None` or empty
+/// inputs produce no groups, keeping the legacy single-geometry path.
+///
+/// Mamba groups carry their full geometry: `page_bytes` is the physical
+/// per-block row size `C` of the dense int8 `[B, C]` state tensor, which
+/// Python derives from the tensor itself (vLLM's spec page_size is padded
+/// metadata, not the physical row). Attention groups only need the
+/// page-token count — their outer/inner dims are inferred per group from
+/// the group's first registered tensor (or taken from the explicit
+/// config-level dims); the outer/inner values stored here are inert
+/// placeholders that exist only so `validate()`'s non-zero
+/// `bytes_per_block` rule passes.
+#[allow(clippy::too_many_arguments)]
+fn build_layer_groups(
+    group_of_layer: Option<&[usize]>,
+    group_specs: Option<&[(bool, Option<usize>)]>,
+    num_registered: usize,
+    page_size: usize,
+    dtype_width_bytes: usize,
+    outer_dim: Option<usize>,
+    inner_dim: Option<usize>,
+) -> anyhow::Result<Vec<LayerGroup>> {
+    let (Some(group_of_layer), Some(group_specs)) = (group_of_layer, group_specs) else {
+        return Ok(Vec::new());
+    };
+    if group_of_layer.is_empty() || group_specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    if group_of_layer.len() != num_registered {
+        anyhow::bail!(
+            "group_of_layer has {} entries but {} tensors were registered",
+            group_of_layer.len(),
+            num_registered
+        );
+    }
+
+    // Collect each group's tensor indices, preserving registration order.
+    // Groups may interleave (e.g. attention layers inside a mamba span).
+    let mut indices_per_group = vec![Vec::<usize>::new(); group_specs.len()];
+    for (tensor_idx, &group_id) in group_of_layer.iter().enumerate() {
+        let Some(indices) = indices_per_group.get_mut(group_id) else {
+            anyhow::bail!(
+                "group_of_layer references group id {} but only {} groups were provided",
+                group_id,
+                group_specs.len()
+            );
+        };
+        indices.push(tensor_idx);
+    }
+
+    let mut groups = Vec::with_capacity(group_specs.len());
+    for (group_id, (is_mamba, page_bytes)) in group_specs.iter().enumerate() {
+        let tensor_indices = std::mem::take(&mut indices_per_group[group_id]);
+        if *is_mamba {
+            let Some(page_bytes) = page_bytes else {
+                anyhow::bail!(
+                    "mamba layer group {group_id} requires page_bytes (the physical per-block row size of its state tensor)"
+                );
+            };
+            let mut group = LayerGroup::mamba(tensor_indices.len(), *page_bytes);
+            group.tensor_indices = tensor_indices;
+            groups.push(group);
+        } else {
+            let page_tokens = page_bytes.unwrap_or(page_size);
+            let mut group = LayerGroup::attention(
+                tensor_indices.len(),
+                page_tokens,
+                outer_dim.unwrap_or(1),
+                inner_dim.unwrap_or(1),
+                dtype_width_bytes,
+            );
+            group.tensor_indices = tensor_indices;
+            groups.push(group);
+        }
+    }
+    Ok(groups)
 }
 
 impl Worker for KvConnectorWorker {
@@ -123,6 +277,7 @@ impl Worker for KvConnectorWorker {
     ///
     /// The Dynamo KVBM worker is lazily initialized when the first KV cache is registered.
     /// This process establishes a connection between all KVBM workers and the leader.
+    #[allow(clippy::too_many_arguments)]
     fn register_kv_caches(
         &mut self,
         num_device_blocks: usize,
@@ -136,6 +291,9 @@ impl Worker for KvConnectorWorker {
         disk_layout_type: Option<LayoutType>,
         outer_dim: Option<usize>,
         inner_dim: Option<usize>,
+        group_of_layer: Option<Vec<usize>>,
+        group_specs: Option<Vec<(bool, Option<usize>)>>,
+        active_save_layers: Option<usize>,
     ) -> anyhow::Result<()> {
         if self.kvbm_worker.get().is_some() {
             tracing::warn!("kvbm worker already registered");
@@ -168,6 +326,28 @@ impl Worker for KvConnectorWorker {
         }
 
         self.layer_events = raw_event_handles;
+
+        // Hybrid (HMA) handoff: build the per-group layer geometry so the
+        // worker derives per-group layouts/pools, and remember the
+        // attention-layer count for the save trigger. None/empty inputs
+        // keep the legacy single-group path byte-identical.
+        let groups = build_layer_groups(
+            group_of_layer.as_deref(),
+            group_specs.as_deref(),
+            vllm_tensors.len(),
+            page_size,
+            dtype_width_bytes,
+            outer_dim,
+            inner_dim,
+        )?;
+        self.active_save_layers = active_save_layers;
+        if let Some(active_save_layers) = active_save_layers {
+            tracing::info!(
+                active_save_layers,
+                num_groups = groups.len(),
+                "hybrid registration: save trigger moved to wait_for_save"
+            );
+        }
 
         // Auto-detect device layout type if not explicitly provided
         let detected_device_layout_type = match device_layout_type {
@@ -217,7 +397,10 @@ impl Worker for KvConnectorWorker {
         if let Some(id) = inner_dim {
             config_builder = config_builder.inner_dim(Some(id));
         }
-        let config = config_builder.build()?;
+        let config = config_builder
+            .groups(groups)
+            .active_save_layers(active_save_layers)
+            .build()?;
 
         let worker = get_current_tokio_handle().block_on(async move {
             let worker = KvbmWorker::new(config, false).await?;
@@ -297,6 +480,16 @@ impl Worker for KvConnectorWorker {
             self.maybe_finished_onboarding.insert(request_id);
         }
 
+        // Hybrid only: a prior iteration may still HOLD offload operations
+        // (a step without a forward pass never reaches wait_for_save).
+        // Enqueue them before the new metadata overwrites the field, or
+        // their slots would never complete. Legacy registrations cannot
+        // hold operations — their enqueue already happened at the last
+        // save_kv_layer — so the legacy path stays byte-identical.
+        if self.active_save_layers.is_some() {
+            self.flush_held_offload_operations();
+        }
+
         self.offloading_operations = offloading_operations;
 
         Ok(())
@@ -315,38 +508,51 @@ impl Worker for KvConnectorWorker {
     }
 
     /// Trigger layer-wise completion signals.
-    /// Trigger block-wise completion signals afer last layer.
+    /// Trigger block-wise completion signals after the last layer.
+    ///
+    /// Attention-only (legacy): when the last registered layer's save
+    /// arrives, sync its event and enqueue the offload operations — the
+    /// exact historical path. Hybrid (HMA): mamba/GDN layers never call
+    /// this, so the last ATTENTION layer's save arrives before mamba
+    /// bytes are final. Sync the attention event at
+    /// `active_save_layers`, but HOLD the offload enqueue for
+    /// [`Worker::wait_for_save`], which runs after the full forward pass.
     fn save_kv_layer(&mut self, _layer_name: String) -> anyhow::Result<()> {
         self.layers_complete += 1;
+        let trigger_at = self
+            .active_save_layers
+            .unwrap_or(self.kv_cache_layers.len());
         tracing::debug!(
             iteration = self.iteration,
             layers_complete = self.layers_complete,
+            trigger_at,
             total_layers = self.kv_cache_layers.len(),
             pending_offload_ops = self.offloading_operations.len(),
             "save_kv_layer called"
         );
-        if self.layers_complete == self.kv_cache_layers.len() {
-            let offloading_operations = std::mem::take(&mut self.offloading_operations);
-
-            tracing::trace!(
-                iteration = self.iteration,
-                num_operations = offloading_operations.len(),
-                "All layers complete, enqueuing {} offload operations",
-                offloading_operations.len()
-            );
-
-            // block on the the completion of the last layer
-            // todo(ryan): capture the context, pass this to the scheduler to do the await on another thread
-            // or put the event on a stream and use stream waits to keep it all on device.
+        if self.layers_complete == trigger_at {
+            // Sync the last ATTENTION layer's event (attention bytes are
+            // final here; hybrid mamba bytes are not, but their groups
+            // are not enqueued until wait_for_save's fresh event).
             event_sync_blocking(self.layer_events[self.layers_complete - 1]);
-            for operation in &offloading_operations {
-                tracing::debug!(
-                    request_id = %operation.request_id,
-                    operation_id = %operation.uuid,
-                    "Enqueuing offload operation to scheduler"
-                );
-                self.connector.enqueue_request(operation.clone());
+            if self.active_save_layers.is_none() {
+                self.enqueue_offload_operations();
             }
+            // hybrid: hold — wait_for_save enqueues after the full
+            // forward pass, once mamba-group bytes are final.
+        }
+        Ok(())
+    }
+
+    /// Hybrid save trigger (see [`Worker::wait_for_save`]). The event was
+    /// freshly recorded by Python after the forward pass, so its
+    /// completion covers every registered layer, mamba included; sync it
+    /// and only then enqueue the held offload operations. Attention-only
+    /// registrations never reach the enqueue here (no-op).
+    fn wait_for_save(&mut self, event_handle: u64) -> anyhow::Result<()> {
+        if self.active_save_layers.is_some() {
+            event_sync_blocking(event_handle);
+            self.enqueue_offload_operations();
         }
         Ok(())
     }
@@ -495,7 +701,7 @@ impl PyKvConnectorWorker {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (num_device_blocks, page_size, device_id, dtype_width_bytes, kv_caches, raw_event_handles, device_layout_type=None, host_layout_type=None, disk_layout_type=None, outer_dim=None, inner_dim=None))]
+    #[pyo3(signature = (num_device_blocks, page_size, device_id, dtype_width_bytes, kv_caches, raw_event_handles, device_layout_type=None, host_layout_type=None, disk_layout_type=None, outer_dim=None, inner_dim=None, group_of_layer=None, group_specs=None, active_save_layers=None))]
     pub fn register_kv_caches(
         &mut self,
         num_device_blocks: usize,
@@ -509,6 +715,9 @@ impl PyKvConnectorWorker {
         disk_layout_type: Option<PyLayoutType>,
         outer_dim: Option<usize>,
         inner_dim: Option<usize>,
+        group_of_layer: Option<Vec<usize>>,
+        group_specs: Option<Vec<(bool, Option<usize>)>>,
+        active_save_layers: Option<usize>,
     ) -> PyResult<()> {
         // Convert Python tensors to Rust VllmTensor objects
         let mut rust_kv_caches = Vec::new();
@@ -530,6 +739,9 @@ impl PyKvConnectorWorker {
                 disk_layout_type.map(|py_layout| py_layout.into()),
                 outer_dim,
                 inner_dim,
+                group_of_layer,
+                group_specs,
+                active_save_layers,
             )
             .map_err(to_pyerr)
     }
@@ -548,6 +760,15 @@ impl PyKvConnectorWorker {
         // Note: kv_layer is not used in the current implementation
         self.connector_worker
             .save_kv_layer(layer_name)
+            .map_err(to_pyerr)
+    }
+
+    /// Hybrid (HMA) post-forward save trigger. `event_handle` is a freshly
+    /// recorded CUDA event (raw `cuda_event` handle) whose completion
+    /// covers all registered layers; attention-only workers no-op.
+    pub fn wait_for_save(&mut self, event_handle: u64) -> PyResult<()> {
+        self.connector_worker
+            .wait_for_save(event_handle)
             .map_err(to_pyerr)
     }
 
@@ -584,4 +805,156 @@ pub fn event_sync_blocking(event: u64) {
         cudaError_enum::CUDA_SUCCESS,
         "cuEventSynchronize failed"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // NOTE ON TEST SCOPE: the save-trigger/wait_for_save/flush paths are
+    // not unit-testable here. `KvConnectorWorker::new`'s debug-mode
+    // landing pads instantiate the drop glue of
+    // `kv_cache_layers: Vec<(String, Arc<VllmTensor>)>` — VllmTensor owns
+    // a `Py<PyAny>`, so keeping `new` alive pulls `_Py_DecRef` into the
+    // link, and the extension-module feature deliberately omits
+    // libpython. The trigger's `event_sync_blocking` (cuEventSynchronize)
+    // additionally needs a live CUDA context. Both paths are exercised on
+    // the GPU node (Task 8). What IS testable on CPU is the registration
+    // -> LayerGroup mapping below, which is where the fp4's interleaved
+    // layout and the physical mamba page_bytes must survive.
+
+    #[test]
+    fn build_layer_groups_none_inputs_keep_legacy_path() {
+        assert!(
+            build_layer_groups(None, None, 7, 16, 1, None, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            build_layer_groups(Some(&[]), Some(&[]), 0, 16, 1, None, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn build_layer_groups_interleaved_hybrid_fp4_pattern() {
+        // The fp4 layout: attention tensors at positions 3 and 6 inside
+        // the mamba span. The mamba page_bytes is the physical [B, C]
+        // row size; the attention group passes None so its page tokens
+        // fall back to the registration page_size.
+        let group_of_layer = vec![0, 0, 0, 1, 0, 0, 1];
+        let group_specs = vec![(true, Some(3_207_168usize)), (false, None)];
+        let groups = build_layer_groups(
+            Some(&group_of_layer),
+            Some(&group_specs),
+            7,
+            16,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(groups.len(), 2);
+
+        assert!(groups[0].is_mamba());
+        assert_eq!(groups[0].num_layers, 5);
+        assert_eq!(groups[0].page_bytes, 3_207_168);
+        assert_eq!(groups[0].tensor_indices, vec![0, 1, 2, 4, 5]);
+        assert_eq!(groups[0].bytes_per_block(), 5 * 3_207_168);
+
+        assert!(!groups[1].is_mamba());
+        assert_eq!(groups[1].num_layers, 2);
+        assert_eq!(groups[1].page_bytes, 16);
+        assert_eq!(groups[1].tensor_indices, vec![3, 6]);
+        assert!(groups[1].bytes_per_block() > 0);
+    }
+
+    #[test]
+    fn build_layer_groups_reject_mamba_without_page_bytes() {
+        let group_of_layer = vec![0];
+        let group_specs = vec![(true, None)];
+        let err = build_layer_groups(
+            Some(&group_of_layer),
+            Some(&group_specs),
+            1,
+            16,
+            1,
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("mamba layer group 0 requires page_bytes"),
+            "expected mamba page_bytes error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_layer_groups_reject_length_mismatch() {
+        let group_of_layer = vec![0, 0];
+        let group_specs = vec![(false, None)];
+        let err = build_layer_groups(
+            Some(&group_of_layer),
+            Some(&group_specs),
+            7,
+            16,
+            1,
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("2 entries but 7 tensors were registered"),
+            "expected length-mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_layer_groups_reject_unknown_group_id() {
+        let group_of_layer = vec![0, 5];
+        let group_specs = vec![(false, None)];
+        let err = build_layer_groups(
+            Some(&group_of_layer),
+            Some(&group_specs),
+            2,
+            16,
+            1,
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("group id 5 but only 1 groups"),
+            "expected unknown-group error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_layer_groups_attention_uses_explicit_dims_when_given() {
+        // MLA-style registration: explicit outer/inner dims are stored on
+        // the attention group (derive_group_geometry consumes them via
+        // the config-level explicit pair).
+        let group_of_layer = vec![0, 0];
+        let group_specs = vec![(false, None)];
+        let groups = build_layer_groups(
+            Some(&group_of_layer),
+            Some(&group_specs),
+            2,
+            16,
+            2,
+            Some(1),
+            Some(576),
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].outer_dim, 1);
+        assert_eq!(groups[0].inner_dim, 576);
+        assert_eq!(groups[0].dtype_width_bytes, 2);
+        assert_eq!(groups[0].bytes_per_block(), 2 * 16 * 576 * 2);
+    }
 }

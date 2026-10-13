@@ -172,7 +172,7 @@ class DynamoConnector(KVConnectorBase_V1, SupportsHMA):
     @nvtx_annotate(category="worker")
     @override
     def wait_for_save(self):
-        pass
+        self._worker.wait_for_save()
 
     def get_finished(
         self, finished_req_ids: set[str]
