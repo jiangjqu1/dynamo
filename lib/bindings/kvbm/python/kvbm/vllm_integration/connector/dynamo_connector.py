@@ -105,14 +105,16 @@ class DynamoConnector(KVConnectorBase_V1, SupportsHMA):
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
-        """HMA multi-group finish. Groups share one block index (verified on
-        the fp4: per-group lists are identical; group 0 is authoritative).
-        Delegating preserves the leader's finish bookkeeping (slots become
-        matchable for onboarding) — we return False so vLLM frees the device
-        blocks, matching the attention-only contract where offload is a copy
-        that never holds blocks. If per-group lists ever diverge, the
-        HMA-PROBE log in connector_leader.py will show it and the slot
-        machinery must switch to per-group block-id mapping."""
+        """HMA multi-group finish. Groups share one block index per the
+        multi-group pool design (assumption — the HMA-PROBE log in
+        connector_leader.py is verifying it live on the fp4; group 0 is
+        authoritative pending its verdict). Delegating preserves the leader's
+        finish bookkeeping (slots become matchable for onboarding) — the
+        leader's answer passes through (False today — offload is a copy that
+        never holds blocks — so vLLM frees the device blocks), matching the
+        attention-only contract. If per-group lists ever diverge, the
+        HMA-PROBE log will show it and the slot machinery must switch to
+        per-group block-id mapping."""
         if len(block_ids) >= 1:
             return self.request_finished(request, block_ids[0])
         return False, None
