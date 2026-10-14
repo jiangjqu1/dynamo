@@ -1623,9 +1623,10 @@ mod layer_group_tests {
 
     #[test]
     fn group_geometry_mamba_and_attention() {
-        // attention group: 4 layers, K/V outer=2, page 784 tokens, inner 512, fp8(1B)
+        // attention group: 4 layers, K/V outer=2, page 784 tokens, inner 512,
+        // fp8 (dtype factor 1, folded)
         let attn = LayerGroup::attention(4, 784, 2, 512, 1);
-        assert_eq!(attn.bytes_per_block(), 4 * 2 * 784 * 512 * 1);
+        assert_eq!(attn.bytes_per_block(), 4 * 2 * 784 * 512);
         // mamba group: 24 layers, dense int8 [B, C] rows, C = 3_207_168
         let mamba = LayerGroup::mamba(24, 3_207_168);
         assert_eq!(mamba.bytes_per_block(), 24 * 3_207_168);
@@ -1640,7 +1641,7 @@ mod layer_group_tests {
 
     #[test]
     fn total_bytes_per_block_sums_groups() {
-        let groups = vec![
+        let groups = [
             LayerGroup::attention(4, 784, 2, 512, 1),
             LayerGroup::mamba(24, 3_207_168),
         ];
@@ -2071,5 +2072,917 @@ mod layer_group_tests {
         // attribute, not here).
         assert!(validate_page_size(512).is_ok());
         assert!(validate_page_size(1024).is_ok());
+    }
+}
+
+/// GPU-gated two-group (hybrid attention/mamba) offload/onboard roundtrip
+/// tests — the proof tests for the KVBM multi-group plan. Requires a real
+/// CUDA device plus the `testing-cuda` feature, exactly like the devbar
+/// roundtrip tests (61ffb0ab0 / 802e44153); a no-GPU machine fails at
+/// cudarc/context setup, so the CPU suite never runs these.
+///
+/// What is proven, per executor path, at the pool/executor level (the full
+/// connector + leader/worker handshake stays with the e2e):
+/// - per-group uniform pools sharing one block index (`16+g` / `32+g` sets),
+///   built through `perform_allocation_and_build_handler`'s exact wiring
+///   (the real-path construction test calls that function itself),
+/// - group-tagged `BlockTransferRequest`s moving ONLY the addressed group's
+///   pools, with byte-equality per group (no cross-group bleed, no
+///   uniform-size truncation — the two groups' per-block bytes differ by
+///   one 512-B quantum on purpose),
+/// - Task 4's allocator partitioning: per-group host windows carved
+///   sequentially (attention region first, mamba second) out of ONE
+///   `DevbarAllocator`, verified straight from a file-backed Bar region,
+/// - Task 5 end-to-end: the per-geometry kernel-dims cache (pinned-host
+///   custom-kernel run) and the per-layer staged segment plans (staged runs).
+///
+/// Host-tier semantics coverage: StagedCpu (the raw-MMIO default) against a
+/// mock window and against a file-backed Bar region; HostPointer (pinned
+/// fallback) through the custom kernel. DirectIo needs the IOMEMORY
+/// registration — root plus a real BAR aperture (the existing direct-io
+/// roundtrip test's guard, mirrored by `..._real_bar` below); there is no
+/// mock-window io-mapping path (io mappings only exist when the
+/// registration ran), so the node run-script skips that test by name.
+///
+/// The logical transfer counters are NOT observable at this layer — they
+/// live in the slot/manager machinery above (`metrics_kvbm`), covered by
+/// the manager-level e2e — so they are intentionally not asserted here.
+///
+/// The ENV_LOCK guard is deliberately held across `.await`s in the async
+/// tests: `#[tokio::test]` runs a CURRENT-THREAD runtime, so no other task
+/// can interleave while it is held (no deadlock, no lost wakeup), and the
+/// devbar env must stay pinned for the whole construction-and-run window.
+#[cfg(all(test, feature = "testing-cuda"))]
+#[allow(clippy::await_holding_lock)]
+mod two_group_tests {
+    use super::*;
+    use crate::block_manager::block::{
+        BasicMetadata, BlockDataExt, BlockDataProvider, BlockDataProviderMut,
+        data::local::LocalBlockData, transfer::HostTransferSemantics,
+    };
+    use crate::block_manager::storage::DevbarStorage;
+    use crate::block_manager::storage::torch::TorchDevice;
+    use cudarc::driver::sys;
+    use dynamo_runtime::config::environment_names::kvbm::devbar as env_devbar;
+    use std::any::Any;
+    use tokio_util::sync::CancellationToken;
+
+    // The fp4's real shape, scaled down to node-window-sized allocations
+    // (the controller's GPU window is ~hundreds of MiB; the fp4's 3 MB
+    // rows would be reckless here). Two fake layers per group, 64 blocks.
+    //
+    // Attention group: 2 layers of 4D [B, outer=2, heads=16, dim=64] fp16
+    // tensors — page 64 tokens × inner 16 elements × 2 bytes × 2 outer =
+    // 4,096 bytes per layer-block, 8,192 bytes per block.
+    const NUM_DEVICE_BLOCKS: usize = 64;
+    const ATTN_LAYERS: usize = 2;
+    const ATTN_PAGE_TOKENS: usize = 64;
+    const ATTN_OUTER: usize = 2;
+    const ATTN_INNER: usize = 16;
+    const ATTN_DTYPE_BYTES: usize = 2;
+    const ATTN_LAYER_BLOCK_BYTES: usize =
+        ATTN_OUTER * ATTN_PAGE_TOKENS * ATTN_INNER * ATTN_DTYPE_BYTES; // 4,096
+    const ATTN_BYTES_PER_BLOCK: usize = ATTN_LAYERS * ATTN_LAYER_BLOCK_BYTES; // 8,192
+
+    // Mamba group: 2 layers of 2D [B, C] uint8 rows with C exactly one
+    // 512-B quantum below the attention per-layer bytes — the fp4's
+    // 4096-quantum-off ratio (3,211,264 vs 3,207,168), scaled 8:1.
+    const MAMBA_LAYERS: usize = 2;
+    const MAMBA_C: usize = ATTN_LAYER_BLOCK_BYTES - 512; // 3,584 (16-aligned)
+    const MAMBA_BYTES_PER_BLOCK: usize = MAMBA_LAYERS * MAMBA_C; // 7,168
+
+    const BYTES_PER_BLOCK_PER_GROUP: [usize; 2] = [ATTN_BYTES_PER_BLOCK, MAMBA_BYTES_PER_BLOCK];
+
+    const NUM_HOST_BLOCKS: usize = NUM_DEVICE_BLOCKS;
+    /// The real-BAR direct-io run keeps its host windows small: the expander
+    /// stand-in's aperture size is not guaranteed beyond the 64 KiB the
+    /// existing direct-io roundtrip test carves.
+    const NUM_HOST_BLOCKS_REAL_BAR: usize = 8;
+    /// Backing file for the shared-aperture test: both groups' page-rounded
+    /// windows plus a zero tail that must stay untouched.
+    const APERTURE_FILE_BYTES: usize = 2 * 1024 * 1024;
+
+    /// Block ids moved by every scenario: K, plus its neighbor to catch
+    /// off-by-one indexing between the two groups' pools.
+    const MOVED_BLOCK_IDS: [usize; 2] = [5, 6];
+
+    /// Serializes this module's devbar env mutations and the reads they can
+    /// race (mirrors the devbar tests' ENV_LOCK; the two locks cannot see
+    /// each other, so a full parallel `testing-cuda` suite may still flake
+    /// across modules — the canonical invocation filters `two_group`).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A fake per-layer CUDA tensor: the e2e MockTensor pattern, made
+    /// dtype-aware. The device allocation is `ManuallyDrop`'d — the CUDA
+    /// memory lives until process exit, exactly like the existing e2e's
+    /// tensors.
+    #[derive(Debug, Clone)]
+    struct FakeLayerTensor {
+        ptr: u64,
+        size: usize,
+        shape: Vec<usize>,
+    }
+
+    impl FakeLayerTensor {
+        fn new(shape: Vec<usize>, elem_width_bytes: usize) -> Self {
+            let allocator = DeviceAllocator::new(0).expect("cuda device 0");
+            let size = shape.iter().product::<usize>() * elem_width_bytes;
+            let device_storage = std::mem::ManuallyDrop::new(
+                allocator
+                    .allocate(size)
+                    .expect("fake layer tensor allocation"),
+            );
+            Self {
+                ptr: device_storage.addr(),
+                size,
+                shape,
+            }
+        }
+    }
+
+    impl TorchTensor for FakeLayerTensor {
+        fn device(&self) -> TorchDevice {
+            TorchDevice::Cuda(0)
+        }
+
+        fn data_ptr(&self) -> u64 {
+            self.ptr
+        }
+
+        fn size_bytes(&self) -> usize {
+            self.size
+        }
+
+        fn shape(&self) -> Vec<usize> {
+            self.shape.clone()
+        }
+
+        fn stride(&self) -> Vec<usize> {
+            // Contiguous strides.
+            let mut stride = vec![1];
+            for i in (0..self.shape.len() - 1).rev() {
+                stride.push(stride.last().unwrap() * self.shape[i]);
+            }
+            stride.reverse();
+            stride
+        }
+    }
+
+    /// Registration order [attn0, attn1, mamba0, mamba1]; the groups
+    /// partition it as [0,1] and [2,3]. The attention tensors are 4D
+    /// [B, outer=2, heads=16, dim=64] fp16 with heads×dim = page×inner
+    /// elements; the mamba tensors are 2D [B, C] uint8 rows.
+    fn fake_layer_tensors() -> Vec<Arc<dyn TorchTensor>> {
+        let attention_shape = vec![NUM_DEVICE_BLOCKS, ATTN_OUTER, 16, 64];
+        let mamba_shape = vec![NUM_DEVICE_BLOCKS, MAMBA_C];
+        vec![
+            Arc::new(FakeLayerTensor::new(
+                attention_shape.clone(),
+                ATTN_DTYPE_BYTES,
+            )),
+            Arc::new(FakeLayerTensor::new(attention_shape, ATTN_DTYPE_BYTES)),
+            Arc::new(FakeLayerTensor::new(mamba_shape.clone(), 1)),
+            Arc::new(FakeLayerTensor::new(mamba_shape, 1)),
+        ]
+    }
+
+    /// The 2-group KvbmWorkerConfig mirroring the fp4's hybrid shape:
+    /// one attention group + one mamba group over the fake layer tensors.
+    fn two_group_config() -> KvbmWorkerConfig {
+        let mut attention = LayerGroup::attention(
+            ATTN_LAYERS,
+            ATTN_PAGE_TOKENS,
+            ATTN_OUTER,
+            ATTN_INNER,
+            ATTN_DTYPE_BYTES,
+        );
+        attention.tensor_indices = vec![0, 1];
+        let mut mamba = LayerGroup::mamba(MAMBA_LAYERS, MAMBA_C);
+        mamba.tensor_indices = vec![2, 3];
+        KvbmWorkerConfig::builder()
+            .cancel_token(CancellationToken::new())
+            .num_device_blocks(NUM_DEVICE_BLOCKS)
+            .tensors(fake_layer_tensors())
+            .device_id(0)
+            .outer_dim(Some(ATTN_OUTER))
+            .inner_dim(Some(ATTN_INNER))
+            .groups(vec![attention, mamba])
+            .build()
+            .expect("two-group config builds")
+    }
+
+    /// `KvbmWorker::new`'s grouped arm, verbatim: the >=3-dim attention
+    /// guard, per-group geometry derivation, and per-group DEVICE layouts
+    /// over each group's own tensor subset.
+    fn build_two_group_specs(
+        config: &KvbmWorkerConfig,
+    ) -> anyhow::Result<(Vec<GroupLayoutSpec>, HandshakeGeometry)> {
+        let (device_tensors, _shape) =
+            load_and_validate_tensors(&config.tensors, config.device_id, &config.groups)?;
+
+        for (group_idx, group) in config.groups.iter().enumerate() {
+            if group.is_mamba() {
+                continue;
+            }
+            let tensor_shape = config.tensors[group.tensor_indices[0]].shape();
+            anyhow::ensure!(
+                tensor_shape.len() >= 3,
+                "Unsupported kv cache layout for attention layer group {}: got shape {:?} (needs >= 3 dims)",
+                group_idx,
+                tensor_shape
+            );
+        }
+
+        let geometries: Vec<GroupGeometry> = config
+            .groups
+            .iter()
+            .map(|group| {
+                derive_group_geometry(group, &config.tensors, (config.outer_dim, config.inner_dim))
+            })
+            .collect();
+        let bytes_per_block = geometries
+            .iter()
+            .map(|geometry| geometry.bytes_per_block)
+            .sum();
+        let bytes_per_block_per_group: Vec<usize> = geometries
+            .iter()
+            .map(|geometry| geometry.bytes_per_block)
+            .collect();
+
+        let mut remaining: Vec<Option<DeviceStorage>> =
+            device_tensors.into_iter().map(Some).collect();
+        let mut group_layouts = Vec::with_capacity(geometries.len());
+        for (group_idx, (group, geometry)) in config.groups.iter().zip(&geometries).enumerate() {
+            let mut subset = Vec::with_capacity(group.tensor_indices.len());
+            for &i in &group.tensor_indices {
+                let Some(storage) = remaining[i].take() else {
+                    anyhow::bail!(
+                        "layer group {group_idx}: tensor index {i} already consumed by an earlier group (groups must partition the tensor list)"
+                    );
+                };
+                subset.push(storage);
+            }
+            let mut builder = LayoutConfigBuilder::default();
+            let builder = builder
+                .num_layers(geometry.num_layers)
+                .outer_dim(geometry.outer_dim)
+                .page_size(geometry.page_size)
+                .inner_dim(geometry.inner_dim)
+                .dtype_width_bytes(geometry.dtype_width_bytes);
+            let device_layout = builder
+                .num_blocks(config.num_device_blocks)
+                .build()?
+                .create_layout(geometry.layout_type, subset)
+                .map_err(|e| anyhow::anyhow!("device layout for layer group {group_idx}: {e}"))?;
+            group_layouts.push(GroupLayoutSpec {
+                geometry: *geometry,
+                device_layout,
+            });
+        }
+
+        Ok((
+            group_layouts,
+            HandshakeGeometry {
+                bytes_per_block,
+                bytes_per_block_per_group,
+            },
+        ))
+    }
+
+    /// Per-group pools + the handler driving them, plus retained views over
+    /// the same pool-owned memory (the handler is opaque by design; these
+    /// clones use the handler's own extraction so the test can stamp and
+    /// verify what the executor moves).
+    struct TwoGroupPools {
+        handler: BlockTransferHandler,
+        device_data: Vec<Vec<LocalBlockData<DeviceStorage>>>,
+        host_data: Vec<Vec<LocalBlockData<DevbarStorage>>>,
+        /// The per-window io mappings wired into the context (non-empty only
+        /// when the backing is a registered BAR window).
+        io_mappings: Vec<(usize, u64, usize)>,
+    }
+
+    type LocalBlockList<S> = Vec<Block<S, locality::Local, BasicMetadata>>;
+
+    /// `perform_allocation_and_build_handler`'s wiring, verbatim except:
+    /// the host allocator is injected (the real fn takes it from `from_env`),
+    /// there is no disk tier, and `LocalBlockData` clones are retained so
+    /// the test can observe pool contents. Per-group pools are allocated
+    /// sequentially from the ONE shared allocator — the Bar carve order the
+    /// shared-aperture test asserts.
+    async fn build_two_group_pools(
+        config: &KvbmWorkerConfig,
+        host_allocator: Arc<DevbarAllocator>,
+        semantics: HostTransferSemantics,
+        num_host_blocks: usize,
+    ) -> anyhow::Result<TwoGroupPools> {
+        config.validate()?;
+        let (group_layouts, _geometry) = build_two_group_specs(config)?;
+        let num_groups = group_layouts.len();
+        assert_eq!(num_groups, 2, "the two-group scenario needs two groups");
+
+        let agent = build_agent(0, false)?;
+        let pool_config = PoolConfig {
+            enable_pool: true,
+            max_concurrent_transfers: max_concurrent_transfers(),
+            max_transfer_batch_size: max_transfer_batch_size(),
+            num_outer_components: group_layouts
+                .iter()
+                .map(|spec| spec.geometry.outer_dim)
+                .max()
+                .unwrap_or(1),
+            num_layers: group_layouts
+                .iter()
+                .map(|spec| spec.geometry.num_layers)
+                .max()
+                .unwrap_or(1),
+        };
+        // Bind the primary context before anything allocates pinned memory
+        // (the PinnedStorage SAFETY contract) and before the test's own
+        // cuMemcpy calls.
+        DeviceAllocator::new(0)?.ctx().bind_to_thread()?;
+        let mut transfer_context = TransferContext::new(
+            Arc::new(Some(agent)),
+            DeviceAllocator::new(0)?.ctx().new_stream()?,
+            Handle::current(),
+            Some(pool_config),
+        )
+        .map_err(|e| anyhow::anyhow!("transfer context: {e}"))?;
+        transfer_context.set_host_transfer_semantics(semantics);
+        let transfer_context = Arc::new(transfer_context);
+
+        let mut device_blocks: Vec<Option<LocalBlockList<DeviceStorage>>> =
+            Vec::with_capacity(num_groups);
+        let mut host_blocks: Vec<Option<LocalBlockList<DevbarStorage>>> =
+            Vec::with_capacity(num_groups);
+        let mut host_io_mappings: Vec<(usize, u64, usize)> = Vec::new();
+
+        for (group_idx, spec) in group_layouts.into_iter().enumerate() {
+            let GroupLayoutSpec {
+                geometry,
+                device_layout,
+            } = spec;
+
+            let device_set = 16 + group_idx;
+            device_blocks.push(Some(KvbmWorker::make_layout::<_, BasicMetadata>(
+                device_layout,
+                transfer_context.nixl_agent().as_ref(),
+                device_set,
+                0,
+            )?));
+
+            let host_alloc_wire = Arc::clone(&host_allocator);
+            let host_layout = tier_layout_builder(&geometry, num_host_blocks)
+                .build()?
+                .allocate_layout(LayoutType::FullyContiguous, host_alloc_wire)
+                .map_err(|e| anyhow::anyhow!("host layout for layer group {group_idx}: {e}"))?;
+            if let Some(mapping) = host_allocator.io_mapping() {
+                host_io_mappings.push(mapping);
+            }
+            let host_set = 32 + group_idx;
+            host_blocks.push(Some(KvbmWorker::make_layout::<_, BasicMetadata>(
+                host_layout,
+                transfer_context.nixl_agent().as_ref(),
+                host_set,
+                0,
+            )?));
+        }
+
+        if !host_io_mappings.is_empty() {
+            transfer_context.set_host_tier_io_mappings(host_io_mappings.clone());
+        }
+
+        let device_data: Vec<Vec<LocalBlockData<DeviceStorage>>> = device_blocks
+            .iter()
+            .map(|blocks| local_data_clone(blocks.as_ref().expect("device pool")))
+            .collect();
+        let host_data: Vec<Vec<LocalBlockData<DevbarStorage>>> = host_blocks
+            .iter()
+            .map(|blocks| local_data_clone(blocks.as_ref().expect("host pool")))
+            .collect();
+        let disk_blocks: Vec<Option<LocalBlockList<DiskStorage>>> =
+            (0..num_groups).map(|_| None).collect();
+
+        let handler = BlockTransferHandler::new(
+            device_blocks,
+            host_blocks,
+            disk_blocks,
+            transfer_context,
+            None,
+            transfer::NcclConfig::disabled(),
+        )?;
+        Ok(TwoGroupPools {
+            handler,
+            device_data,
+            host_data,
+            io_mappings: host_io_mappings,
+        })
+    }
+
+    /// The handler's own `LocalBlockData` extraction (transfer.rs's
+    /// `get_local_data`), kept by the test as its observation handle over the
+    /// pool-owned memory.
+    fn local_data_clone<S: Storage>(
+        blocks: &[Block<S, locality::Local, BasicMetadata>],
+    ) -> Vec<LocalBlockData<S>> {
+        blocks
+            .iter()
+            .map(|b| {
+                let data = b.block_data() as &dyn Any;
+                data.downcast_ref::<LocalBlockData<S>>()
+                    .expect("local block data")
+                    .clone()
+            })
+            .collect()
+    }
+
+    /// The stamped byte at one image position: group-distinct complements
+    /// (0x3C/0xC3 first stamp, 0x5A/0xA5 second) mean a byte of one group's
+    /// pattern never equals the other group's at the same index, so
+    /// cross-group bleed fails the first compared byte.
+    fn pattern_byte(second_stamp: bool, group: usize, block: usize, seg: usize, byte: usize) -> u8 {
+        let base: u8 = if second_stamp {
+            [0x5A, 0xA5][group]
+        } else {
+            [0x3C, 0xC3][group]
+        };
+        base ^ (block as u8) ^ ((seg as u8) << 5) ^ (byte as u8)
+    }
+
+    /// The expected whole-block image: the per-`(layer, outer)` segments in
+    /// layer-major-then-outer order — the walk order every executor (custom
+    /// kernel, staged bounce, direct-io segments) copies in, and the order a
+    /// `FullyContiguous` window interleaves regions at.
+    fn expected_block_image<S: Storage>(
+        data: &LocalBlockData<S>,
+        group: usize,
+        block: usize,
+        second_stamp: bool,
+    ) -> Vec<u8> {
+        let mut image = Vec::new();
+        let mut seg = 0usize;
+        let block_data = data.block_data();
+        for layer_idx in 0..block_data.num_layers() {
+            for outer_idx in 0..block_data.num_outer_dims() {
+                let size = block_data
+                    .layer_view(layer_idx, outer_idx)
+                    .expect("layer view")
+                    .size();
+                image.extend((0..size).map(|i| pattern_byte(second_stamp, group, block, seg, i)));
+                seg += 1;
+            }
+        }
+        image
+    }
+
+    /// Stamp a pattern into one device block via per-segment H2D memcpys
+    /// (device pool memory is only writable through the driver).
+    fn stamp_device_block(
+        data: &mut LocalBlockData<DeviceStorage>,
+        group: usize,
+        block: usize,
+        second_stamp: bool,
+    ) {
+        let mut seg = 0usize;
+        let block_data = data.block_data_mut();
+        let num_layers = block_data.num_layers();
+        let num_outer = block_data.num_outer_dims();
+        for layer_idx in 0..num_layers {
+            for outer_idx in 0..num_outer {
+                let mut view = block_data
+                    .layer_view_mut(layer_idx, outer_idx)
+                    .expect("device layer view");
+                let size = view.size();
+                let pattern: Vec<u8> = (0..size)
+                    .map(|i| pattern_byte(second_stamp, group, block, seg, i))
+                    .collect();
+                // SAFETY: the view covers `size` writable device bytes owned
+                // by the pool layout; the pattern buffer outlives the
+                // (synchronous) copy.
+                unsafe {
+                    assert_eq!(
+                        sys::cuMemcpyHtoD_v2(
+                            view.as_mut_ptr() as u64,
+                            pattern.as_ptr() as *const core::ffi::c_void,
+                            size
+                        ),
+                        sys::CUresult::CUDA_SUCCESS,
+                        "stamp H2D"
+                    );
+                }
+                seg += 1;
+            }
+        }
+    }
+
+    /// Read one device block's whole image back via per-segment D2H memcpys.
+    fn read_device_block_image(data: &LocalBlockData<DeviceStorage>) -> Vec<u8> {
+        let mut image = Vec::new();
+        let block_data = data.block_data();
+        for layer_idx in 0..block_data.num_layers() {
+            for outer_idx in 0..block_data.num_outer_dims() {
+                let view = block_data
+                    .layer_view(layer_idx, outer_idx)
+                    .expect("device layer view");
+                let size = view.size();
+                let mut buf = vec![0u8; size];
+                // SAFETY: the view covers `size` readable device bytes owned
+                // by the pool layout; `buf` outlives the (synchronous) copy.
+                unsafe {
+                    assert_eq!(
+                        sys::cuMemcpyDtoH_v2(
+                            buf.as_mut_ptr() as *mut core::ffi::c_void,
+                            view.as_ptr() as u64,
+                            size
+                        ),
+                        sys::CUresult::CUDA_SUCCESS,
+                        "probe D2H"
+                    );
+                }
+                image.extend_from_slice(&buf);
+            }
+        }
+        image
+    }
+
+    /// Read one host-tier block's whole image via CPU. Every backing under
+    /// test is host-accessible — mock mapping, file-backed BAR window,
+    /// pinned, and the real BAR window (its CPU read-back matches the
+    /// existing direct-io roundtrip test's host-VA read; the transfers
+    /// themselves always go through the registered executor paths).
+    fn read_host_block_image(data: &LocalBlockData<DevbarStorage>) -> Vec<u8> {
+        let mut image = Vec::new();
+        let block_data = data.block_data();
+        for layer_idx in 0..block_data.num_layers() {
+            for outer_idx in 0..block_data.num_outer_dims() {
+                let view = block_data
+                    .layer_view(layer_idx, outer_idx)
+                    .expect("host layer view");
+                let size = view.size();
+                // SAFETY: the view covers `size` readable bytes of
+                // host-accessible pool memory that outlives this read.
+                let buf = unsafe { std::slice::from_raw_parts(view.as_ptr(), size) };
+                image.extend_from_slice(buf);
+            }
+        }
+        image
+    }
+
+    /// One group-tagged request moving `MOVED_BLOCK_IDS` between two pool
+    /// tiers at identical block ids — the request shape the leader's
+    /// per-group fan-out produces.
+    fn group_request(
+        from_pool: BlockTransferPool,
+        to_pool: BlockTransferPool,
+        group: usize,
+    ) -> BlockTransferRequest {
+        BlockTransferRequest {
+            from_pool,
+            to_pool,
+            blocks: MOVED_BLOCK_IDS.iter().map(|&b| (b, b)).collect(),
+            group,
+            connector_req: None,
+        }
+    }
+
+    /// Scenario half 1: stamp group-distinct patterns into each group's
+    /// device blocks, offload per-group (group 0's request then group 1's —
+    /// the ordering that historically froze one geometry in the process-wide
+    /// dims cache), and assert the host tier received each group's bytes:
+    /// per-group byte counts, byte-equality per group, no cross-group bleed.
+    /// Returns false when the run soft-skipped on an unloadable fatbin —
+    /// the caller must skip the onboard half too (the host tier was never
+    /// filled, and the kernel would fail that half the same way).
+    async fn offload_and_assert_host(
+        pools: &TwoGroupPools,
+        skip_if_kernel_unloadable: bool,
+    ) -> bool {
+        for (group, blocks) in pools.device_data.iter().enumerate() {
+            for block in MOVED_BLOCK_IDS {
+                // A probe clone's views address the same pool-owned memory;
+                // `stamp_device_block` needs the mutable view handle.
+                let mut data = blocks[block].clone();
+                stamp_device_block(&mut data, group, block, false);
+            }
+        }
+        // The stamps landed (guards the stamping helper itself).
+        for (group, blocks) in pools.device_data.iter().enumerate() {
+            for block in MOVED_BLOCK_IDS {
+                assert_eq!(
+                    read_device_block_image(&blocks[block]),
+                    expected_block_image(&blocks[block], group, block, false),
+                    "stamp verification, group {group} block {block}"
+                );
+            }
+        }
+
+        for group in 0..pools.device_data.len() {
+            let request = group_request(BlockTransferPool::Device, BlockTransferPool::Host, group);
+            match pools.handler.execute_transfer(request).await {
+                Ok(()) => {}
+                Err(e) if skip_if_kernel_unloadable && e.to_string().contains("FATBIN") => {
+                    // The committed vectorized_copy fatbin is sm_100-only;
+                    // on other GPUs the custom kernel cannot load. This is
+                    // an environment gap, not a code failure — soft-skip
+                    // (build a compatible fatbin and set DYN_FATBIN_PATH to
+                    // activate the full proof on this GPU).
+                    eprintln!(
+                        "two_group custom-kernel run: SKIPPED (no loadable vectorized_copy \
+                         fatbin for this GPU; build one and set DYN_FATBIN_PATH)"
+                    );
+                    return false;
+                }
+                Err(e) => panic!("two-group offload (group {group}) failed: {e:#}"),
+            }
+        }
+
+        for (group, blocks) in pools.host_data.iter().enumerate() {
+            for block in MOVED_BLOCK_IDS {
+                let host = read_host_block_image(&blocks[block]);
+                assert_eq!(
+                    host.len(),
+                    BYTES_PER_BLOCK_PER_GROUP[group],
+                    "per-group byte count moved, group {group}"
+                );
+                assert_eq!(
+                    host,
+                    expected_block_image(&pools.device_data[group][block], group, block, false),
+                    "host tier content after offload, group {group} block {block} \
+                     (expected this group's own pattern — no cross-group bleed, no \
+                     uniform-size truncation)"
+                );
+            }
+        }
+
+        true
+    }
+
+    /// Scenario half 2: overwrite the device blocks with a second,
+    /// distinct pattern, prove the overwrite took, onboard per-group, and
+    /// assert each group's ORIGINAL pattern is restored byte-exactly.
+    async fn overwrite_onboard_and_assert(pools: &TwoGroupPools) {
+        for (group, blocks) in pools.device_data.iter().enumerate() {
+            for block in MOVED_BLOCK_IDS {
+                let mut data = blocks[block].clone();
+                stamp_device_block(&mut data, group, block, true);
+            }
+        }
+        // The overwrite took — the onboard below must visibly replace it.
+        for (group, blocks) in pools.device_data.iter().enumerate() {
+            for block in MOVED_BLOCK_IDS {
+                assert_eq!(
+                    read_device_block_image(&blocks[block]),
+                    expected_block_image(&blocks[block], group, block, true),
+                    "overwrite verification, group {group} block {block}"
+                );
+            }
+        }
+
+        for group in 0..pools.device_data.len() {
+            pools
+                .handler
+                .execute_transfer(group_request(
+                    BlockTransferPool::Host,
+                    BlockTransferPool::Device,
+                    group,
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("two-group onboard (group {group}) failed: {e:#}"));
+        }
+
+        for (group, blocks) in pools.device_data.iter().enumerate() {
+            for block in MOVED_BLOCK_IDS {
+                assert_eq!(
+                    read_device_block_image(&blocks[block]),
+                    expected_block_image(&blocks[block], group, block, false),
+                    "device tier content after onboard, group {group} block {block} \
+                     (expected the group's original pattern restored exactly)"
+                );
+            }
+        }
+    }
+
+    /// The full offload/onboard scenario, skipping the onboard half when
+    /// the offload soft-skipped (an unloadable kernel fails both halves the
+    /// same way, and the host tier was never filled).
+    async fn run_offload_onboard_scenario(pools: &TwoGroupPools, skip_if_kernel_unloadable: bool) {
+        if !offload_and_assert_host(pools, skip_if_kernel_unloadable).await {
+            return;
+        }
+        overwrite_onboard_and_assert(pools).await;
+    }
+
+    /// The REAL construction path: `perform_allocation_and_build_handler`
+    /// with a 2-group `KvbmWorkerConfig` under the mock devbar env — proves
+    /// the production allocation code builds per-group pools (layouts, NIXL
+    /// registration, block-set ids, sequential mock windows) and returns a
+    /// working handler. Content is proven by the sibling tests, which keep
+    /// observation handles this path cannot hand out (the handler is
+    /// opaque).
+    #[tokio::test]
+    async fn two_group_real_path_handler_construction() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: devbar env vars are only read by devbar code and the
+        // sibling tests sharing ENV_LOCK.
+        unsafe {
+            std::env::remove_var(env_devbar::DYN_KVBM_DEVBAR_VMM);
+            std::env::remove_var(env_devbar::DYN_KVBM_DEVBAR_BDF);
+            std::env::remove_var(env_devbar::DYN_KVBM_DEVBAR_RESOURCE_INDEX);
+            std::env::remove_var(env_devbar::DYN_KVBM_DEVBAR_TRANSFERS);
+            std::env::remove_var(env_devbar::DYN_KVBM_DEVBAR_MEM_TYPE);
+            std::env::set_var(env_devbar::DYN_KVBM_DEVBAR_MOCK, "1");
+        }
+
+        let config = two_group_config();
+        let (group_layouts, geometry) =
+            build_two_group_specs(&config).expect("two-group specs derive");
+        assert_eq!(geometry.bytes_per_block, 15_360);
+        assert_eq!(geometry.bytes_per_block_per_group, vec![8_192, 7_168]);
+
+        let handler = perform_allocation_and_build_handler(
+            group_layouts,
+            config,
+            LeaderMetadata {
+                num_host_blocks: NUM_HOST_BLOCKS,
+                num_disk_blocks: 0,
+            },
+            0,
+            0,
+            None,
+        )
+        .await
+        .expect("2-group handler via the real allocation path (mock env; no privileges needed)");
+        drop(handler);
+
+        unsafe { std::env::remove_var(env_devbar::DYN_KVBM_DEVBAR_MOCK) };
+    }
+
+    /// MOCK backing + the staged (`StagedCpu`) semantics: the whole
+    /// offload/onboard scenario runs through the staged executor's legs —
+    /// CPU window->bounce, DMA bounce->device, DMA device->bounce, CPU
+    /// bounce->window — against a host-RAM window: 61ffb0ab0's staged-shape
+    /// pattern elevated to the pool/executor level. The mock window is
+    /// pageable host memory, so GPU-side access would fault — exactly why
+    /// the mock backing only ever pairs with the staged legs here.
+    #[tokio::test]
+    async fn two_group_offload_onboard_roundtrip_staged_semantics() {
+        let config = two_group_config();
+        let pools = build_two_group_pools(
+            &config,
+            Arc::new(DevbarAllocator::mock(0)),
+            HostTransferSemantics::StagedCpu,
+            NUM_HOST_BLOCKS,
+        )
+        .await
+        .expect("two-group pools over the mock backing");
+        run_offload_onboard_scenario(&pools, false).await;
+    }
+
+    /// PINNED backing (the default host tier) + `HostPointer` semantics:
+    /// both directions resolve to the CUSTOM KERNEL (device pools are
+    /// LayerSeparate, never fully contiguous), so group 1's batch after
+    /// group 0's exercises the per-geometry kernel-dims cache end-to-end —
+    /// a frozen first-geometry cache would corrupt or fault group 1.
+    /// Soft-skips when the committed sm_100-only fatbin cannot load on the
+    /// local GPU (see `offload_and_assert_host`).
+    #[tokio::test]
+    async fn two_group_custom_kernel_roundtrip_pinned_host() {
+        let config = two_group_config();
+        let pools = build_two_group_pools(
+            &config,
+            Arc::new(DevbarAllocator::default()),
+            HostTransferSemantics::HostPointer,
+            NUM_HOST_BLOCKS,
+        )
+        .await
+        .expect("two-group pools over the pinned fallback");
+        run_offload_onboard_scenario(&pools, true).await;
+    }
+
+    /// File-backed Bar region + the staged semantics: real per-group
+    /// sequential aperture carving (disjoint page-rounded windows from ONE
+    /// `DevbarAllocator`) with zero privileges, with the backing file as
+    /// the assertion surface for Task 4's allocator partitioning —
+    /// attention region FIRST, mamba region SECOND, nothing past group 1's
+    /// window (a uniform-size truncation or a pre-cursor aliasing bug would
+    /// overwrite the wrong bytes and fail here).
+    #[tokio::test]
+    async fn two_group_aperture_partition_staged() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The staged semantics and the Dram NIXL registration both read the
+        // env; hold them stable for this test's construction (the real-bar
+        // test writes TRANSFERS under the same lock).
+        unsafe {
+            std::env::remove_var(env_devbar::DYN_KVBM_DEVBAR_TRANSFERS);
+            std::env::remove_var(env_devbar::DYN_KVBM_DEVBAR_MEM_TYPE);
+        }
+
+        let config = two_group_config();
+        let mut aperture = tempfile::NamedTempFile::new().expect("aperture file");
+        aperture
+            .as_file_mut()
+            .set_len(APERTURE_FILE_BYTES as u64)
+            .expect("size the aperture");
+
+        let allocator = Arc::new(DevbarAllocator::bar(aperture.path().to_path_buf(), 0, 0));
+        assert_eq!(
+            allocator.transfer_semantics(),
+            HostTransferSemantics::StagedCpu
+        );
+        let pools = build_two_group_pools(
+            &config,
+            allocator,
+            HostTransferSemantics::StagedCpu,
+            NUM_HOST_BLOCKS,
+        )
+        .await
+        .expect("two-group pools over a shared file-backed aperture");
+        assert!(pools.io_mappings.is_empty(), "no registration ran");
+
+        offload_and_assert_host(&pools, false).await;
+
+        // Task 4's partitioning, read straight from the backing file.
+        let file = std::fs::read(aperture.path()).expect("read the aperture file back");
+        assert_eq!(file.len(), APERTURE_FILE_BYTES);
+        let attention_window = NUM_HOST_BLOCKS * ATTN_BYTES_PER_BLOCK; // 524,288, page-multiple
+        let mamba_window = NUM_HOST_BLOCKS * MAMBA_BYTES_PER_BLOCK; // 458,752, page-multiple
+        let attention_offset = 0;
+        let mamba_offset = attention_offset + attention_window;
+        for block in MOVED_BLOCK_IDS {
+            let expected = expected_block_image(&pools.device_data[0][block], 0, block, false);
+            let start = attention_offset + block * ATTN_BYTES_PER_BLOCK;
+            assert_eq!(
+                &file[start..start + ATTN_BYTES_PER_BLOCK],
+                &expected[..],
+                "group 0's pattern in the ATTENTION region (carved first, offset {attention_offset})"
+            );
+            let expected = expected_block_image(&pools.device_data[1][block], 1, block, false);
+            let start = mamba_offset + block * MAMBA_BYTES_PER_BLOCK;
+            assert_eq!(
+                &file[start..start + MAMBA_BYTES_PER_BLOCK],
+                &expected[..],
+                "group 1's pattern in the MAMBA region (carved second, offset {mamba_offset})"
+            );
+        }
+        // Never-offloaded blocks stay zero, and nothing lands past group
+        // 1's window: an oversized (uniform-size) move would bleed past the
+        // mamba region into the tail.
+        let untouched_zero = |span: &[u8]| span.iter().all(|&b| b == 0);
+        assert!(
+            untouched_zero(&file[0..ATTN_BYTES_PER_BLOCK]),
+            "group 0's block 0 must be untouched"
+        );
+        assert!(
+            untouched_zero(&file[mamba_offset..mamba_offset + MAMBA_BYTES_PER_BLOCK]),
+            "group 1's block 0 must be untouched"
+        );
+        assert!(
+            untouched_zero(&file[mamba_offset + mamba_window..]),
+            "nothing may land past group 1's window"
+        );
+
+        overwrite_onboard_and_assert(&pools).await;
+    }
+
+    /// REAL BAR + `DirectIo` semantics: the IOMEMORY-registered windows'
+    /// device VAs, one registration per group's carved window (two io
+    /// mappings wired), with GPU-side memcpys pointer-translated per window.
+    /// REQUIRES root (the registration's documented non-privileged failure
+    /// is CUDA_ERROR_NOT_PERMITTED) plus the expander stand-in at
+    /// 0000:41:00.0 — the same guard the existing direct-io roundtrip test
+    /// uses; the node run-script skips this test by name (`--skip
+    /// real_bar`) because its window runs unprivileged.
+    #[tokio::test]
+    async fn two_group_direct_io_offload_onboard_roundtrip_real_bar() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var(env_devbar::DYN_KVBM_DEVBAR_MEM_TYPE);
+            std::env::set_var(env_devbar::DYN_KVBM_DEVBAR_TRANSFERS, "direct");
+        }
+
+        let config = two_group_config();
+        let bar_path = std::path::PathBuf::from("/sys/bus/pci/devices/0000:41:00.0/resource0");
+        let allocator = Arc::new(DevbarAllocator::bar(bar_path, 0, 0));
+        assert_eq!(
+            allocator.transfer_semantics(),
+            HostTransferSemantics::DirectIo
+        );
+        let pools = build_two_group_pools(
+            &config,
+            allocator,
+            HostTransferSemantics::DirectIo,
+            NUM_HOST_BLOCKS_REAL_BAR,
+        )
+        .await
+        .expect("direct alloc (root + the expander stand-in needed)");
+        assert_eq!(
+            pools.io_mappings.len(),
+            2,
+            "each group's window must carry its own io mapping"
+        );
+
+        run_offload_onboard_scenario(&pools, false).await;
+
+        unsafe { std::env::remove_var(env_devbar::DYN_KVBM_DEVBAR_TRANSFERS) };
     }
 }
