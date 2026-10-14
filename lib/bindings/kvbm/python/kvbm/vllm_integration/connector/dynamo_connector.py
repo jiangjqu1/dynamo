@@ -59,7 +59,9 @@ class DynamoConnector(KVConnectorBase_V1, SupportsHMA):
 
         if role == KVConnectorRole.SCHEDULER:
             self._scheduler = KvConnectorLeader(
-                vllm_config=vllm_config, engine_id=self.engine_id
+                vllm_config=vllm_config,
+                engine_id=self.engine_id,
+                kv_cache_config=kv_cache_config,
             )
             self._worker = None
         elif role == KVConnectorRole.WORKER:
@@ -107,17 +109,26 @@ class DynamoConnector(KVConnectorBase_V1, SupportsHMA):
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
-        """HMA multi-group finish. Groups share one block index per the
-        multi-group pool design (assumption — the HMA-PROBE log in
-        connector_leader.py is verifying it live on the fp4; group 0 is
-        authoritative pending its verdict). Delegating preserves the leader's
-        finish bookkeeping (slots become matchable for onboarding) — the
-        leader's answer passes through (False today — offload is a copy that
-        never holds blocks — so vLLM frees the device blocks), matching the
-        attention-only contract. If per-group lists ever diverge, the
-        HMA-PROBE log will show it and the slot machinery must switch to
-        per-group block-id mapping."""
+        """HMA multi-group finish.
+
+        The HMA-PROBE log PROVED per-group ids diverge: one request's
+        ``block_ids per group`` came back as ``[[1], [2], [3], [4]]`` —
+        vLLM's hybrid allocator assigns block ids per group independently,
+        so group 0's list is NOT the other groups'. Before delegating, the
+        FULL per-group lists are published to the leader's slot mapping
+        (the offload/onboard consumers index it by [group][position]);
+        the delegation itself keeps group 0's list for the slot's flat
+        device-block sequence. Delegating preserves the leader's finish
+        bookkeeping (slots become matchable for onboarding) — the leader's
+        answer passes through (False today — offload is a copy that never
+        holds blocks — so vLLM frees the device blocks), matching the
+        attention-only contract.
+        """
         if len(block_ids) >= 1:
+            if self._scheduler._num_groups > 1:
+                self._scheduler.set_per_group_device_blocks(
+                    request.request_id, block_ids
+                )
             return self.request_finished(request, block_ids[0])
         return False, None
 

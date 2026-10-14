@@ -6,7 +6,7 @@ pub mod slot;
 
 use super::*;
 use dynamo_llm::block_manager::metrics_kvbm::{KvbmMetrics, KvbmMetricsRegistry};
-use slot::{ConnectorSlotManager, SlotError, SlotManager, SlotState};
+use slot::{ConnectorSlotManager, ExternallyManagedDeviceSlot, SlotError, SlotManager, SlotState};
 
 use crate::block_manager::BlockManagerBuilder;
 use crate::block_manager::{
@@ -77,6 +77,32 @@ pub trait Leader: Send + Sync + std::fmt::Debug {
         num_external_tokens: usize,
     ) -> anyhow::Result<()>;
 
+    /// Store the request's per-group device block-id mapping (HMA
+    /// multi-group). `per_group_block_ids[g]` is group `g`'s device ids for
+    /// the request's logical blocks, position-indexed from block 0. vLLM
+    /// reports FULL per-group lists here (update_state_after_alloc, new
+    /// requests, resumed-from-preemption requests, finish) — the slot's
+    /// mapping is REPLACED with them.
+    ///
+    /// vLLM's hybrid allocator assigns block ids PER GROUP independently
+    /// (probe evidence: one request, ids `[[1], [2], [3], [4]]`), so
+    /// offload/onboard legs must carry each group's own ids; group 0's flat
+    /// list is only valid for group 0's pool.
+    fn set_per_group_device_blocks(
+        &self,
+        request_id: String,
+        per_group_block_ids: Vec<Vec<BlockId>>,
+    ) -> anyhow::Result<()>;
+
+    /// Append the request's per-group device block-id DELTAS (this
+    /// iteration's newly allocated ids per group — vLLM's cached-request
+    /// `new_block_ids`) to the tail of the slot's per-group mapping.
+    fn append_per_group_device_blocks(
+        &self,
+        request_id: String,
+        per_group_block_ids: Vec<Vec<BlockId>>,
+    ) -> anyhow::Result<()>;
+
     fn build_connector_metadata(
         &mut self,
         scheduler_output: SchedulerOutput,
@@ -112,6 +138,32 @@ pub struct KvConnectorLeader {
 }
 
 impl KvConnectorLeader {
+    /// Apply a per-group mapping update to the request's slot.
+    ///
+    /// The mapping is advisory slot state: a missing slot means the request
+    /// is already gone from the leader's books (e.g. finished), so the
+    /// update is dropped with a warning instead of failing vLLM's scheduler.
+    /// Consumers (offload/onboard) fail loudly if they later need a mapping
+    /// that was never published.
+    fn per_group_slot_update(
+        &self,
+        request_id: &str,
+        update: impl FnOnce(&mut dyn ExternallyManagedDeviceSlot) -> Result<(), SlotError>,
+    ) -> anyhow::Result<()> {
+        let Ok(shared_slot) = self.slot_manager().get_slot(&request_id.to_string()) else {
+            tracing::warn!(
+                request_id,
+                "per-group device block update ignored: no slot for request"
+            );
+            return Ok(());
+        };
+        let mut slot = shared_slot
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock slot: {}", e))?;
+        update(&mut *slot)?;
+        Ok(())
+    }
+
     fn new(
         worker_id: String,
         page_size: usize,
@@ -349,6 +401,26 @@ impl Leader for KvConnectorLeader {
         }
 
         Ok(())
+    }
+
+    fn set_per_group_device_blocks(
+        &self,
+        request_id: String,
+        per_group_block_ids: Vec<Vec<BlockId>>,
+    ) -> anyhow::Result<()> {
+        self.per_group_slot_update(&request_id, |slot| {
+            slot.set_per_group_device_blocks(&per_group_block_ids)
+        })
+    }
+
+    fn append_per_group_device_blocks(
+        &self,
+        request_id: String,
+        per_group_block_ids: Vec<Vec<BlockId>>,
+    ) -> anyhow::Result<()> {
+        self.per_group_slot_update(&request_id, |slot| {
+            slot.append_per_group_device_blocks(&per_group_block_ids)
+        })
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(iteration = self.iteration_counter + 1))]
@@ -723,6 +795,30 @@ impl PyKvConnectorLeader {
     ) -> PyResult<()> {
         self.connector_leader
             .update_state_after_alloc(request_id, block_ids, num_external_tokens)
+            .map_err(to_pyerr)
+    }
+
+    /// Full per-group device block-id lists (REPLACE semantics). BlockId is
+    /// `usize`, so the Python side passes `[[int; _]; num_groups]`.
+    fn set_per_group_device_blocks(
+        &self,
+        request_id: &str,
+        per_group_block_ids: Vec<Vec<usize>>,
+    ) -> PyResult<()> {
+        self.connector_leader
+            .set_per_group_device_blocks(request_id.to_string(), per_group_block_ids)
+            .map_err(to_pyerr)
+    }
+
+    /// Per-group device block-id deltas for this iteration (APPEND
+    /// semantics — vLLM's cached-request `new_block_ids`).
+    fn append_per_group_device_blocks(
+        &self,
+        request_id: &str,
+        per_group_block_ids: Vec<Vec<usize>>,
+    ) -> PyResult<()> {
+        self.connector_leader
+            .append_per_group_device_blocks(request_id.to_string(), per_group_block_ids)
             .map_err(to_pyerr)
     }
 

@@ -53,6 +53,25 @@ pub trait Leader: Send + Sync + std::fmt::Debug {
         context_current_position: usize,
     ) -> anyhow::Result<()>;
 
+    /// Store the request's per-group device block-id mapping (HMA
+    /// multi-group); full per-group lists REPLACE the slot's mapping.
+    /// Unused on the TRT-LLM path today (single-group); kept for trait
+    /// parity with the vLLM leader.
+    #[allow(dead_code)]
+    fn set_per_group_device_blocks(
+        &self,
+        request_id: String,
+        per_group_block_ids: Vec<Vec<BlockId>>,
+    ) -> anyhow::Result<()>;
+
+    /// Append per-group device block-id deltas to the slot's mapping.
+    #[allow(dead_code)]
+    fn append_per_group_device_blocks(
+        &self,
+        request_id: String,
+        per_group_block_ids: Vec<Vec<BlockId>>,
+    ) -> anyhow::Result<()>;
+
     fn build_connector_metadata(
         &mut self,
         scheduler_output: SchedulerOutput,
@@ -306,6 +325,32 @@ impl Leader for KvConnectorLeader {
         }
 
         Ok(())
+    }
+
+    fn set_per_group_device_blocks(
+        &self,
+        request_id: String,
+        per_group_block_ids: Vec<Vec<BlockId>>,
+    ) -> anyhow::Result<()> {
+        let shared_slot = self.slot_manager().get_slot(&request_id)?;
+        let mut slot = shared_slot
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock slot: {}", e))?;
+        slot.set_per_group_device_blocks(&per_group_block_ids)
+            .map_err(|e| anyhow::anyhow!("set_per_group_device_blocks failed: {}", e))
+    }
+
+    fn append_per_group_device_blocks(
+        &self,
+        request_id: String,
+        per_group_block_ids: Vec<Vec<BlockId>>,
+    ) -> anyhow::Result<()> {
+        let shared_slot = self.slot_manager().get_slot(&request_id)?;
+        let mut slot = shared_slot
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock slot: {}", e))?;
+        slot.append_per_group_device_blocks(&per_group_block_ids)
+            .map_err(|e| anyhow::anyhow!("append_per_group_device_blocks failed: {}", e))
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(iteration = self.iteration_counter + 1))]

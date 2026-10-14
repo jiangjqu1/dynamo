@@ -432,6 +432,29 @@ impl Leader for KvConnectorLeaderRecorder {
         Ok(())
     }
 
+    // The per-group mapping updates are delegated but NOT recorded: they
+    // are advisory slot state reproducible from the recorded
+    // UpdateStateAfterAlloc / BuildConnectorMeta actions (same inputs), and
+    // adding Action variants would change the recorded trace schema. If a
+    // multi-group replay ever needs them recorded, extend `Action` then.
+    fn set_per_group_device_blocks(
+        &self,
+        request_id: String,
+        per_group_block_ids: Vec<Vec<BlockId>>,
+    ) -> anyhow::Result<()> {
+        self.connector_leader
+            .set_per_group_device_blocks(request_id, per_group_block_ids)
+    }
+
+    fn append_per_group_device_blocks(
+        &self,
+        request_id: String,
+        per_group_block_ids: Vec<Vec<BlockId>>,
+    ) -> anyhow::Result<()> {
+        self.connector_leader
+            .append_per_group_device_blocks(request_id, per_group_block_ids)
+    }
+
     fn build_connector_metadata(
         &mut self,
         scheduler_output: SchedulerOutput,

@@ -17,7 +17,9 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import Request
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
 
@@ -58,7 +60,13 @@ class KvConnectorLeader:
     that can be used in the vLLM KV cache manager protocol.
     """
 
-    def __init__(self, vllm_config: "VllmConfig", engine_id: str, **kwargs):
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        engine_id: str,
+        kv_cache_config: Optional["KVCacheConfig"] = None,
+        **kwargs,
+    ):
         drt: Optional[object] = kwargs.get("drt")
 
         if drt is None and is_dyn_runtime_enabled():
@@ -69,6 +77,20 @@ class KvConnectorLeader:
         self.drt = drt
         self.vllm_config = vllm_config
         world_size = vllm_config.parallel_config.world_size
+
+        # HMA group count from the factory-supplied kv_cache_config. vLLM's
+        # hybrid allocator assigns block ids PER GROUP independently (the
+        # HMA-PROBE logged `[[1], [2], [3], [4]]` for one request), so with
+        # more than one group the leader must publish per-group id lists to
+        # the Rust slot mapping — group 0's flat list is only valid for
+        # group 0's pool. Single-group (or unknown) deployments keep the
+        # flat group-0-only contract.
+        kv_cache_groups = (
+            getattr(kv_cache_config, "kv_cache_groups", None)
+            if kv_cache_config is not None
+            else None
+        )
+        self._num_groups = len(kv_cache_groups) if kv_cache_groups else 1
 
         leader = KvbmLeader(world_size, drt=self.drt)
 
@@ -167,6 +189,12 @@ class KvConnectorLeader:
                 [list(g) for g in group_block_ids[:4]],  # truncate
             )
         block_ids = group_block_ids[0]
+        # Multi-group: publish the FULL per-group mapping BEFORE the Rust
+        # call — update_state_after_alloc may trigger onboarding inside it
+        # (num_external_tokens > 0), and the onboard destinations are
+        # resolved per group from this mapping. vLLM hands full per-group
+        # lists here, so the mapping is replaced wholesale.
+        self.set_per_group_device_blocks(request.request_id, group_block_ids)
         self._connector.update_state_after_alloc(
             request.request_id, block_ids, num_external_tokens
         )
@@ -184,6 +212,10 @@ class KvConnectorLeader:
         output = RustSchedulerOutput()
 
         for req in scheduler_output.scheduled_new_reqs:
+            # NewRequestData.block_ids is the per-group tuple of FULL lists;
+            # re-publishing is idempotent (update_state_after_alloc already
+            # replaced the mapping for this request this iteration).
+            self.set_per_group_device_blocks(req.req_id, req.block_ids)
             output.add_new_request(
                 req.req_id,
                 req.prompt_token_ids,
@@ -222,6 +254,19 @@ class KvConnectorLeader:
 
             resumed_from_preemption = req_id in resumed_req_ids
             if new_block_ids is not None:
+                if self._num_groups > 1:
+                    # vLLM's CachedRequestData contract: running requests
+                    # carry this iteration's per-group DELTAS (appended to
+                    # the request's block ids), resumed-from-preemption
+                    # requests carry FULL per-group lists (they replace the
+                    # request's block ids). The Rust apply of these blocks —
+                    # including its offload decisions — runs inside
+                    # build_connector_metadata below, so the mapping must be
+                    # updated first.
+                    if resumed_from_preemption:
+                        self.set_per_group_device_blocks(req_id, new_block_ids)
+                    else:
+                        self.append_per_group_device_blocks(req_id, new_block_ids)
                 output.add_cached_request(
                     request_id=req_id,
                     resumed_from_preemption=resumed_from_preemption,
@@ -272,6 +317,38 @@ class KvConnectorLeader:
         return self._connector.reset_cache()
 
     # Utility functions
+
+    def set_per_group_device_blocks(
+        self, request_id: str, per_group_block_ids: tuple[list[int], ...]
+    ) -> None:
+        """Publish the request's FULL per-group device block ids to the Rust
+        slot mapping (REPLACE semantics).
+
+        vLLM's hybrid allocator assigns block ids per group independently
+        (the HMA-PROBE proved group 0's ids are NOT the other groups' ids),
+        and the slot's offload/onboard consumers index the mapping by
+        [group][logical block position]. Single-group deployments skip the
+        call entirely — the flat group-0 contract applies unchanged.
+        """
+        if self._num_groups <= 1:
+            return
+        self._connector.set_per_group_device_blocks(
+            request_id, [list(group) for group in per_group_block_ids]
+        )
+
+    def append_per_group_device_blocks(
+        self, request_id: str, per_group_block_ids: tuple[list[int], ...]
+    ) -> None:
+        """Publish the request's per-group device block-id DELTAS (this
+        iteration's newly allocated ids per group — vLLM's cached-request
+        ``new_block_ids``) to the Rust slot mapping (APPEND-at-tail
+        semantics). Skipped for single-group deployments.
+        """
+        if self._num_groups <= 1:
+            return
+        self._connector.append_per_group_device_blocks(
+            request_id, [list(group) for group in per_group_block_ids]
+        )
 
     def _create_slot(self, request: Request) -> None:
         """Create a slot for the request"""

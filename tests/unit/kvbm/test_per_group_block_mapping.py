@@ -1,0 +1,338 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Per-group block-id mapping on the Python leader (HMA multi-group).
+
+The HMA-PROBE on the fp4 proved vLLM's hybrid allocator assigns block ids
+PER GROUP independently (``[[1], [2], [3], [4]]`` for one request), so the
+leader must publish per-group id lists to the Rust slot mapping at every
+hook that precedes a per-group consumer:
+
+- ``update_state_after_alloc`` — FULL lists, REPLACE, before the Rust call
+  (it may trigger onboarding inside, which resolves per-group dst ids).
+- ``build_connector_meta`` — new requests re-publish FULL lists; running
+  cached requests APPEND per-group DELTAS; resumed-from-preemption requests
+  REPLACE with FULL lists (vLLM's CachedRequestData contract).
+- single-group deployments must make NONE of these calls.
+
+The REAL ``KvConnectorLeader`` is loaded from source with the Rust
+connector stubbed (a recording fake), so these tests assert the PUBLISH
+DECISIONS and their ordering, not Rust behavior.
+"""
+
+import importlib.util
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+pytestmark = [
+    pytest.mark.unit,
+    pytest.mark.pre_merge,
+    pytest.mark.gpu_0,
+    pytest.mark.kvbm,
+]
+
+_VLLM_INTEGRATION_DIR = (
+    Path(__file__).resolve().parents[3]
+    / "lib/bindings/kvbm/python/kvbm/vllm_integration"
+)
+
+
+class FakeKvbmLeader:
+    def __init__(self, world_size, drt=None):
+        self.world_size = world_size
+        self.drt = drt
+
+
+class FakeRustKvConnectorLeader:
+    """Recording stand-in for kvbm.vllm_integration.rust.KvConnectorLeader."""
+
+    def __init__(
+        self,
+        engine_id,
+        drt,
+        block_size,
+        leader,
+        consolidator_vllm_endpoint=None,
+        consolidator_output_endpoint=None,
+        consolidator_mode=None,
+    ):
+        self.engine_id = engine_id
+        self.drt = drt
+        self.block_size = block_size
+        self.leader = leader
+        self.calls: list[tuple] = []
+
+    def set_per_group_device_blocks(self, request_id, per_group_block_ids):
+        self.calls.append(("set", request_id, per_group_block_ids))
+
+    def append_per_group_device_blocks(self, request_id, per_group_block_ids):
+        self.calls.append(("append", request_id, per_group_block_ids))
+
+    def update_state_after_alloc(self, request_id, block_ids, num_external_tokens):
+        self.calls.append(("update", request_id, block_ids, num_external_tokens))
+
+    def build_connector_metadata(self, scheduler_output):
+        self.calls.append(("build_meta", scheduler_output))
+        return b"{}"
+
+    def request_finished(self, request_id, block_ids):
+        self.calls.append(("finish", request_id, block_ids))
+        return False, None
+
+    def get_num_new_matched_tokens(self, request_id, num_tokens, num_computed):
+        return 0, False
+
+    def has_slot(self, request_id):
+        return False
+
+    def create_slot(self, request, tokens):
+        pass
+
+    def reset_cache(self):
+        return True
+
+
+class FakeRustSchedulerOutput:
+    """Stand-in for kvbm.vllm_integration.rust.SchedulerOutput."""
+
+    def __init__(self):
+        self.new_requests = []
+        self.cached_requests = []
+        self.total = None
+
+    def add_new_request(self, *args):
+        self.new_requests.append(args)
+
+    def add_cached_request(self, **kwargs):
+        self.cached_requests.append(kwargs)
+
+    def add_num_scheduled_tokens(self, num_scheduled_tokens):
+        # vLLM's leader passes the per-request dict through to the Rust side.
+        self.total = num_scheduled_tokens
+
+    def get_num_scheduled_tokens(self):
+        return sum(self.total.values()) if self.total else 0
+
+
+class FakeKvCacheGroups:
+    """Stands in for vLLM's KVCacheConfig (the .kv_cache_groups holder)."""
+
+    def __init__(self, num_groups):
+        self.kv_cache_groups = [object() for _ in range(num_groups)]
+
+
+class FakeBlocks:
+    """Stands in for vLLM's KVCacheBlocks (per-group get_block_ids)."""
+
+    def __init__(self, per_group_block_ids):
+        self._per_group = per_group_block_ids
+
+    def get_block_ids(self):
+        return self._per_group
+
+
+class FakeRequest:
+    def __init__(self, request_id):
+        self.request_id = request_id
+
+
+class FakeNewReq:
+    def __init__(self, req_id, block_ids):
+        self.req_id = req_id
+        self.prompt_token_ids = [1, 2, 3]
+        self.block_ids = block_ids
+        self.num_computed_tokens = 0
+
+
+class FakeCachedReqs:
+    def __init__(self, req_ids, new_block_ids, resumed_req_ids=()):
+        self.req_ids = req_ids
+        self.resumed_req_ids = set(resumed_req_ids)
+        self.new_token_ids = [[] for _ in req_ids]
+        self.new_block_ids = new_block_ids
+        self.num_computed_tokens = [0 for _ in req_ids]
+
+
+def _fake_vllm_config():
+    cfg = types.SimpleNamespace()
+    cfg.parallel_config = types.SimpleNamespace(world_size=1)
+    cfg.cache_config = types.SimpleNamespace(block_size=16)
+    cfg.additional_config = {}
+    return cfg
+
+
+@pytest.fixture(name="leader_module")
+def load_connector_leader_module(monkeypatch):
+    """Load connector_leader.py from source with kvbm's heavy imports and
+    the Rust connector stubbed. monkeypatch restores sys.modules."""
+    kvbm_pkg = types.ModuleType("kvbm")
+    kvbm_pkg.__path__ = []
+    kvbm_pkg.KvbmLeader = FakeKvbmLeader
+    monkeypatch.setitem(sys.modules, "kvbm", kvbm_pkg)
+
+    utils_mod = types.ModuleType("kvbm.utils")
+    utils_mod.is_dyn_runtime_enabled = lambda: False
+    monkeypatch.setitem(sys.modules, "kvbm.utils", utils_mod)
+
+    vllm_integration = types.ModuleType("kvbm.vllm_integration")
+    vllm_integration.__path__ = []
+    monkeypatch.setitem(sys.modules, "kvbm.vllm_integration", vllm_integration)
+
+    consolidator_mod = types.ModuleType("kvbm.vllm_integration.consolidator_config")
+    consolidator_mod.get_consolidator_mode = lambda: None
+    monkeypatch.setitem(sys.modules, consolidator_mod.__name__, consolidator_mod)
+
+    rust_mod = types.ModuleType("kvbm.vllm_integration.rust")
+    rust_mod.KvConnectorLeader = FakeRustKvConnectorLeader
+    rust_mod.KvbmRequest = type("KvbmRequest", (), {})
+    rust_mod.SchedulerOutput = FakeRustSchedulerOutput
+    monkeypatch.setitem(sys.modules, "kvbm.vllm_integration.rust", rust_mod)
+
+    config_mod = types.ModuleType("vllm.config")
+    config_mod.VllmConfig = type("VllmConfig", (), {})
+    monkeypatch.setitem(sys.modules, "vllm.config", config_mod)
+
+    base_mod = types.ModuleType("vllm.distributed.kv_transfer.kv_connector.v1.base")
+    base_mod.KVConnectorMetadata = type("KVConnectorMetadata", (), {})
+    monkeypatch.setitem(sys.modules, base_mod.__name__, base_mod)
+
+    manager_mod = types.ModuleType("vllm.v1.core.kv_cache_manager")
+    manager_mod.KVCacheBlocks = type("KVCacheBlocks", (), {})
+    monkeypatch.setitem(sys.modules, manager_mod.__name__, manager_mod)
+
+    sched_output_mod = types.ModuleType("vllm.v1.core.sched.output")
+    sched_output_mod.SchedulerOutput = type("SchedulerOutput", (), {})
+    monkeypatch.setitem(sys.modules, sched_output_mod.__name__, sched_output_mod)
+
+    request_mod = types.ModuleType("vllm.v1.request")
+    request_mod.Request = type("Request", (), {})
+    monkeypatch.setitem(sys.modules, request_mod.__name__, request_mod)
+
+    leader_spec = importlib.util.spec_from_file_location(
+        "kvbm.vllm_integration.connector_leader",
+        _VLLM_INTEGRATION_DIR / "connector_leader.py",
+    )
+    leader_mod = importlib.util.module_from_spec(leader_spec)
+    monkeypatch.setitem(sys.modules, leader_spec.name, leader_mod)
+    leader_spec.loader.exec_module(leader_mod)
+    return leader_mod
+
+
+def _make_leader(leader_module, num_groups):
+    leader = leader_module.KvConnectorLeader(
+        vllm_config=_fake_vllm_config(),
+        engine_id="engine-0",
+        kv_cache_config=FakeKvCacheGroups(num_groups),
+    )
+    return leader, leader._connector
+
+
+def test_num_groups_derived_from_kv_cache_config(leader_module):
+    _, rust = _make_leader(leader_module, 4)
+    assert rust.leader.world_size == 1  # sanity: the ctor ran
+    leader_module  # noqa: B018 — fixture loaded
+
+
+def test_update_state_after_alloc_publishes_full_mapping_before_rust_call(
+    leader_module,
+):
+    leader, rust = _make_leader(leader_module, 4)
+    blocks = FakeBlocks(([10, 11], [20, 21], [30, 31], [40, 41]))
+
+    leader.update_state_after_alloc(FakeRequest("req-1"), blocks, 0)
+
+    kinds = [call[0] for call in rust.calls]
+    assert kinds.index("set") < kinds.index("update"), (
+        "the mapping must reach the Rust slot BEFORE update_state_after_alloc: "
+        "it may trigger onboarding inside, which resolves per-group dst ids"
+    )
+    assert rust.calls[kinds.index("set")] == (
+        "set",
+        "req-1",
+        [[10, 11], [20, 21], [30, 31], [40, 41]],
+    )
+    # The Rust call itself keeps the flat group-0 contract.
+    assert rust.calls[kinds.index("update")] == ("update", "req-1", [10, 11], 0)
+
+
+def test_update_state_after_alloc_single_group_skips_mapping(leader_module):
+    leader, rust = _make_leader(leader_module, 1)
+    blocks = FakeBlocks(([10, 11],))
+
+    leader.update_state_after_alloc(FakeRequest("req-1"), blocks, 0)
+
+    assert [call[0] for call in rust.calls] == ["update"]
+
+
+def _scheduler_output(new_reqs=(), cached=None, total=0):
+    output = types.SimpleNamespace()
+    output.scheduled_new_reqs = list(new_reqs)
+    output.scheduled_cached_reqs = cached or FakeCachedReqs([], [])
+    output.num_scheduled_tokens = {}
+    output.total_num_scheduled_tokens = total
+    return output
+
+
+def test_build_connector_meta_publishes_new_running_and_resumed(leader_module):
+    leader, rust = _make_leader(leader_module, 4)
+
+    new_req = FakeNewReq("req-new", ([10, 11], [20, 21], [30, 31], [40, 41]))
+    cached = FakeCachedReqs(
+        req_ids=["req-running", "req-resumed", "req-idle"],
+        new_block_ids=[
+            ([12], [22], [32], [42]),  # running: per-group DELTAS
+            ([13, 14], [23, 24], [33, 34], [43, 44]),  # resumed: FULL lists
+            None,  # scheduled with no new blocks
+        ],
+        resumed_req_ids=("req-resumed",),
+    )
+
+    leader.build_connector_meta(_scheduler_output(new_reqs=[new_req], cached=cached))
+
+    per_req = {}
+    for call in rust.calls:
+        if call[0] in ("set", "append"):
+            per_req.setdefault(call[1], []).append(call)
+
+    # New request: FULL lists (set).
+    assert [c[0] for c in per_req["req-new"]] == ["set"]
+    assert per_req["req-new"][0][2] == [[10, 11], [20, 21], [30, 31], [40, 41]]
+    # Running request: per-group DELTAS (append).
+    assert [c[0] for c in per_req["req-running"]] == ["append"]
+    assert per_req["req-running"][0][2] == [[12], [22], [32], [42]]
+    # Resumed request: FULL lists (set).
+    assert [c[0] for c in per_req["req-resumed"]] == ["set"]
+    assert per_req["req-resumed"][0][2] == [
+        [13, 14],
+        [23, 24],
+        [33, 34],
+        [43, 44],
+    ]
+    # No new blocks: no mapping update at all.
+    assert "req-idle" not in per_req
+
+
+def test_build_connector_meta_single_group_skips_mapping(leader_module):
+    leader, rust = _make_leader(leader_module, 1)
+
+    new_req = FakeNewReq("req-new", ([10, 11],))
+    cached = FakeCachedReqs(req_ids=["req-running"], new_block_ids=[([12],)])
+
+    leader.build_connector_meta(_scheduler_output(new_reqs=[new_req], cached=cached))
+
+    assert not [call for call in rust.calls if call[0] in ("set", "append")]
+
+
+def test_single_group_config_defaults_to_one(leader_module):
+    leader = leader_module.KvConnectorLeader(
+        vllm_config=_fake_vllm_config(),
+        engine_id="engine-0",
+        kv_cache_config=None,
+    )
+    assert leader._num_groups == 1
+
+    leader, _ = _make_leader(leader_module, 4)
+    assert leader._num_groups == 4

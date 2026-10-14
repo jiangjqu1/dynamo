@@ -169,6 +169,25 @@ pub trait ExternallyManagedDeviceSlot: Slot {
     ///
     /// The external device block manager has provided a set of mutable blocks to the slot.
     fn append_mutable_device_blocks(&mut self, block_ids: &[BlockId]) -> Result<(), SlotError>;
+
+    /// REPLACE the per-group device block-id mapping with the FULL per-group
+    /// lists vLLM reports for the request (`per_group[g]` = group `g`'s ids
+    /// for the request's logical blocks, position-indexed from block 0).
+    ///
+    /// vLLM hands full lists at update_state_after_alloc, for new requests,
+    /// for resumed-from-preemption requests, and at finish.
+    fn set_per_group_device_blocks(
+        &mut self,
+        per_group_block_ids: &[Vec<BlockId>],
+    ) -> Result<(), SlotError>;
+
+    /// APPEND the per-group device block-id DELTAS (this iteration's newly
+    /// allocated ids per group — vLLM's cached-request `new_block_ids`) to
+    /// the tail of the mapping.
+    fn append_per_group_device_blocks(
+        &mut self,
+        per_group_block_ids: &[Vec<BlockId>],
+    ) -> Result<(), SlotError>;
 }
 
 pub struct ConnectorSlotManager<R: RequestKey> {
@@ -436,6 +455,31 @@ pub struct VllmConnectorSlot {
     /// rendezvous — one Worker + one Transfer per `(request_id, uuid)` —
     /// matches every wire leg.
     num_groups: usize,
+
+    /// Per-group device block ids for HMA multi-group deployments:
+    /// `table[g][p]` = group `g`'s device id for the request's p-th logical
+    /// block. vLLM's hybrid allocator assigns block ids PER GROUP
+    /// independently (the HMA-PROBE logged `[[1], [2], [3], [4]]` for one
+    /// request), so any transfer touching group `g` needs group `g`'s OWN
+    /// ids — the flat `device_blocks` list is group 0's view and is only
+    /// valid for group 0's pool.
+    ///
+    /// [`Self::set_per_group_device_blocks`] REPLACES the table with the
+    /// FULL per-group lists vLLM reports (update_state_after_alloc, new
+    /// requests, resumed-from-preemption requests, finish);
+    /// [`Self::append_per_group_device_blocks`] extends the tail with the
+    /// per-group DELTAS vLLM reports for running requests (cached
+    /// `new_block_ids`). `None` until the first report — single-group
+    /// deployments never set it and keep the legacy flat path.
+    ///
+    /// Deliberately NOT cleared by `reset_after_preemption`: the Python
+    /// leader re-publishes the full mapping (update_state_after_alloc and
+    /// the resumed request's full `new_block_ids`) BEFORE the Rust-side
+    /// reset runs inside `build_connector_metadata`, so clearing here would
+    /// drop the fresh mapping and leave multi-group consumers with nothing
+    /// to index. Between preemption and resume no consumer runs (the
+    /// request is unscheduled).
+    per_group_block_table: Option<Vec<Vec<BlockId>>>,
 }
 
 impl VllmConnectorSlot {
@@ -480,6 +524,7 @@ impl VllmConnectorSlot {
             offload_terminated_at_block: None,
             stored_block_priorities: HashMap::new(),
             num_groups: num_groups.max(1),
+            per_group_block_table: None,
         }
     }
 
@@ -521,12 +566,18 @@ impl VllmConnectorSlot {
             offload_terminated_at_block: None,
             stored_block_priorities: HashMap::new(),
             num_groups: num_groups.max(1),
+            per_group_block_table: None,
         }
     }
 
     #[cfg(test)]
     fn device_blocks_snapshot(&self) -> &[BlockId] {
         &self.device_blocks
+    }
+
+    #[cfg(test)]
+    fn per_group_block_table_snapshot(&self) -> Option<&[Vec<BlockId>]> {
+        self.per_group_block_table.as_deref()
     }
 
     fn sync_external_sequence_hashes(
@@ -1315,9 +1366,114 @@ impl ExternallyManagedDeviceSlot for VllmConnectorSlot {
 
         Ok(())
     }
+
+    fn set_per_group_device_blocks(
+        &mut self,
+        per_group_block_ids: &[Vec<BlockId>],
+    ) -> Result<(), SlotError> {
+        Self::validate_per_group_shape(per_group_block_ids, self.num_groups)?;
+        tracing::debug!(
+            request_id = self.request_id,
+            num_groups = per_group_block_ids.len(),
+            positions = per_group_block_ids.first().map(Vec::len).unwrap_or(0),
+            "replacing per-group device block mapping (full lists)"
+        );
+        self.per_group_block_table = Some(per_group_block_ids.to_vec());
+        Ok(())
+    }
+
+    fn append_per_group_device_blocks(
+        &mut self,
+        per_group_block_ids: &[Vec<BlockId>],
+    ) -> Result<(), SlotError> {
+        Self::validate_per_group_shape(per_group_block_ids, self.num_groups)?;
+        let table = self
+            .per_group_block_table
+            .get_or_insert_with(|| vec![Vec::new(); self.num_groups]);
+        for (group_ids, delta) in table.iter_mut().zip(per_group_block_ids) {
+            group_ids.extend_from_slice(delta);
+        }
+        tracing::debug!(
+            request_id = self.request_id,
+            num_groups = per_group_block_ids.len(),
+            delta_len = per_group_block_ids.first().map(Vec::len).unwrap_or(0),
+            total = table.first().map(Vec::len).unwrap_or(0),
+            "appended per-group device block delta to mapping"
+        );
+        Ok(())
+    }
 }
 
 impl VllmConnectorSlot {
+    /// Shared shape validation for per-group mapping updates: exactly one
+    /// list per HMA group. Group lists of UNEQUAL length are warned (vLLM's
+    /// groups are expected to allocate in step — one block per group per
+    /// logical block, as the HMA-PROBE showed — but a warning keeps a
+    /// benign divergence visible without killing scheduling; the consumers
+    /// fail loudly if a needed position is missing).
+    fn validate_per_group_shape(
+        per_group_block_ids: &[Vec<BlockId>],
+        num_groups: usize,
+    ) -> Result<(), SlotError> {
+        if per_group_block_ids.len() != num_groups {
+            return Err(SlotError::InvalidOperation(format!(
+                "per-group device block mapping expects {num_groups} group lists, got {}",
+                per_group_block_ids.len()
+            )));
+        }
+        if num_groups > 1 {
+            let lengths: Vec<usize> = per_group_block_ids.iter().map(Vec::len).collect();
+            if lengths.windows(2).any(|w| w[0] != w[1]) {
+                tracing::warn!(
+                    group_lengths = ?lengths,
+                    "per-group device block lists have unequal lengths; groups are expected \
+                     to allocate in step (one block per group per logical block)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Each group's device ids for logical block positions `start..start+len`.
+    ///
+    /// Returns `Ok(None)` for the legacy single-group path (one group, or
+    /// the mapping was never reported) — callers then use group 0's flat
+    /// ids for every group. Returns an error when the slot is multi-group
+    /// but the mapping is missing or too short: moving group 0's ids
+    /// through another group's pool would transfer the WRONG bytes, so the
+    /// op must not be issued.
+    fn per_group_device_ids(
+        &self,
+        start: usize,
+        len: usize,
+    ) -> Result<Option<Vec<Vec<BlockId>>>, SlotError> {
+        if self.num_groups <= 1 {
+            return Ok(None);
+        }
+        let Some(table) = &self.per_group_block_table else {
+            return Err(SlotError::InvalidOperation(format!(
+                "per-group device block mapping missing for request {} (num_groups={}): \
+                 vLLM's per-group ids were never reported; refusing to move group 0's ids \
+                 through every group's pool",
+                self.request_id, self.num_groups
+            )));
+        };
+        let end = start + len;
+        let lengths: Vec<usize> = table.iter().map(Vec::len).collect();
+        if lengths.iter().any(|&l| l < end) {
+            return Err(SlotError::InvalidOperation(format!(
+                "per-group device block mapping too short for request {}: need positions \
+                 {start}..{end}, group lengths {lengths:?}",
+                self.request_id
+            )));
+        }
+        Ok(Some(
+            (0..self.num_groups)
+                .map(|g| table[g][start..end].to_vec())
+                .collect(),
+        ))
+    }
+
     /// this method does two things which are related:
     /// 1. creates transfer engine offload request
     /// 2. creates matching connector worker transfer request
@@ -1341,12 +1497,22 @@ impl VllmConnectorSlot {
         assert!(block_ids.len() == priorities.len());
         let operation_id = uuid::Uuid::new_v4();
 
+        // The candidates are the request's logical blocks at positions
+        // `evaluated_blocks..+n` (apply_scheduler_output selected them from
+        // device_blocks before advancing evaluated_blocks). Resolve each
+        // group's SOURCE device ids for exactly those positions — group 0's
+        // flat ids are only valid for group 0's pool.
+        let per_group_src_block_ids = self
+            .per_group_device_ids(self.evaluated_blocks, block_ids.len())?
+            .unwrap_or_default();
+
         let xfer_req = LocalTransferRequest::Offload(LocalOffloadRequest::new(
             self.request_id.clone(),
             block_ids.to_vec(),
             token_blocks.to_vec(),
             priorities.to_vec(),
             operation_id,
+            per_group_src_block_ids,
         ));
 
         // ONE metadata operation PER GROUP LEG, each with its deterministic
@@ -1395,11 +1561,21 @@ impl VllmConnectorSlot {
         let src_storage_pool = src_blocks.storage_pool();
         let operation_id = uuid::Uuid::new_v4();
 
+        // The destinations are the request's logical blocks at positions
+        // `evaluated_blocks..+n` — the SAME positions the caller just zipped
+        // from device_blocks (group 0's ids). Resolve each group's OWN
+        // destination ids for those positions; group 0's flat ids are only
+        // valid for group 0's pool.
+        let per_group_dst_block_ids = self
+            .per_group_device_ids(self.evaluated_blocks, dst_block_ids.len())?
+            .unwrap_or_default();
+
         let xfer_req = LocalTransferRequest::Onboard(LocalOnboardRequest::new(
             self.request_id.clone(),
             src_blocks,
             dst_block_ids,
             operation_id,
+            per_group_dst_block_ids,
         ));
 
         // ONE metadata operation PER GROUP LEG, each with its deterministic
@@ -1476,11 +1652,18 @@ fn derive_leg_uuid(logical: uuid::Uuid, group: usize) -> uuid::Uuid {
 
 struct LocalOffloadRequest {
     request_id: String,
+    /// Group 0's device ids for the candidate blocks — also the logical
+    /// block count for the tier-side allocation.
     block_ids: Vec<BlockId>,
     token_blocks: Vec<TokenBlock>,
     /// Priorities for each block, used to set BasicMetadata.priority during offload.
     priorities: Vec<u32>,
     operation_id: uuid::Uuid,
+    /// Per-group SOURCE device ids for the candidate blocks, group-major and
+    /// position-indexed (`[g][p]` = group `g`'s device id for the p-th
+    /// candidate). Empty in the legacy single-group path — every group then
+    /// uses `block_ids` (group 0's ids).
+    per_group_block_ids: Vec<Vec<BlockId>>,
 }
 
 impl LocalOffloadRequest {
@@ -1490,15 +1673,28 @@ impl LocalOffloadRequest {
         token_blocks: Vec<TokenBlock>,
         priorities: Vec<u32>,
         operation_id: uuid::Uuid,
+        per_group_block_ids: Vec<Vec<BlockId>>,
     ) -> Self {
         debug_assert!(block_ids.len() == token_blocks.len());
         debug_assert!(block_ids.len() == priorities.len());
+        debug_assert!(
+            per_group_block_ids.is_empty() || per_group_block_ids.len() > 1,
+            "per-group source ids are only recorded for multi-group offloads"
+        );
+        for ids in &per_group_block_ids {
+            debug_assert_eq!(
+                ids.len(),
+                block_ids.len(),
+                "per-group source ids must be position-aligned with the candidate list"
+            );
+        }
         Self {
             request_id,
             block_ids,
             token_blocks,
             priorities,
             operation_id,
+            per_group_block_ids,
         }
     }
 }
@@ -1506,8 +1702,13 @@ impl LocalOffloadRequest {
 struct LocalOnboardRequest {
     request_id: String,
     src_blocks: Box<dyn AnyBlocks>,
+    /// Group 0's destination device ids — also the logical block count.
     dst_block_ids: Vec<BlockId>,
     operation_id: uuid::Uuid,
+    /// Per-group DESTINATION device ids, group-major and position-indexed
+    /// (`[g][p]` = group `g`'s device id for the p-th destination). Empty in
+    /// the legacy single-group path — every group then uses `dst_block_ids`.
+    per_group_dst_block_ids: Vec<Vec<BlockId>>,
 }
 
 impl LocalOnboardRequest {
@@ -1516,13 +1717,26 @@ impl LocalOnboardRequest {
         src_blocks: Box<dyn AnyBlocks>,
         dst_block_ids: Vec<BlockId>,
         operation_id: uuid::Uuid,
+        per_group_dst_block_ids: Vec<Vec<BlockId>>,
     ) -> Self {
         debug_assert!(src_blocks.len() == dst_block_ids.len());
+        debug_assert!(
+            per_group_dst_block_ids.is_empty() || per_group_dst_block_ids.len() > 1,
+            "per-group destination ids are only recorded for multi-group onboards"
+        );
+        for ids in &per_group_dst_block_ids {
+            debug_assert_eq!(
+                ids.len(),
+                dst_block_ids.len(),
+                "per-group destination ids must be position-aligned with the dst list"
+            );
+        }
         Self {
             request_id,
             src_blocks,
             dst_block_ids,
             operation_id,
+            per_group_dst_block_ids,
         }
     }
 }
@@ -1807,12 +2021,32 @@ where
     let token_blocks = offload_req.token_blocks;
 
     let allocated_block_ids: Vec<usize> = blocks.iter().map(|b| b.block_id()).collect();
-    let block_pairs: Vec<(usize, usize)> = offload_req
-        .block_ids
+    let num_blocks = allocated_block_ids.len();
+
+    // Each group moves its OWN source device ids into the SAME freshly
+    // allocated tier blocks (the tier pool's ids index every group's
+    // worker-side view; only the DEVICE side is per-group). Legacy
+    // single-group offloads carry no per-group mapping and use group 0's
+    // ids for every group, exactly as before.
+    let src_ids_per_group: Vec<Vec<usize>> = if offload_req.per_group_block_ids.is_empty() {
+        vec![offload_req.block_ids.clone(); num_groups]
+    } else {
+        offload_req.per_group_block_ids.clone()
+    };
+    let block_pairs_per_group: Vec<Vec<(usize, usize)>> = src_ids_per_group
         .into_iter()
-        .zip(allocated_block_ids)
+        .map(|src_ids| {
+            debug_assert_eq!(
+                src_ids.len(),
+                num_blocks,
+                "per-group source ids must cover every candidate block"
+            );
+            src_ids
+                .into_iter()
+                .zip(allocated_block_ids.iter().copied())
+                .collect()
+        })
         .collect();
-    let num_blocks = block_pairs.len();
 
     tracing::debug!(
         request_id = request_id,
@@ -1846,11 +2080,11 @@ where
     );
 
     // 3. Issue the offload: ONE logical op fanned out to one request PER
-    // GROUP (same block pairs — the tier's block ids index every group's
-    // worker-side pool; each worker holds one pool per group), each leg with
-    // its own deterministic uuid. All legs are sent before any is awaited.
-    // Single-group (num_groups == 1) sends the one request exactly as
-    // before, with the logical op's uuid (derive_leg_uuid identity).
+    // GROUP — each leg carries that group's OWN source device ids (the tier
+    // destination ids are shared) and its own deterministic uuid. All legs
+    // are sent before any is awaited. Single-group (num_groups == 1) sends
+    // the one request exactly as before, with the logical op's uuid
+    // (derive_leg_uuid identity).
     let notify_receivers = fan_out_group_legs(
         leader,
         num_groups,
@@ -1858,7 +2092,7 @@ where
         offload_req.operation_id,
         BlockTransferPool::Device,
         transfer_pool,
-        block_pairs,
+        &block_pairs_per_group,
         RequestType::Scheduled,
         "offload",
     )
@@ -1911,8 +2145,11 @@ where
 
 /// Send one wire request PER GROUP LEG for a logical offload/onboard op.
 ///
-/// Each leg carries its own deterministic uuid (`derive_leg_uuid`) and its
-/// group tag — the worker-side connector scheduler rendezvous keys on
+/// Each leg carries its own deterministic uuid (`derive_leg_uuid`), its
+/// group tag, and ITS GROUP'S OWN block pairs (`block_pairs_per_group[g]` —
+/// the per-group device-id mapping; on offloads the sources differ per
+/// group, on onboards the destinations do, while the shared tier side is
+/// identical) — the worker-side connector scheduler rendezvous keys on
 /// `(request_id, uuid)` and supports exactly one Worker + one Transfer per
 /// uuid, so legs must not share the logical op's uuid. All legs are sent
 /// before any is awaited; if a leg's send fails after earlier legs were
@@ -1926,16 +2163,22 @@ async fn fan_out_group_legs(
     operation_id: uuid::Uuid,
     from_pool: BlockTransferPool,
     to_pool: BlockTransferPool,
-    block_pairs: Vec<(usize, usize)>,
+    block_pairs_per_group: &[Vec<(usize, usize)>],
     request_type: RequestType,
     op_name: &str,
 ) -> anyhow::Result<Vec<tokio::sync::oneshot::Receiver<()>>> {
+    assert_eq!(
+        block_pairs_per_group.len(),
+        num_groups,
+        "{op_name}: one block-pair list per group required (got {} for {num_groups} groups)",
+        block_pairs_per_group.len()
+    );
     let mut notify_receivers = Vec::with_capacity(num_groups);
-    for group in 0..num_groups {
+    for (group, group_block_pairs) in block_pairs_per_group.iter().enumerate() {
         let block_xfer_req = BlockTransferRequest {
             from_pool,
             to_pool,
-            blocks: block_pairs.clone(),
+            blocks: group_block_pairs.clone(),
             group,
             connector_req: Some(LeaderTransferRequest {
                 request_id: request_id.to_string(),
@@ -1999,16 +2242,31 @@ async fn process_onboard_request(
     // extract source block ids
     let src_block_ids = onboard_req.src_blocks.block_ids();
 
-    // create block pairs
-    let block_pairs = src_block_ids
-        .iter()
-        .zip(onboard_req.dst_block_ids.iter())
-        .map(|(src, dst)| (*src, *dst))
-        .collect::<Vec<_>>();
+    // The tier SOURCE ids are shared across groups (one tier pool); each
+    // group writes into its OWN destination device ids. Legacy single-group
+    // onboards carry no per-group mapping and use group 0's destinations
+    // for every group, exactly as before.
+    let dst_ids_per_group: Vec<Vec<usize>> = if onboard_req.per_group_dst_block_ids.is_empty() {
+        vec![onboard_req.dst_block_ids.clone(); num_groups]
+    } else {
+        onboard_req.per_group_dst_block_ids.clone()
+    };
+    let block_pairs_per_group: Vec<Vec<(usize, usize)>> = dst_ids_per_group
+        .into_iter()
+        .map(|dst_ids| {
+            debug_assert_eq!(
+                dst_ids.len(),
+                src_block_ids.len(),
+                "per-group destination ids must cover every source block"
+            );
+            src_block_ids.iter().copied().zip(dst_ids).collect()
+        })
+        .collect();
 
     // Issue the onboard: ONE logical op fanned out to one request PER GROUP
-    // (same block pairs; each group's worker-side pools), each leg with its
-    // own deterministic uuid. All legs are sent before any is awaited.
+    // (shared tier sources into each group's own device destinations), each
+    // leg with its own deterministic uuid. All legs are sent before any is
+    // awaited.
     let notify_receivers = fan_out_group_legs(
         leader,
         num_groups,
@@ -2016,7 +2274,7 @@ async fn process_onboard_request(
         *operation_id,
         onboard_req.src_blocks.storage_pool(),
         BlockTransferPool::Device,
-        block_pairs,
+        &block_pairs_per_group,
         RequestType::Immediate,
         "onboard",
     )
@@ -2161,10 +2419,20 @@ mod connector_tests {
     fn drain_offload_block_ids(
         rx: &mut mpsc::UnboundedReceiver<LocalTransferRequest>,
     ) -> Vec<Vec<usize>> {
+        drain_offload_requests(rx)
+            .into_iter()
+            .map(|offload| offload.block_ids)
+            .collect()
+    }
+
+    /// Drains all pending offload requests from the channel, whole.
+    fn drain_offload_requests(
+        rx: &mut mpsc::UnboundedReceiver<LocalTransferRequest>,
+    ) -> Vec<LocalOffloadRequest> {
         let mut results = Vec::new();
         while let Ok(req) = rx.try_recv() {
             if let LocalTransferRequest::Offload(offload) = req {
-                results.push(offload.block_ids);
+                results.push(offload);
             }
         }
         results
@@ -2614,6 +2882,15 @@ mod connector_tests {
         let num_tokens = 96; // 3 blocks
         let (mut slot, mut rx) = create_test_slot_with_groups(num_tokens, 0, 3);
 
+        // Multi-group slots require the per-group mapping before any
+        // transfer op: group 0's ids are only valid for group 0's pool.
+        slot.set_per_group_device_blocks(&[
+            block_ids(100, 3),
+            block_ids(200, 3),
+            block_ids(300, 3),
+        ])
+        .unwrap();
+
         slot.append_mutable_device_blocks(&block_ids(100, 3))
             .unwrap();
         slot.apply_scheduler_output(&[], &[], 0, num_tokens, None, None)
@@ -2667,6 +2944,11 @@ mod connector_tests {
     fn onboard_records_one_metadata_operation_per_group() {
         let (mut slot, _rx) = create_test_slot_with_groups(96, 0, 2);
 
+        // Multi-group onboards resolve destination ids per group from the
+        // mapping — publish it first (positions 0..2 hold the onboard dst).
+        slot.set_per_group_device_blocks(&[vec![0, 1], vec![90, 91]])
+            .unwrap();
+
         slot.onboard_blocks(
             Box::new(TestAnyBlocks {
                 ids: vec![500, 501],
@@ -2689,5 +2971,181 @@ mod connector_tests {
             assert_eq!(op.uuid, derive_leg_uuid(ops[0].uuid, group));
         }
         assert_ne!(ops[0].uuid, ops[1].uuid);
+    }
+
+    // ---------------------------------------------------------------
+    // Per-group block-id mapping (HMA): set/append + consumers
+    // ---------------------------------------------------------------
+
+    /// Drains all pending onboard requests from the channel, whole.
+    fn drain_onboard_requests(
+        rx: &mut mpsc::UnboundedReceiver<LocalTransferRequest>,
+    ) -> Vec<LocalOnboardRequest> {
+        let mut results = Vec::new();
+        while let Ok(req) = rx.try_recv() {
+            if let LocalTransferRequest::Onboard(onboard) = req {
+                results.push(onboard);
+            }
+        }
+        results
+    }
+
+    #[test]
+    fn per_group_mapping_set_replaces_and_append_extends() {
+        let (mut slot, _rx) = create_test_slot_with_groups(96, 0, 2);
+
+        // update_state_after_alloc / new-request scheduling report FULL
+        // per-group lists — they REPLACE the table.
+        slot.set_per_group_device_blocks(&[vec![10, 11], vec![20, 22]])
+            .unwrap();
+        assert_eq!(
+            slot.per_group_block_table_snapshot(),
+            Some(&[vec![10, 11], vec![20, 22]][..])
+        );
+
+        // Running-request scheduling reports per-group DELTAS — they extend
+        // each group's list at the tail.
+        slot.append_per_group_device_blocks(&[vec![12], vec![23]])
+            .unwrap();
+        assert_eq!(
+            slot.per_group_block_table_snapshot(),
+            Some(&[vec![10, 11, 12], vec![20, 22, 23]][..])
+        );
+
+        // A second full report replaces everything again (e.g. resume after
+        // preemption re-publishes the request's full lists).
+        slot.set_per_group_device_blocks(&[vec![30], vec![40]])
+            .unwrap();
+        assert_eq!(
+            slot.per_group_block_table_snapshot(),
+            Some(&[vec![30], vec![40]][..])
+        );
+    }
+
+    #[test]
+    fn per_group_mapping_delta_append_before_any_set_builds_table() {
+        let (mut slot, _rx) = create_test_slot_with_groups(64, 0, 2);
+        slot.append_per_group_device_blocks(&[vec![5], vec![6]])
+            .unwrap();
+        assert_eq!(
+            slot.per_group_block_table_snapshot(),
+            Some(&[vec![5], vec![6]][..])
+        );
+    }
+
+    #[test]
+    fn per_group_mapping_wrong_group_count_errors() {
+        let (mut slot, _rx) = create_test_slot_with_groups(64, 0, 2);
+        let err = slot
+            .set_per_group_device_blocks(&[vec![1, 2]])
+            .expect_err("1 list for a 2-group slot must fail");
+        assert!(err.to_string().contains("expects 2 group lists"));
+        let err = slot
+            .append_per_group_device_blocks(&[vec![1], vec![2], vec![3]])
+            .expect_err("3 lists for a 2-group slot must fail");
+        assert!(err.to_string().contains("expects 2 group lists"));
+    }
+
+    #[test]
+    fn offload_carries_per_group_source_ids() {
+        let num_tokens = 96; // 3 blocks
+        let (mut slot, mut rx) = create_test_slot_with_groups(num_tokens, 0, 2);
+
+        // The HMA-PROBE shape: same position, DIFFERENT device id per group.
+        slot.set_per_group_device_blocks(&[block_ids(100, 3), block_ids(900, 3)])
+            .unwrap();
+        slot.append_mutable_device_blocks(&block_ids(100, 3))
+            .unwrap();
+        slot.apply_scheduler_output(&[], &[], 0, num_tokens, None, None)
+            .unwrap();
+
+        let offloads = drain_offload_requests(&mut rx);
+        assert_eq!(offloads.len(), 1);
+        let offload = &offloads[0];
+        // Group 0's flat list is unchanged (tier allocation count + legacy
+        // fallback), and each group's source ids are its OWN.
+        assert_eq!(offload.block_ids, vec![100, 101, 102]);
+        assert_eq!(
+            offload.per_group_block_ids,
+            vec![vec![100, 101, 102], vec![900, 901, 902]]
+        );
+    }
+
+    #[test]
+    fn offload_single_group_keeps_legacy_empty_per_group_ids() {
+        let num_tokens = 96;
+        let (mut slot, mut rx) = create_test_slot_with_groups(num_tokens, 0, 1);
+
+        slot.append_mutable_device_blocks(&block_ids(100, 3))
+            .unwrap();
+        slot.apply_scheduler_output(&[], &[], 0, num_tokens, None, None)
+            .unwrap();
+
+        let offloads = drain_offload_requests(&mut rx);
+        assert_eq!(offloads.len(), 1);
+        assert!(
+            offloads[0].per_group_block_ids.is_empty(),
+            "single-group offloads carry no per-group mapping"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "per-group device block mapping missing")]
+    fn offload_multi_group_without_mapping_refuses_to_move_group_zero_ids() {
+        let num_tokens = 96;
+        let (mut slot, _rx) = create_test_slot_with_groups(num_tokens, 0, 2);
+
+        slot.append_mutable_device_blocks(&block_ids(100, 3))
+            .unwrap();
+        // No set_per_group_device_blocks: an offload here would move group
+        // 0's ids through group 1's pool — wrong bytes. It must fail.
+        slot.apply_scheduler_output(&[], &[], 0, num_tokens, None, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn onboard_carries_per_group_destination_ids() {
+        let (mut slot, mut rx) = create_test_slot_with_groups(96, 0, 2);
+
+        // Onboard destinations are the mapping's positions 0..2 (the slot's
+        // evaluated_blocks is 0 before any onboarding).
+        slot.set_per_group_device_blocks(&[vec![7, 8, 9], vec![70, 80, 90]])
+            .unwrap();
+
+        slot.onboard_blocks(
+            Box::new(TestAnyBlocks {
+                ids: vec![500, 501],
+                pool: BlockTransferPool::Host,
+            }),
+            vec![7, 8],
+        )
+        .unwrap();
+
+        let onboards = drain_onboard_requests(&mut rx);
+        assert_eq!(onboards.len(), 1);
+        let onboard = &onboards[0];
+        assert_eq!(onboard.dst_block_ids, vec![7, 8]);
+        assert_eq!(
+            onboard.per_group_dst_block_ids,
+            vec![vec![7, 8], vec![70, 80]]
+        );
+    }
+
+    #[test]
+    fn onboard_multi_group_without_mapping_refuses_group_zero_destinations() {
+        let (mut slot, _rx) = create_test_slot_with_groups(96, 0, 2);
+        let err = slot
+            .onboard_blocks(
+                Box::new(TestAnyBlocks {
+                    ids: vec![500, 501],
+                    pool: BlockTransferPool::Host,
+                }),
+                vec![7, 8],
+            )
+            .expect_err("multi-group onboard without a mapping must fail");
+        assert!(
+            err.to_string()
+                .contains("per-group device block mapping missing")
+        );
     }
 }
