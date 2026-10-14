@@ -15,7 +15,6 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
-from typing import Optional
 
 import pytest
 import torch
@@ -54,14 +53,19 @@ class FakeKVCacheConfig:
 
 
 class FakeVllmConfig:
-    """Stands in for vllm.config.VllmConfig (attribute surface only)."""
+    """Stands in for vllm.config.VllmConfig (attribute surface only).
 
-    def __init__(self, kv_cache_config: Optional[FakeKVCacheConfig]):
+    Note: vLLM does NOT expose kv_cache_config as a VllmConfig attribute —
+    the connector factory passes it to DynamoConnector's constructor, which
+    threads it to KvConnectorWorker as a constructor kwarg. Tests pass the
+    fake ``KVCacheConfig`` to the worker constructor directly.
+    """
+
+    def __init__(self):
         cache_config = types.SimpleNamespace(block_size=16, cache_dtype="auto")
         model_config = types.SimpleNamespace(use_mla=False, dtype=torch.uint8)
         self.cache_config = cache_config
         self.model_config = model_config
-        self.kv_cache_config = kv_cache_config
 
 
 class FakeCudaEvent:

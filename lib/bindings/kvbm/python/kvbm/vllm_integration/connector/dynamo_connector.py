@@ -64,7 +64,9 @@ class DynamoConnector(KVConnectorBase_V1, SupportsHMA):
             self._worker = None
         elif role == KVConnectorRole.WORKER:
             self._worker = KvConnectorWorker(
-                vllm_config=vllm_config, engine_id=self.engine_id
+                vllm_config=vllm_config,
+                engine_id=self.engine_id,
+                kv_cache_config=kv_cache_config,
             )
             self._scheduler = None
 

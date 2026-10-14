@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.config import VllmConfig
     from vllm.forward_context import ForwardContext
+    from vllm.v1.kv_cache_interface import KVCacheConfig
 
 
 # from kvbm.vllm_integration.kv_cache_utils import KvbmCacheBlocks
@@ -105,7 +106,13 @@ def _recover_raw_tensor(state_tensors: "list[torch.Tensor]") -> "torch.Tensor":
 
 
 class KvConnectorWorker:
-    def __init__(self, vllm_config: "VllmConfig", engine_id: str, **kwargs):
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        engine_id: str,
+        kv_cache_config: Optional["KVCacheConfig"] = None,
+        **kwargs,
+    ):
         drt: Optional[object] = kwargs.get("drt")
 
         if drt is None and is_dyn_runtime_enabled():
@@ -116,6 +123,10 @@ class KvConnectorWorker:
         self.drt = drt
 
         self.vllm_config = vllm_config
+        # vLLM's connector factory hands this to DynamoConnector (the 3-arg
+        # contract); the model runner holds it elsewhere on VllmConfig, so
+        # this kwarg — not a vllm_config attribute — is the only source.
+        self.kv_cache_config = kv_cache_config
         self._connector = RustKvConnectorWorker(self.drt, engine_id)
         self.mamba_layer_names: set[str] = set()
         # Rust handoff (Task 6); fallback: one non-mamba group, page_bytes=None
@@ -131,9 +142,11 @@ class KvConnectorWorker:
         KV Caches in the KVConnector (e.g. for NIXL).
 
         Args: kv_caches:
-            dictionary of layer names, kv cache.  Hybrid models (vLLM HMA)
-            pass a list[Tensor] for recurrent (Mamba/GDN) layers — strided
-            views into one flat backing buffer — instead of a single Tensor.
+            dictionary of layer names, kv cache.  Hybrid (Mamba/GDN) layers
+            arrive either as a plain page tensor ([num_blocks, 1, 1, C]
+            int8 — vLLM 0.29) or as a list[Tensor] of strided views into
+            one flat backing buffer (vLLM HMA-era); both normalize to the
+            flat [num_blocks, C] backing tensor before registration.
         """
 
         cache_config = self.vllm_config.cache_config
@@ -146,10 +159,12 @@ class KvConnectorWorker:
             )
         ]
 
-        # Partition the layers into HMA groups (vLLM's kv_cache_config) for
-        # per-group validation below; a missing config falls back to one
-        # group covering every layer.
-        kv_cache_config = getattr(self.vllm_config, "kv_cache_config", None)
+        # Partition the layers into HMA groups (vLLM's kv_cache_config,
+        # supplied to the connector by vLLM's factory) for per-group
+        # validation below; a missing config falls back to one group
+        # covering every layer.  The plan is derived BEFORE normalization:
+        # it decides which layers are recurrent.
+        kv_cache_config = self.kv_cache_config
         group_plans = derive_layer_groups(
             kv_cache_config, [name for name, _tensor in ordered_kv_caches]
         )
@@ -173,25 +188,104 @@ class KvConnectorWorker:
                     unknown_layers[:4],
                 )
 
-        # Normalize recurrent (Mamba/GDN) layers — list[Tensor] strided views —
-        # to the flat raw_tensor backing them, so every registered layer is a
-        # Tensor with the same [num_blocks, ...] block layout as attention KV.
+        # The plans share ONE group_of_layer list parallel to the
+        # registration order (GroupPlan docstring); plan[0]'s view is the
+        # authoritative mapping.
+        group_of_layer = group_plans[0].group_of_layer
+        mamba_group_ids = {plan.group_id for plan in group_plans if plan.is_mamba}
+
+        # num_device_blocks must come from an ATTENTION-group tensor, and
+        # the plan (not the tensor shape) decides which layers those are:
+        # a GDN layer's raw page tensor [num_blocks, 1, 1, C] is 4D and
+        # would hijack a shape-based heuristic.  Nemotron-style hybrid
+        # patterns can also START with a mamba layer, so "first" alone is
+        # not enough.  The isinstance guard covers the single-group
+        # fallback (no kv_cache_config) where a list[Tensor] HMA value
+        # could come first.
+        use_mla = getattr(self.vllm_config.model_config, "use_mla", False)
+        attention_tensor = next(
+            (
+                t
+                for (_n, t), gid in zip(ordered_kv_caches, group_of_layer)
+                if gid not in mamba_group_ids and isinstance(t, torch.Tensor)
+            ),
+            None,
+        )
+        if attention_tensor is None:
+            ref_tensor = ordered_kv_caches[0][1]
+            if isinstance(ref_tensor, list):
+                ref_tensor = _recover_raw_tensor(ref_tensor)
+            shape = ref_tensor.shape
+            num_device_blocks = shape[0]
+        else:
+            shape = attention_tensor.shape
+            # MLA tensors are [num_blocks, page_size, head_size] — block dim is always axis 0.
+            # Standard attention tensors are [outer_dim, num_blocks, ...] or [num_blocks, outer_dim, ...]
+            # — block dim is whichever axis is larger, which is unambiguous as long as
+            # num_blocks >> outer_dim (always true in practice).
+            num_device_blocks = shape[0] if use_mla else max(shape[0], shape[1])
+
+        # Normalize recurrent (Mamba/GDN) layers to a flat 2D
+        # [num_blocks, state_bytes] tensor — the same [num_blocks, ...]
+        # block layout attention KV registers with.  The PLAN decides
+        # which layers are recurrent (not the value type): vLLM 0.29
+        # hands GDN layers a plain page tensor while HMA-era vLLM passed
+        # list[Tensor] strided views into one flat buffer.
         attention_layer_count = 0
         recurrent_layer_count = 0
         normalized_kv_caches: list[tuple[str, torch.Tensor]] = []
         mamba_layer_names: set[str] = set()
-        for layer_name, value in ordered_kv_caches:
-            if isinstance(value, list):
-                raw_tensor = _recover_raw_tensor(value)
+        for layer_pos, (layer_name, value) in enumerate(ordered_kv_caches):
+            if group_of_layer[layer_pos] in mamba_group_ids:
+                if isinstance(value, list):
+                    # HMA-era forward compat: recover the flat backing
+                    # raw_tensor from the strided views.
+                    raw_tensor = _recover_raw_tensor(value)
+                    logger.debug(
+                        "register_kv_caches: layer=%s list[Tensor] len=%d raw_shape=%s",
+                        layer_name,
+                        len(value),
+                        list(raw_tensor.shape),
+                    )
+                else:
+                    # Plain page tensor ([num_blocks, 1, 1, C] int8):
+                    # flatten every axis after the first.  view() cannot
+                    # copy — vLLM allocates the page tensor contiguous
+                    # with the block axis outermost, so folding the
+                    # trailing dims is stride-preserving and the storage
+                    # base (data_ptr) Rust registers stays vLLM's live
+                    # buffer.  view() only raises for a non-viewable
+                    # layout, where reshape() would ALLOCATE A COPY and
+                    # the registered pointer would diverge from vLLM's
+                    # cache — that never happens for the raw page tensor,
+                    # but warn loudly if it ever does.
+                    try:
+                        raw_tensor = value.view(value.shape[0], -1)
+                    except RuntimeError:
+                        logger.warning(
+                            "mamba layer %s: shape %s is not viewable as "
+                            "[num_blocks, -1]; reshape() may have copied — "
+                            "the registered storage base can differ from "
+                            "vLLM's cache buffer",
+                            layer_name,
+                            list(value.shape),
+                        )
+                        raw_tensor = value.reshape(value.shape[0], -1)
+                    # TEMPORARY shape probe (Phase-1-style): confirms the
+                    # plain-tensor form from the node log; remove after the
+                    # Probe A/B verdicts.
+                    logger.warning(
+                        "mamba layer %s: value type %s, shape %s, dtype %s "
+                        "-> normalized %s",
+                        layer_name,
+                        type(value).__name__,
+                        list(value.shape),
+                        value.dtype,
+                        list(raw_tensor.shape),
+                    )
                 mamba_layer_names.add(layer_name)
                 recurrent_layer_count += 1
                 normalized_kv_caches.append((layer_name, raw_tensor))
-                logger.debug(
-                    "register_kv_caches: layer=%s list[Tensor] len=%d raw_shape=%s",
-                    layer_name,
-                    len(value),
-                    list(raw_tensor.shape),
-                )
             else:
                 attention_layer_count += 1
                 normalized_kv_caches.append((layer_name, value))
@@ -232,27 +326,8 @@ class KvConnectorWorker:
             for (layer_name, _tensor), event in zip(ordered_kv_caches, events)
         }
 
-        # num_device_blocks must come from an attention tensor (>= 3 dims):
-        # recurrent raw_tensors are 2D [num_blocks, flat_state] where shape[1]
-        # is the flattened state size, not the block axis.  Nemotron-style
-        # hybrid patterns start with a Mamba layer, so the first tensor cannot
-        # be assumed to be attention.
-        use_mla = getattr(self.vllm_config.model_config, "use_mla", False)
-        attention_tensor = next(
-            (t for _n, t in ordered_kv_caches if t.dim() >= 3), None
-        )
-        if attention_tensor is None:
-            ref_tensor = ordered_kv_caches[0][1]
-            shape = ref_tensor.shape
-            num_device_blocks = shape[0]
-        else:
-            shape = attention_tensor.shape
-            # MLA tensors are [num_blocks, page_size, head_size] — block dim is always axis 0.
-            # Standard attention tensors are [outer_dim, num_blocks, ...] or [num_blocks, outer_dim, ...]
-            # — block dim is whichever axis is larger, which is unambiguous as long as
-            # num_blocks >> outer_dim (always true in practice).
-            num_device_blocks = shape[0] if use_mla else max(shape[0], shape[1])
-
+        # num_device_blocks was derived above from an attention-group
+        # tensor (plan-driven, before normalization).
         page_size = cache_config.block_size
         device_id = ordered_kv_caches[0][1].device.index
 
@@ -338,11 +413,16 @@ class KvConnectorWorker:
         for plan in self.group_plans:
             if plan.is_mamba and plan.layer_names:
                 first_tensor = name_to_tensor[plan.layer_names[0]]
-                # Physical per-block row bytes of the group's dense
-                # int8 [B, C] state tensor. vLLM's spec page_size is
-                # padded metadata (Phase 1 probe proved it); the
-                # tensor's own shape is ground truth.
-                page_bytes: Optional[int] = int(first_tensor.shape[1])
+                # Physical per-block row bytes of the group's NORMALIZED
+                # dense [num_blocks, C] state tensor: dtype-folded
+                # (element_size * elements per block row) rather than
+                # assumed int8 or read off shape[1].  vLLM's spec
+                # page_size is padded metadata (Phase 1 probe proved
+                # it); the tensor's own layout is ground truth.
+                page_bytes: Optional[int] = int(
+                    first_tensor.element_size()
+                    * (first_tensor.nelement() // first_tensor.shape[0])
+                )
             else:
                 # Attention groups: Rust infers the geometry from the
                 # group's first tensor (page tokens fall back to the
