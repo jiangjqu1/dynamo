@@ -198,14 +198,17 @@ class KvConnectorWorker:
         ordered_kv_caches = normalized_kv_caches
         self.mamba_layer_names = mamba_layer_names
 
-        logger.info(
+        # TEMPORARY probe level (warning, not info): python logging's default
+        # level is WARNING and nothing configures the kvbm loggers — the
+        # Phase 1 probe proved INFO lines never reach the worker log.
+        logger.warning(
             "register_kv_caches: %d KV layers (%d attention, %d recurrent/HMA)",
             len(ordered_kv_caches),
             attention_layer_count,
             recurrent_layer_count,
         )
         for group in group_plans:
-            logger.info(
+            logger.warning(
                 "register_kv_caches: group %d: %d layers (mamba=%s), layers=%s",
                 group.group_id,
                 len(group.layer_names),

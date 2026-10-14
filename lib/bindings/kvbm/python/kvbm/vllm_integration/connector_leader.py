@@ -160,8 +160,8 @@ class KvConnectorLeader:
         # update_state_after_alloc receives the allocated KVCacheBlocks,
         # whose get_block_ids() is the per-group tuple.
         group_block_ids = blocks.get_block_ids()
-        if len(group_block_ids) > 1 and logger.isEnabledFor(logging.INFO):
-            logger.info(
+        if len(group_block_ids) > 1 and logger.isEnabledFor(logging.WARNING):
+            logger.warning(
                 "HMA-PROBE: request %s block_ids per group: %s",
                 request.request_id,
                 [list(g) for g in group_block_ids[:4]],  # truncate
