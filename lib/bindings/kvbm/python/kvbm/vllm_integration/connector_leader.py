@@ -7,6 +7,7 @@ Implementation of vLLM KV cache manager protocol.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 from vllm.config import VllmConfig
@@ -38,6 +39,8 @@ from kvbm.vllm_integration.rust import SchedulerOutput as RustSchedulerOutput
 DistributedRuntime = None
 if is_dyn_runtime_enabled():
     from dynamo.runtime import DistributedRuntime
+
+logger = logging.getLogger(__name__)
 
 
 class DynamoConnectorMetadata(KVConnectorMetadata):
@@ -147,7 +150,23 @@ class KvConnectorLeader:
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
-        block_ids = blocks.get_block_ids()[0]
+        # TEMPORARY HMA-PROBE (remove after Task 9's probe verdicts): verify
+        # the shared-index assumption — vLLM HMA hands per-group block-id
+        # lists and the multi-group pool design requires them to be identical
+        # (group 0 is authoritative here and in build_connector_meta). The
+        # probe lives here rather than in get_num_new_matched_tokens because
+        # the Request object does not carry block_ids in this vLLM line and
+        # the blocks are not allocated yet when that hook runs;
+        # update_state_after_alloc receives the allocated KVCacheBlocks,
+        # whose get_block_ids() is the per-group tuple.
+        group_block_ids = blocks.get_block_ids()
+        if len(group_block_ids) > 1:
+            logger.info(
+                "HMA-PROBE: request %s block_ids per group: %s",
+                request.request_id,
+                [list(g) for g in group_block_ids[:4]],  # truncate
+            )
+        block_ids = group_block_ids[0]
         self._connector.update_state_after_alloc(
             request.request_id, block_ids, num_external_tokens
         )

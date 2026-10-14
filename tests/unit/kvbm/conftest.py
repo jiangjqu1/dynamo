@@ -106,6 +106,28 @@ class FakeRustKvConnectorWorker:
         return set(), set()
 
 
+class FakeKVConnectorBase_V1:
+    """Stand-in for vLLM's KVConnectorBase_V1 (subclass/constructor surface)."""
+
+    def __init__(self, vllm_config=None, role=None, kv_cache_config=None):
+        pass
+
+
+class FakeKVConnectorMetadata:
+    """Stand-in for vLLM's KVConnectorMetadata (subclass target)."""
+
+
+class FakeKVConnectorRole:
+    """Stand-in for vLLM's KVConnectorRole enum (scheduler/worker)."""
+
+    SCHEDULER = "scheduler"
+    WORKER = "worker"
+
+
+class FakeSupportsHMA:
+    """Stand-in for vLLM's SupportsHMA marker mixin."""
+
+
 @pytest.fixture(name="connector_worker_module")
 def load_connector_worker_module(monkeypatch):
     """Load connector_worker.py from source with kvbm's heavy imports stubbed.
@@ -152,3 +174,58 @@ def load_connector_worker_module(monkeypatch):
     monkeypatch.setattr(torch.cuda, "Event", FakeCudaEvent)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
     return worker_mod
+
+
+@pytest.fixture(name="connector_module")
+def load_connector_module(monkeypatch):
+    """Load dynamo_connector.py from source with vllm and kvbm's heavy
+    imports stubbed.
+
+    The scheduler-facing delegation methods (``request_finished`` /
+    ``request_finished_all_groups``) are pure routing over the leader, so
+    vLLM's protocol base classes are faked, the leader/worker modules are
+    stubbed, and the REAL ``DynamoConnector`` class is loaded from its
+    source file. Tests exercise the methods unbound on caller-provided
+    stubs — no vLLM import and no leader construction. monkeypatch
+    restores sys.modules after each test.
+    """
+    kvbm_pkg = types.ModuleType("kvbm")
+    kvbm_pkg.__path__ = []
+    monkeypatch.setitem(sys.modules, "kvbm", kvbm_pkg)
+
+    utils_mod = types.ModuleType("kvbm.utils")
+    utils_mod.is_dyn_runtime_enabled = lambda: False
+    utils_mod.nvtx_annotate = lambda category: (lambda func: func)
+    monkeypatch.setitem(sys.modules, "kvbm.utils", utils_mod)
+
+    vllm_integration = types.ModuleType("kvbm.vllm_integration")
+    vllm_integration.__path__ = []
+    monkeypatch.setitem(sys.modules, "kvbm.vllm_integration", vllm_integration)
+
+    leader_mod = types.ModuleType("kvbm.vllm_integration.connector_leader")
+    leader_mod.KvConnectorLeader = type("KvConnectorLeader", (), {})
+    monkeypatch.setitem(sys.modules, leader_mod.__name__, leader_mod)
+
+    worker_mod = types.ModuleType("kvbm.vllm_integration.connector_worker")
+    worker_mod.KvConnectorWorker = type("KvConnectorWorker", (), {})
+    monkeypatch.setitem(sys.modules, worker_mod.__name__, worker_mod)
+
+    base_mod = types.ModuleType("vllm.distributed.kv_transfer.kv_connector.v1.base")
+    base_mod.KVConnectorBase_V1 = FakeKVConnectorBase_V1
+    base_mod.KVConnectorMetadata = FakeKVConnectorMetadata
+    base_mod.KVConnectorRole = FakeKVConnectorRole
+    base_mod.SupportsHMA = FakeSupportsHMA
+    monkeypatch.setitem(sys.modules, base_mod.__name__, base_mod)
+
+    output_mod = types.ModuleType("vllm.v1.core.sched.output")
+    output_mod.SchedulerOutput = type("SchedulerOutput", (), {})
+    monkeypatch.setitem(sys.modules, output_mod.__name__, output_mod)
+
+    connector_spec = importlib.util.spec_from_file_location(
+        "kvbm.vllm_integration.connector.dynamo_connector",
+        _VLLM_INTEGRATION_DIR / "connector" / "dynamo_connector.py",
+    )
+    connector_mod = importlib.util.module_from_spec(connector_spec)
+    monkeypatch.setitem(sys.modules, connector_spec.name, connector_mod)
+    connector_spec.loader.exec_module(connector_mod)
+    return connector_mod

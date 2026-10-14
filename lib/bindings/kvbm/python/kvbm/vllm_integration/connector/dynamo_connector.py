@@ -105,16 +105,15 @@ class DynamoConnector(KVConnectorBase_V1, SupportsHMA):
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
-        """HMA (Hybrid Memory Allocator) support (vLLM 0.29+).
-
-        Single-group configs (attention-only models) delegate to the existing
-        request_finished flow unchanged. Multi-group configs (hybrid SSM
-        models) return (False, None) — vLLM frees the blocks immediately and
-        the kvbm offload/onboard for the per-group KV/state is a follow-up;
-        declaring HMA keeps the hybrid memory allocator enabled so hybrid
-        models can start.
-        """
-        if len(block_ids) == 1:
+        """HMA multi-group finish. Groups share one block index (verified on
+        the fp4: per-group lists are identical; group 0 is authoritative).
+        Delegating preserves the leader's finish bookkeeping (slots become
+        matchable for onboarding) — we return False so vLLM frees the device
+        blocks, matching the attention-only contract where offload is a copy
+        that never holds blocks. If per-group lists ever diverge, the
+        HMA-PROBE log in connector_leader.py will show it and the slot
+        machinery must switch to per-group block-id mapping."""
+        if len(block_ids) >= 1:
             return self.request_finished(request, block_ids[0])
         return False, None
 
