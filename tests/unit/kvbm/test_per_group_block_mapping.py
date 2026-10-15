@@ -11,9 +11,14 @@ hook that precedes a per-group consumer:
 - ``update_state_after_alloc`` — FULL lists, REPLACE, before the Rust call
   (it may trigger onboarding inside, which resolves per-group dst ids).
 - ``build_connector_meta`` — new requests re-publish FULL lists; running
-  cached requests APPEND per-group DELTAS; resumed-from-preemption requests
-  REPLACE with FULL lists (vLLM's CachedRequestData contract).
-- single-group deployments must make NONE of these calls.
+  cached requests are merged into the leader's CUMULATIVE per-group store
+  and the FULL stored lists are republished every step (a delta alone is
+  not always reconstructive — prefix-cache COW delivers replacement-shaped
+  feeds, live cm008 evidence ``[0, 6]`` replacing a mid-list id);
+  resumed-from-preemption requests REPLACE the store with FULL lists
+  (vLLM's CachedRequestData contract).
+- single-group deployments must make NONE of these calls and keep the raw
+  per-step delta feeds unchanged.
 
 The REAL ``KvConnectorLeader`` is loaded from source with the Rust
 connector stubbed (a recording fake), so these tests assert the PUBLISH
@@ -324,6 +329,182 @@ def test_build_connector_meta_single_group_skips_mapping(leader_module):
     leader.build_connector_meta(_scheduler_output(new_reqs=[new_req], cached=cached))
 
     assert not [call for call in rust.calls if call[0] in ("set", "append")]
+
+
+def _flat_feeds(rust):
+    """The per-request flat block-id feeds from the last build_meta call."""
+    output = rust.calls[-1][1]
+    return {c["request_id"]: c["new_block_ids"] for c in output.cached_requests}
+
+
+def _mapping_calls(rust, req_id):
+    return [c for c in rust.calls if c[0] in ("set", "append") and c[1] == req_id]
+
+
+def test_chunked_prefill_publishes_cumulative_full_lists(leader_module):
+    """The chunked-prefill cadence fix: admission stores the full lists; a
+    running step's delta EXTENDS the store; the Rust mapping receives the
+    CUMULATIVE lists (set, not append) and the flat feed is the FULL
+    group-0 list — so the Rust slot's tracked list grows with every chunk
+    and the offload candidates index real positions."""
+    leader, rust = _make_leader(leader_module, 4)
+
+    # Chunk 1 (admission): NewRequestData carries FULL per-group lists.
+    new_req = FakeNewReq("req-c", ([10, 11], [20, 21], [30, 31], [40, 41]))
+    leader.build_connector_meta(_scheduler_output(new_reqs=[new_req]))
+    assert "req-c" in leader._req_full_blocks
+
+    # Chunk 2 (running): vLLM's cached-request new_block_ids are per-group
+    # DELTAS. The store must absorb them and republish FULL.
+    cached = FakeCachedReqs(req_ids=["req-c"], new_block_ids=[([12], [22], [32], [42])])
+    leader.build_connector_meta(_scheduler_output(cached=cached))
+
+    calls = _mapping_calls(rust, "req-c")
+    assert [c[0] for c in calls] == [
+        "set",
+        "set",
+    ], "the cumulative mapping is REPLACED (not appended) every step"
+    assert calls[1][2] == [[10, 11, 12], [20, 21, 22], [30, 31, 32], [40, 41, 42]]
+    assert _flat_feeds(rust)["req-c"] == [
+        10,
+        11,
+        12,
+    ], "the flat feed must be the FULL cumulative group-0 list, not the delta"
+
+
+def test_cow_replacement_delta_never_leaves_stale_positions(leader_module):
+    """The cm008 COW shape: a NON-resumed step's new_block_ids carry the
+    replacement-shaped lists ([0, 6] where 6 replaces mid-list id 1). The
+    leader mirrors the Rust reconcile (head-match + divergent tail →
+    REPLACE) so every published position holds vLLM's CURRENT id — the
+    reassigned-away ids must never remain for the offload consumers."""
+    leader, rust = _make_leader(leader_module, 4)
+
+    new_req = FakeNewReq("req-cow", ([0, 1], [0, 2], [0, 3], [4, 5]))
+    leader.build_connector_meta(_scheduler_output(new_reqs=[new_req]))
+
+    cached = FakeCachedReqs(
+        req_ids=["req-cow"], new_block_ids=[([0, 6], [0, 7], [0, 8], [4, 9])]
+    )
+    leader.build_connector_meta(_scheduler_output(cached=cached))
+
+    calls = _mapping_calls(rust, "req-cow")
+    assert [c[0] for c in calls] == ["set", "set"]
+    assert calls[1][2] == [[0, 6], [0, 7], [0, 8], [4, 9]], (
+        "the COW replacement must REPLACE the stored lists — no stale "
+        "position may survive for the offload consumers"
+    )
+    assert _flat_feeds(rust)["req-cow"] == [0, 6]
+
+
+def test_cow_replacement_then_pure_append_extends(leader_module):
+    """After the COW step replaced the store, the next step's genuine
+    tail-appends extend the replaced lists (the cadence self-heals)."""
+    leader, rust = _make_leader(leader_module, 4)
+
+    leader.build_connector_meta(
+        _scheduler_output(
+            new_reqs=[FakeNewReq("req-h", ([0, 1], [0, 2], [0, 3], [4, 5]))]
+        )
+    )
+    leader.build_connector_meta(
+        _scheduler_output(
+            cached=FakeCachedReqs(
+                req_ids=["req-h"], new_block_ids=[([0, 6], [0, 7], [0, 8], [4, 9])]
+            )
+        )
+    )
+    leader.build_connector_meta(
+        _scheduler_output(
+            cached=FakeCachedReqs(
+                req_ids=["req-h"], new_block_ids=[([9], [9], [9], [9])]
+            )
+        )
+    )
+
+    calls = _mapping_calls(rust, "req-h")
+    assert [c[0] for c in calls] == ["set", "set", "set"]
+    # Groups 0-2 extend with the new id; group 3's delta [9] is already
+    # tracked at its tail — the suffix-overlap dedup adds nothing.
+    assert calls[2][2] == [[0, 6, 9], [0, 7, 9], [0, 8, 9], [4, 9]]
+    assert _flat_feeds(rust)["req-h"] == [0, 6, 9]
+
+
+def test_resumed_request_replaces_cumulative_store(leader_module):
+    """A resumed-from-preemption step carries FULL per-group lists — they
+    REPLACE the store (preemption invalidated the old tracking)."""
+    leader, rust = _make_leader(leader_module, 4)
+
+    leader.build_connector_meta(
+        _scheduler_output(
+            new_reqs=[FakeNewReq("req-r", ([10, 11], [20, 21], [30, 31], [40, 41]))]
+        )
+    )
+    cached = FakeCachedReqs(
+        req_ids=["req-r"],
+        new_block_ids=[([50, 51], [60, 61], [70, 71], [80, 81])],
+        resumed_req_ids=("req-r",),
+    )
+    leader.build_connector_meta(_scheduler_output(cached=cached))
+
+    calls = _mapping_calls(rust, "req-r")
+    assert [c[0] for c in calls] == ["set", "set"]
+    assert calls[1][2] == [[50, 51], [60, 61], [70, 71], [80, 81]]
+    assert _flat_feeds(rust)["req-r"] == [50, 51]
+
+
+def test_none_delta_republishes_stored_lists(leader_module):
+    """A scheduled-with-no-new-blocks step republishes the stored lists
+    (state unchanged) and feeds the stored group-0 list."""
+    leader, rust = _make_leader(leader_module, 4)
+
+    leader.build_connector_meta(
+        _scheduler_output(
+            new_reqs=[FakeNewReq("req-i", ([10, 11], [20, 21], [30, 31], [40, 41]))]
+        )
+    )
+    leader.build_connector_meta(
+        _scheduler_output(
+            cached=FakeCachedReqs(req_ids=["req-i"], new_block_ids=[None])
+        )
+    )
+
+    calls = _mapping_calls(rust, "req-i")
+    assert [c[0] for c in calls] == ["set", "set"]
+    assert calls[1][2] == [[10, 11], [20, 21], [30, 31], [40, 41]]
+    assert _flat_feeds(rust)["req-i"] == [10, 11]
+
+
+def test_request_finished_drops_cumulative_store(leader_module):
+    leader, rust = _make_leader(leader_module, 4)
+
+    leader.build_connector_meta(
+        _scheduler_output(
+            new_reqs=[FakeNewReq("req-f", ([10, 11], [20, 21], [30, 31], [40, 41]))]
+        )
+    )
+    assert "req-f" in leader._req_full_blocks
+
+    leader.request_finished(FakeRequest("req-f"), [10, 11])
+
+    assert "req-f" not in leader._req_full_blocks
+
+
+def test_single_group_feeds_unchanged(leader_module):
+    """Single-group: no mapping calls at all and the flat feeds stay the
+    raw per-step deltas (the legacy group-0 contract)."""
+    leader, rust = _make_leader(leader_module, 1)
+
+    new_req = FakeNewReq("req-new", ([10, 11],))
+    cached = FakeCachedReqs(
+        req_ids=["req-running", "req-idle"], new_block_ids=[([12],), None]
+    )
+    leader.build_connector_meta(_scheduler_output(new_reqs=[new_req], cached=cached))
+
+    assert not [c for c in rust.calls if c[0] in ("set", "append")]
+    feeds = _flat_feeds(rust)
+    assert feeds["req-running"] == [12]
+    assert feeds["req-idle"] == []
 
 
 def test_single_group_config_defaults_to_one(leader_module):

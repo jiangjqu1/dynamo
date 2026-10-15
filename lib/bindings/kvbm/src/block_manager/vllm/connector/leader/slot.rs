@@ -890,15 +890,32 @@ impl Slot for VllmConnectorSlot {
             return Ok(());
         }
 
-        // we should have enough device blocks to cover the newly scheduled tokens
+        // The tracked list should cover the newly scheduled tokens, but the
+        // check is TOLERANT, not fatal: chunked prefill + prefix-cache COW
+        // breaks this cadence transiently. On the step vLLM copy-on-writes a
+        // shared tail block it can deliver a replacement-shaped feed (live
+        // cm008 evidence: a non-resumed step fed [0, 6] where 6 replaced a
+        // mid-list id) and the tracked list under-covers the tokens scheduled
+        // so far (`next_position: 3136 > device_blocks.len() 2 * block_size
+        // 784` — EngineCore death). The python leader now publishes the
+        // cumulative full lists every step, and the offload candidate
+        // selection below clamps to the tracked list; the next pure-append
+        // step restores coverage. Genuine feed inconsistency still fails
+        // loudly in `reconcile_device_block_feed`. The token-to-block math is
+        // also only exact for the group whose block size equals `block_size`
+        // (hybrid groups can differ), so a hard assert here is wrong for HMA.
         let next_position = self.current_position + num_scheduled_tokens;
-        assert!(
-            next_position <= self.device_blocks.len() * self.block_size,
-            "next_position: {} > device_blocks.len() {} * block_size {}",
-            next_position,
-            self.device_blocks.len(),
-            self.block_size
-        );
+        if next_position > self.device_blocks.len() * self.block_size {
+            tracing::warn!(
+                request_id = %self.request_id,
+                next_position,
+                tracked_blocks = self.device_blocks.len(),
+                block_size = self.block_size,
+                "tracked device blocks under-cover the scheduled tokens \
+                 (chunked-prefill COW transient); clamping offload candidates \
+                 to the tracked list"
+            );
+        }
 
         if next_position > self.sequence.total_tokens() {
             // vllm stopped providing tokens, so we are done
@@ -922,7 +939,19 @@ impl Slot for VllmConnectorSlot {
 
         debug_assert!(next_position / self.block_size >= self.evaluated_blocks);
 
-        let num_candidate_blocks = (next_position / self.block_size) - self.evaluated_blocks;
+        // Clamp the candidate window to the tracked list: a chunked-prefill
+        // COW step can leave the list transiently short of the scheduled
+        // tokens (see the under-coverage warning above). Candidates beyond
+        // the tracked entries do not exist yet — the next pure-append step
+        // restores coverage and the deferred blocks offload then. Clamping
+        // keeps the position-indexed slice inside real entries, so a stale
+        // or missing position can never be offloaded.
+        let available_candidates = self
+            .device_blocks
+            .len()
+            .saturating_sub(self.evaluated_blocks);
+        let num_candidate_blocks =
+            ((next_position / self.block_size) - self.evaluated_blocks).min(available_candidates);
 
         tracing::debug!(
             "evaluating policy with the following parameters: state: {:?}; current_position: {}; num_candidate_blocks: {}; num_scheduled_tokens: {}",
@@ -951,12 +980,9 @@ impl Slot for VllmConnectorSlot {
                 .map(|id| self.stored_block_priorities.get(id).copied().unwrap_or(0))
                 .collect();
 
-            assert_eq!(
-                candidate_block_ids.len(),
-                num_candidate_blocks,
-                "device block overflow - candidate blocks exceed block count at offset {}",
-                self.evaluated_blocks
-            );
+            // num_candidate_blocks is clamped to the tracked entries above, so
+            // the slice below always yields exactly that many candidates — the
+            // former "device block overflow" assert is unreachable.
 
             // Apply contiguous priority filtering: find how many blocks from the start
             // meet the minimum priority threshold. Stop at first block below threshold.
@@ -2961,6 +2987,50 @@ mod connector_tests {
             slot.per_group_block_table_snapshot(),
             Some(&[vec![0, 6, 9], vec![0, 3, 9], vec![0, 2, 9], vec![1, 5, 9]][..])
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Test 18: The cm008 chunked-prefill COW cadence — a non-resumed
+    //          step's replacement-shaped feed ([0,6]) under-covers the
+    //          tokens scheduled so far. Must not panic (the former
+    //          `next_position` assert killed EngineCore), must not
+    //          produce candidates beyond the tracked list, and the next
+    //          full-feed step must restore growth and resume offloads
+    //          for real entries only — the reassigned-away id (1) is
+    //          never offloaded.
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_cow_step_under_coverage_clamps_and_self_heals() {
+        let num_tokens = 192; // 6 blocks at BLOCK_SIZE 32
+        let (mut slot, mut rx) = create_test_slot(num_tokens, 0);
+
+        // Chunk 1 (new request): full feed [0,1], 64 tokens scheduled —
+        // both blocks become offload candidates.
+        slot.apply_scheduler_output(&[], &[0, 1], 0, 64, None, None)
+            .unwrap();
+        assert_eq!(slot.num_device_blocks_allocated(), 2);
+        assert_eq!(drain_offload_block_ids(&mut rx), vec![vec![0, 1]]);
+
+        // Chunk 2 (the COW step): vLLM reassigned the shared tail (1 → 6)
+        // and fed the replacement-shaped list while the cumulative
+        // scheduled tokens (128) outgrew the tracked list (2 × 32). The
+        // former assert panicked here.
+        slot.apply_scheduler_output(&[], &[0, 6], 64, 32, None, None)
+            .unwrap();
+        assert_eq!(slot.num_device_blocks_allocated(), 2); // replaced, not doubled
+        assert_eq!(slot.device_blocks_snapshot(), &[0, 6]);
+        assert!(
+            drain_offload_block_ids(&mut rx).is_empty(),
+            "no candidates beyond the tracked list on the under-covered step"
+        );
+
+        // Chunk 3: the full feed restores coverage; offloads resume for the
+        // newly covered real entry only.
+        slot.apply_scheduler_output(&[], &[0, 6, 7, 8], 96, 32, None, None)
+            .unwrap();
+        assert_eq!(slot.num_device_blocks_allocated(), 4);
+        assert_eq!(slot.device_blocks_snapshot(), &[0, 6, 7, 8]);
+        assert_eq!(drain_offload_block_ids(&mut rx), vec![vec![8]]);
     }
 
     // ---------------------------------------------------------------

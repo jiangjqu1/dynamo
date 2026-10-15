@@ -45,6 +45,14 @@ if is_dyn_runtime_enabled():
 logger = logging.getLogger(__name__)
 
 
+def _rposition(tracked: list[int], block_id: int) -> Optional[int]:
+    """Last index of ``block_id`` in ``tracked``, or None (Rust rposition)."""
+    for idx in range(len(tracked) - 1, -1, -1):
+        if tracked[idx] == block_id:
+            return idx
+    return None
+
+
 class DynamoConnectorMetadata(KVConnectorMetadata):
     def __init__(self, metadata: bytes):
         assert isinstance(metadata, bytes)
@@ -91,6 +99,18 @@ class KvConnectorLeader:
             else None
         )
         self._num_groups = len(kv_cache_groups) if kv_cache_groups else 1
+
+        # Cumulative per-group device block lists per request (group-major).
+        # This is the leader's authoritative view of what the Rust slot holds:
+        # FULL lists at admission/resume, merged with each step's deltas for
+        # running requests, published back FULL at every build_connector_meta.
+        # Chunked prefill + prefix-cache COW can make vLLM's cached-request
+        # ``new_block_ids`` a REPLACEMENT-shaped feed (live cm008 evidence: a
+        # non-resumed step delivered ``[0, 6]`` where ``6`` replaced a mid-list
+        # id), so a delta alone cannot always reconstruct the full list — the
+        # leader tracks the cumulative lists itself and never invents block
+        # ids it has not seen vLLM report.
+        self._req_full_blocks: dict[str, tuple[list[int], ...]] = {}
 
         leader = KvbmLeader(world_size, drt=self.drt)
 
@@ -195,6 +215,9 @@ class KvConnectorLeader:
         # resolved per group from this mapping. vLLM hands full per-group
         # lists here, so the mapping is replaced wholesale.
         self.set_per_group_device_blocks(request.request_id, group_block_ids)
+        self._req_full_blocks[request.request_id] = tuple(
+            list(group) for group in group_block_ids
+        )
         self._connector.update_state_after_alloc(
             request.request_id, block_ids, num_external_tokens
         )
@@ -214,8 +237,13 @@ class KvConnectorLeader:
         for req in scheduler_output.scheduled_new_reqs:
             # NewRequestData.block_ids is the per-group tuple of FULL lists;
             # re-publishing is idempotent (update_state_after_alloc already
-            # replaced the mapping for this request this iteration).
+            # replaced the mapping for this request this iteration). Record
+            # it as the request's cumulative state — the running-step deltas
+            # merge into it below.
             self.set_per_group_device_blocks(req.req_id, req.block_ids)
+            self._req_full_blocks[req.req_id] = tuple(
+                list(group) for group in req.block_ids
+            )
             output.add_new_request(
                 req.req_id,
                 req.prompt_token_ids,
@@ -253,35 +281,50 @@ class KvConnectorLeader:
             num_computed_tokens = cached_reqs.num_computed_tokens[i]
 
             resumed_from_preemption = req_id in resumed_req_ids
-            if new_block_ids is not None:
-                if self._num_groups > 1:
-                    # vLLM's CachedRequestData contract: running requests
-                    # carry this iteration's per-group DELTAS (appended to
-                    # the request's block ids), resumed-from-preemption
-                    # requests carry FULL per-group lists (they replace the
-                    # request's block ids). The Rust apply of these blocks —
-                    # including its offload decisions — runs inside
-                    # build_connector_metadata below, so the mapping must be
-                    # updated first.
+            if self._num_groups > 1:
+                # Publish the CUMULATIVE per-group mapping and feed the
+                # cumulative group-0 list. vLLM's CachedRequestData contract:
+                # running requests carry this iteration's per-group DELTAS,
+                # resumed-from-preemption requests carry FULL per-group lists
+                # — but a delta alone is not always reconstructive (prefix
+                # -cache COW delivers replacement-shaped feeds; live cm008
+                # evidence: a non-resumed step fed [0, 6] where 6 replaced a
+                # mid-list id), so the leader maintains the cumulative
+                # per-group lists itself and republishes them FULL every
+                # step. The Rust reconcile applies a full feed idempotently
+                # (no-op / suffix-extend / head-match REPLACE), so this is
+                # safe and self-healing, and the offload/onboard consumers
+                # index positions that hold vLLM's CURRENT ids.
+                if new_block_ids is not None:
                     if resumed_from_preemption:
-                        self.set_per_group_device_blocks(req_id, new_block_ids)
+                        self._store_full_blocks(req_id, new_block_ids)
                     else:
-                        self.append_per_group_device_blocks(req_id, new_block_ids)
-                output.add_cached_request(
-                    request_id=req_id,
-                    resumed_from_preemption=resumed_from_preemption,
-                    new_token_ids=new_token_ids,
-                    new_block_ids=new_block_ids[0],
-                    num_computed_tokens=num_computed_tokens,
-                )
+                        self._merge_delta_into_store(req_id, new_block_ids)
+                stored = self._req_full_blocks.get(req_id)
+                if stored is not None:
+                    self.set_per_group_device_blocks(req_id, stored)
+                    flat_block_ids = list(stored[0])
+                elif new_block_ids is not None:
+                    # No cumulative state to republish (slot predates this
+                    # leader's store or the delta could not be merged) —
+                    # fall back to today's per-step delta behavior; never
+                    # invent block ids.
+                    self.append_per_group_device_blocks(req_id, new_block_ids)
+                    flat_block_ids = new_block_ids[0]
+                else:
+                    flat_block_ids = []
+            elif new_block_ids is not None:
+                # Single-group keeps the flat group-0 contract unchanged.
+                flat_block_ids = new_block_ids[0]
             else:
-                output.add_cached_request(
-                    request_id=req_id,
-                    resumed_from_preemption=resumed_from_preemption,
-                    new_token_ids=new_token_ids,
-                    new_block_ids=[],
-                    num_computed_tokens=num_computed_tokens,
-                )
+                flat_block_ids = []
+            output.add_cached_request(
+                request_id=req_id,
+                resumed_from_preemption=resumed_from_preemption,
+                new_token_ids=new_token_ids,
+                new_block_ids=flat_block_ids,
+                num_computed_tokens=num_computed_tokens,
+            )
 
         output.add_num_scheduled_tokens(scheduler_output.num_scheduled_tokens)
 
@@ -310,6 +353,7 @@ class KvConnectorLeader:
         # note our worker can communication with us oob and we can use that to know
         # ahead of time if the request is finished.
         status = self._connector.request_finished(request.request_id, block_ids)
+        self._req_full_blocks.pop(request.request_id, None)
         return status, None
 
     def reset_cache(self) -> bool:
@@ -349,6 +393,88 @@ class KvConnectorLeader:
         self._connector.append_per_group_device_blocks(
             request_id, [list(group) for group in per_group_block_ids]
         )
+
+    def _store_full_blocks(
+        self, request_id: str, per_group_block_ids: tuple[list[int], ...]
+    ) -> None:
+        """Record vLLM's FULL per-group lists as the request's cumulative
+        state (admission-time and resumed-from-preemption reports — both
+        carry the request's complete current lists)."""
+        self._req_full_blocks[request_id] = tuple(
+            list(group) for group in per_group_block_ids
+        )
+
+    def _merge_delta_into_store(
+        self, request_id: str, per_group_delta: tuple[list[int], ...]
+    ) -> None:
+        """Merge a running step's per-group DELTAS into the cumulative store,
+        mirroring the Rust ``reconcile_device_block_feed`` contract per group
+        so the store always matches what the Rust slot holds after the feed.
+
+        Per group: a pure-append delta extends the stored list; a feed whose
+        head is already tracked matches the Rust's suffix-overlap extend or
+        its head-match REPLACE (the prefix-cache COW shape — vLLM reassigned
+        the tracked ids, the feed is the request's current list); anything
+        else (mid-list divergence, double-tracking) leaves that group's
+        stored list untouched with a loud warning — the leader never invents
+        or silently repositions block ids.
+        """
+        stored = self._req_full_blocks.get(request_id)
+        if stored is None:
+            logger.warning(
+                "request %s has no cumulative block state to merge the delta "
+                "into; deferring to the per-step delta feed",
+                request_id,
+            )
+            return
+        merged: list[list[int]] = []
+        for group, (current, delta) in enumerate(zip(stored, per_group_delta)):
+            current = list(current)
+            if delta:
+                pos = _rposition(current, delta[0])
+                if pos is None:
+                    tracked = set(current)
+                    if any(block_id in tracked for block_id in delta):
+                        logger.warning(
+                            "request %s group %d: delta %s re-tracks ids from "
+                            "the stored list %s without a head match; keeping "
+                            "the stored list",
+                            request_id,
+                            group,
+                            delta,
+                            current,
+                        )
+                    else:
+                        current.extend(delta)
+                else:
+                    suffix_len = len(current) - pos
+                    if suffix_len <= len(delta) and current[pos:] == delta[:suffix_len]:
+                        current.extend(delta[suffix_len:])
+                    elif pos == 0:
+                        logger.warning(
+                            "request %s group %d: device blocks reassigned "
+                            "(e.g. copy-on-write of a prefix-cache-shared "
+                            "block); replacing the stored list %s with %s",
+                            request_id,
+                            group,
+                            current,
+                            delta,
+                        )
+                        current = list(delta)
+                    else:
+                        logger.warning(
+                            "request %s group %d: delta head %d found at "
+                            "mid-list position %d of %s with a divergent "
+                            "continuation %s; keeping the stored list",
+                            request_id,
+                            group,
+                            delta[0],
+                            pos,
+                            current,
+                            delta,
+                        )
+            merged.append(current)
+        self._req_full_blocks[request_id] = tuple(merged)
 
     def _create_slot(self, request: Request) -> None:
         """Create a slot for the request"""
