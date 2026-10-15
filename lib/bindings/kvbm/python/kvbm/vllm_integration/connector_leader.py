@@ -53,6 +53,75 @@ def _rposition(tracked: list[int], block_id: int) -> Optional[int]:
     return None
 
 
+def _reconcile_feed(
+    current: list[int], feed: list[int], request_id: str, group: int
+) -> list[int]:
+    """The python mirror of the Rust ``reconcile_device_block_feed``
+    decision ladder (keep the two in lockstep — the store must equal what
+    the Rust slot holds after the same feed). vLLM's feed is ALWAYS the
+    authoritative current list; divergence degrades to replace-with-warn,
+    never an error (the engine must not die on HMA hybrid feed shapes)."""
+    if not feed or current == feed:
+        return current
+    if len(current) >= len(feed) and current[len(current) - len(feed) :] == feed:
+        return current  # natural suffix — already applied
+    if len(feed) > len(current) and feed[: len(current)] == current:
+        tail = feed[len(current) :]
+        known = set(current)
+        for block_id in tail:
+            if block_id in known:
+                logger.warning(
+                    "request %s group %d: feed tail re-tracks id %d "
+                    "(vLLM duplicate reporting is legal for HMA mamba groups)",
+                    request_id,
+                    group,
+                    block_id,
+                )
+        current.extend(tail)
+        return current
+    pos = _rposition(current, feed[0])
+    if pos is None:
+        known = set(current)
+        for block_id in feed:
+            if block_id in known:
+                logger.warning(
+                    "request %s group %d: feed appends already-tracked id %d "
+                    "(vLLM duplicate reporting is legal for HMA mamba groups)",
+                    request_id,
+                    group,
+                    block_id,
+                )
+        current.extend(feed)
+        return current
+    suffix_len = len(current) - pos
+    if suffix_len <= len(feed) and current[pos:] == feed[:suffix_len]:
+        current.extend(feed[suffix_len:])
+        return current
+    if pos == 0:
+        logger.warning(
+            "request %s group %d: device blocks reassigned (e.g. "
+            "copy-on-write of a prefix-cache-shared block); replacing the "
+            "stored list %s with %s",
+            request_id,
+            group,
+            current,
+            feed,
+        )
+        return feed
+    # The ladder could not align the feed (HMA hybrid feed shapes) — vLLM's
+    # feed is the authoritative current list: replace with a warn.
+    logger.warning(
+        "request %s group %d: device-block feed could not be aligned (vLLM "
+        "HMA hybrid feed shape); replacing the stored list %s with the "
+        "authoritative feed %s",
+        request_id,
+        group,
+        current,
+        feed,
+    )
+    return feed
+
+
 class DynamoConnectorMetadata(KVConnectorMetadata):
     def __init__(self, metadata: bytes):
         assert isinstance(metadata, bytes)
@@ -408,16 +477,22 @@ class KvConnectorLeader:
         self, request_id: str, per_group_delta: tuple[list[int], ...]
     ) -> None:
         """Merge a running step's per-group DELTAS into the cumulative store,
-        mirroring the Rust ``reconcile_device_block_feed`` contract per group
-        so the store always matches what the Rust slot holds after the feed.
+        mirroring the Rust ``reconcile_device_block_feed`` ladder per group so
+        the store always matches what the Rust slot holds after the feed.
 
-        Per group: a pure-append delta extends the stored list; a feed whose
-        head is already tracked matches the Rust's suffix-overlap extend or
-        its head-match REPLACE (the prefix-cache COW shape — vLLM reassigned
-        the tracked ids, the feed is the request's current list); anything
-        else (mid-list divergence, double-tracking) leaves that group's
-        stored list untouched with a loud warning — the leader never invents
-        or silently repositions block ids.
+        Per group (the same decision ladder as the Rust, in the same
+        order — vLLM's feed is ALWAYS the authoritative current list):
+
+        1. feed == stored → no-op;
+        2. feed matches the stored list's natural suffix → no-op;
+        3. the stored list is a prefix of the feed → extend with the tail;
+        4. feed head not tracked → append (already-tracked ids only warn —
+           vLLM's HMA mamba groups legitimately report duplicates);
+        5. suffix/prefix overlap → extend with the remainder;
+        6. head-match with a divergent tail → REPLACE (the COW shape);
+        7. mid-list mismatch → REPLACE with a warn (the HMA hybrid feed
+           shapes — replacement-shaped running feeds, cached-mamba
+           collapse to a shared id, groups not allocating in step).
         """
         stored = self._req_full_blocks.get(request_id)
         if stored is None:
@@ -429,51 +504,9 @@ class KvConnectorLeader:
             return
         merged: list[list[int]] = []
         for group, (current, delta) in enumerate(zip(stored, per_group_delta)):
-            current = list(current)
-            if delta:
-                pos = _rposition(current, delta[0])
-                if pos is None:
-                    tracked = set(current)
-                    if any(block_id in tracked for block_id in delta):
-                        logger.warning(
-                            "request %s group %d: delta %s re-tracks ids from "
-                            "the stored list %s without a head match; keeping "
-                            "the stored list",
-                            request_id,
-                            group,
-                            delta,
-                            current,
-                        )
-                    else:
-                        current.extend(delta)
-                else:
-                    suffix_len = len(current) - pos
-                    if suffix_len <= len(delta) and current[pos:] == delta[:suffix_len]:
-                        current.extend(delta[suffix_len:])
-                    elif pos == 0:
-                        logger.warning(
-                            "request %s group %d: device blocks reassigned "
-                            "(e.g. copy-on-write of a prefix-cache-shared "
-                            "block); replacing the stored list %s with %s",
-                            request_id,
-                            group,
-                            current,
-                            delta,
-                        )
-                        current = list(delta)
-                    else:
-                        logger.warning(
-                            "request %s group %d: delta head %d found at "
-                            "mid-list position %d of %s with a divergent "
-                            "continuation %s; keeping the stored list",
-                            request_id,
-                            group,
-                            delta[0],
-                            pos,
-                            current,
-                            delta,
-                        )
-            merged.append(current)
+            merged.append(
+                _reconcile_feed(list(current), list(delta), request_id, group)
+            )
         self._req_full_blocks[request_id] = tuple(merged)
 
     def _create_slot(self, request: Request) -> None:

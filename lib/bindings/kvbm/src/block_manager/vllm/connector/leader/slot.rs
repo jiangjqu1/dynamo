@@ -680,14 +680,18 @@ impl std::fmt::Debug for VllmConnectorSlot {
 ///    The feed is the request's current list — REPLACE the tracked
 ///    list wholesale;
 /// 7. feed head tracked mid-list with a divergent continuation →
-///    inconsistent feed → Err. The flat apply panics on this; the
-///    advisory per-group table logs and skips the row update instead
-///    (its consumers fail loudly if a stale position is needed).
+///    the ladder could not align the feed. vLLM's feed is ALWAYS the
+///    authoritative current list — REPLACE with a warn (vLLM's HMA
+///    hybrid reality: replacement-shaped feeds on running steps,
+///    cached-mamba states collapsing to a shared id, groups not
+///    allocating in step on prefix-cache hits). The warn keeps the
+///    divergence diagnosable for the DEP's semantic review.
 ///
-/// Returns Err with a `device_blocks contract violation` message for
-/// case 7 — mid-list id match with a divergent continuation. Already-
-/// tracked ids in append/extension tails only WARN: vLLM's HMA mamba
-/// groups legitimately report duplicate ids within one request.
+/// The reconcile therefore never fails: alignment-exact cases are
+/// cheap no-ops/extensions, and everything else degrades to
+/// replace-with-warn (vLLM's feed is truth). Already-tracked ids in
+/// append/extension tails also only WARN: vLLM's HMA mamba groups
+/// legitimately report duplicate ids within one request.
 fn reconcile_device_block_feed(
     tracked: &mut Vec<BlockId>,
     feed: &[BlockId],
@@ -790,12 +794,25 @@ fn reconcile_device_block_feed(
         return Ok(());
     }
 
-    // Case (d): mid-list match with a divergent continuation.
-    Err(SlotError::InvalidOperation(format!(
-        "device_blocks contract violation: block_ids[0]={} found at device_blocks[{}] but \
-         device_blocks[{}..] != block_ids[..{}] (device_blocks={:?}, block_ids={:?})",
-        feed[0], pos, pos, suffix_len, tracked, feed
-    )))
+    // Case 7 (was (d)): mid-list match with a divergent continuation.
+    // vLLM's hybrid reality produces feeds the ladder cannot align —
+    // replacement-shaped lists on running steps, cached-mamba state
+    // blocks that collapse to a shared id (repeated 0s), groups that do
+    // not allocate in step on prefix-cache hits. vLLM's feed is ALWAYS
+    // the authoritative CURRENT list: replace and warn (the engine
+    // must not die on feed-shape surprises; the warn keeps the
+    // divergence diagnosable for the DEP's semantic review).
+    tracing::warn!(
+        head = feed[0],
+        pos,
+        old = ?tracked,
+        new = ?feed,
+        "device-block feed could not be aligned (vLLM HMA hybrid feed \
+         shape); replacing the tracked list with the authoritative feed"
+    );
+    tracked.clear();
+    tracked.extend_from_slice(feed);
+    Ok(())
 }
 
 impl Slot for VllmConnectorSlot {
@@ -2881,21 +2898,25 @@ mod connector_tests {
     }
 
     // ---------------------------------------------------------------
-    // Test 11: Invalid overlap panics — block present but not at tail
-    //          [10,11,12] + apply([11,14]) → panic (contract violation)
+    // Test 11: mid-list mismatch degrades to replace-with-warn (was a
+    //          contract-violation panic). vLLM's HMA hybrid feeds can
+    //          carry shapes the ladder cannot align; the feed is the
+    //          authoritative current list — [10,11,12] + apply([11,14])
+    //          → [11,14].
     // ---------------------------------------------------------------
     #[test]
-    #[should_panic(expected = "contract violation")]
-    fn test_invalid_overlap_panics() {
+    fn test_mid_list_mismatch_replaces_with_the_feed() {
         let num_tokens = 128;
         let (mut slot, _rx) = create_test_slot(num_tokens, 0);
 
         slot.append_mutable_device_blocks(&[10, 11, 12]).unwrap();
 
-        // block_ids[0]=11 is found at device_blocks[1], but device_blocks[1..] = [11,12]
-        // does NOT match block_ids[..2] = [11,14]. Contract violation.
+        // block_ids[0]=11 is found at device_blocks[1], but the suffix
+        // [11,12] does not match the feed's prefix [11,14] — replace.
         slot.apply_scheduler_output(&[], &[11, 14], 0, 128, None, None)
             .unwrap();
+
+        assert_eq!(slot.device_blocks_snapshot(), &[11, 14]);
     }
 
     // ---------------------------------------------------------------
