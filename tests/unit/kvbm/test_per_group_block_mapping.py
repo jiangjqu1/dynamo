@@ -192,7 +192,12 @@ def load_connector_leader_module(monkeypatch):
 
     rust_mod = types.ModuleType("kvbm.vllm_integration.rust")
     rust_mod.KvConnectorLeader = FakeRustKvConnectorLeader
-    rust_mod.KvbmRequest = type("KvbmRequest", (), {})
+
+    class _StubKvbmRequest:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    rust_mod.KvbmRequest = _StubKvbmRequest
     rust_mod.SchedulerOutput = FakeRustSchedulerOutput
     monkeypatch.setitem(sys.modules, "kvbm.vllm_integration.rust", rust_mod)
 
@@ -517,3 +522,66 @@ def test_single_group_config_defaults_to_one(leader_module):
 
     leader, _ = _make_leader(leader_module, 4)
     assert leader._num_groups == 4
+
+
+# ---------------------------------------------------------------------
+# The hybrid onboard SAFETY GATE: multi-group (hybrid) models must not
+# receive external KV onboarding by default — the fp4 determinism test
+# proved onboarding restores content that corrupts generation (vLLM
+# 0.29 HMA per-group lists are not position-aligned for cached prefixes:
+# live evidence group_lengths [4,4,4,10]). Offload (D2H) continues;
+# onboarding needs the per-group semantics (the DEP).
+# ---------------------------------------------------------------------
+class _GateProbeRequest:
+    request_id = "gate-req-1"
+    num_tokens = 100
+    cache_salt = None
+    lora_request = None
+    all_token_ids = [1] * 100
+
+
+def _gate_probe(leader):
+    """Wrap the rust connector's external lookup with a call counter."""
+    calls = []
+
+    def _recording(request_id, num_tokens, num_computed):
+        calls.append((request_id, num_tokens, num_computed))
+        return num_computed, False
+
+    leader._connector.get_num_new_matched_tokens = _recording
+    return calls
+
+
+def test_hybrid_gate_blocks_external_lookup_by_default(leader_module, monkeypatch):
+    monkeypatch.delenv("DYN_KVBM_HYBRID_EXPERIMENTAL_ONBOARD", raising=False)
+    leader, _ = _make_leader(leader_module, 4)
+    calls = _gate_probe(leader)
+
+    num_computed, deferred = leader.get_num_new_matched_tokens(
+        _GateProbeRequest(), num_computed_tokens=40
+    )
+
+    # The no-hit answer (recompute), and the external lookup never ran.
+    assert (num_computed, deferred) == (40, False)
+    assert calls == []
+
+
+def test_hybrid_gate_opens_with_the_experimental_env(leader_module, monkeypatch):
+    monkeypatch.setenv("DYN_KVBM_HYBRID_EXPERIMENTAL_ONBOARD", "1")
+    leader, _ = _make_leader(leader_module, 4)
+    calls = _gate_probe(leader)
+
+    leader.get_num_new_matched_tokens(_GateProbeRequest(), num_computed_tokens=40)
+
+    assert len(calls) == 1
+
+
+def test_single_group_bypasses_the_gate(leader_module, monkeypatch):
+    monkeypatch.delenv("DYN_KVBM_HYBRID_EXPERIMENTAL_ONBOARD", raising=False)
+    leader, _ = _make_leader(leader_module, 1)
+    calls = _gate_probe(leader)
+
+    leader.get_num_new_matched_tokens(_GateProbeRequest(), num_computed_tokens=40)
+
+    # Attention-only: the external lookup runs (today's behavior).
+    assert len(calls) == 1

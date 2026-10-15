@@ -8,6 +8,7 @@ Implementation of vLLM KV cache manager protocol.
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Optional
 
 from vllm.config import VllmConfig
@@ -168,6 +169,9 @@ class KvConnectorLeader:
             else None
         )
         self._num_groups = len(kv_cache_groups) if kv_cache_groups else 1
+        # One-time gate log for the hybrid onboard safety gate (see
+        # get_num_new_matched_tokens).
+        self._hybrid_onboard_gate_logged = False
 
         # Cumulative per-group device block lists per request (group-major).
         # This is the leader's authoritative view of what the Rust slot holds:
@@ -252,6 +256,33 @@ class KvConnectorLeader:
                   asynchronously (between scheduler steps).
         """
         self._create_slot(request)
+        if (
+            self._num_groups > 1
+            and not os.environ.get("DYN_KVBM_HYBRID_EXPERIMENTAL_ONBOARD", "").strip()
+        ):
+            # SAFETY GATE (2026-10-15): the hybrid external ONBOARD is
+            # disabled by default. The determinism test on the fp4 proved
+            # that onboarding restores content that corrupts generation
+            # (temp-0 replay garbles after h2d onboards; coherent without):
+            # vLLM 0.29 HMA per-group block lists are NOT position-aligned
+            # for cached prefixes (live evidence: group_lengths [4,4,4,10]
+            # — the mamba state collapses to checkpoint entries with a
+            # different indexing than attention KV blocks), so the tier-2
+            # copies restored under positionally-matched hashes carry the
+            # wrong content for those positions. Offload (D2H) continues
+            # (harmless copies at rest); onboarding requires the
+            # per-group semantics from the DEP. Opt back in explicitly
+            # with DYN_KVBM_HYBRID_EXPERIMENTAL_ONBOARD=1 for experiments.
+            if not self._hybrid_onboard_gate_logged:
+                self._hybrid_onboard_gate_logged = True
+                logger.warning(
+                    "hybrid multi-group model detected: external KV onboarding "
+                    "is DISABLED (the HMA per-group block semantics are not "
+                    "position-aligned for cached prefixes; onboarding restores "
+                    "wrong content — see the phase-2 plan §12). Set "
+                    "DYN_KVBM_HYBRID_EXPERIMENTAL_ONBOARD=1 to override."
+                )
+            return num_computed_tokens, False
         return self._connector.get_num_new_matched_tokens(
             request.request_id,
             request.num_tokens,
