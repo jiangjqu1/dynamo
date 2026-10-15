@@ -108,6 +108,12 @@ pub trait Leader: Send + Sync + std::fmt::Debug {
         scheduler_output: SchedulerOutput,
     ) -> anyhow::Result<Vec<u8>>;
 
+    /// Note (HMA multi-group): the Python finish path
+    /// (`request_finished_all_groups`) MUST have published the request's
+    /// FINAL per-group device block ids
+    /// (`set_per_group_device_blocks`) BEFORE delegating here — the
+    /// hybrid finish flush inside reads the CURRENT per-group table,
+    /// and the chunked-prefill COW churn has only settled at finish.
     fn request_finished(
         &mut self,
         request_id: String,
@@ -135,6 +141,15 @@ pub struct KvConnectorLeader {
     onboarding_slots: HashSet<String>,
     iteration_counter: u64,
     kvbm_metrics: KvbmMetrics,
+    /// Per-leg metadata operations created by hybrid finish-time flush
+    /// offloads (fix 1b): `request_finished` produced them AFTER the
+    /// request's last scheduling, so the slot's pending-operations drain
+    /// can never reach them — the NEXT `build_connector_metadata`
+    /// injects them via [`inject_deferred_flush_ops`] (they are
+    /// Scheduled stores: the worker-side holds them until wait_for_save
+    /// and their per-leg uuids rendezvous with the transfer legs that
+    /// are already in flight).
+    deferred_flush_ops: Vec<WorkerTransferRequest>,
 }
 
 impl KvConnectorLeader {
@@ -270,8 +285,30 @@ impl KvConnectorLeader {
             onboarding_slots: HashSet::new(),
             iteration_counter: 0,
             kvbm_metrics,
+            deferred_flush_ops: Vec::new(),
         }
     }
+}
+
+/// Move the leader's deferred hybrid finish-flush operations (fix 1b)
+/// into the metadata's operation list. The operations were created at
+/// `request_finished` — after the request's last scheduling — so the
+/// normal pending-operations drain could never pick them up; the next
+/// `build_connector_metadata` carries them instead. The take clears the
+/// stash: a later build adds nothing.
+fn inject_deferred_flush_ops(
+    deferred_flush_ops: &mut Vec<WorkerTransferRequest>,
+    md: &mut ConnectorMetadata,
+) {
+    let ops = std::mem::take(deferred_flush_ops);
+    if ops.is_empty() {
+        return;
+    }
+    tracing::debug!(
+        count = ops.len(),
+        "injecting deferred hybrid finish-flush operations into the connector metadata"
+    );
+    md.add_operations(ops);
 }
 
 impl Leader for KvConnectorLeader {
@@ -441,6 +478,14 @@ impl Leader for KvConnectorLeader {
 
         let mut inflight_requests = self.inflight_requests.clone();
         let mut md = ConnectorMetadata::new(iteration);
+
+        // Hybrid finish-flush operations (fix 1b): per-leg operations from
+        // requests that finished since the last metadata build. They are
+        // Scheduled stores: the worker-side holds them until wait_for_save
+        // and their per-leg uuids rendezvous with the transfer legs that
+        // are already in flight. Inject them FIRST, before the
+        // per-request loops, so they cannot be lost behind a later take.
+        inject_deferred_flush_ops(&mut self.deferred_flush_ops, &mut md);
 
         let onboarding_slots = std::mem::take(&mut self.onboarding_slots);
 
@@ -666,6 +711,36 @@ impl Leader for KvConnectorLeader {
         // or Finished if all operations are complete)
         slot.mark_as_finished(self.iteration_counter)?;
 
+        // Hybrid finish flush (fix 1b, H2D content-correctness): multi-group
+        // slots suppressed every mid-flight offload (the fp4 COWs its
+        // chunk-boundary block on every chunked-prefill boundary, so a
+        // mid-flight copy captures pre-write content of a soon-reassigned
+        // id, and BOTH the stale and a later final copy would match the
+        // same hash). Flush the remaining completed positions NOW, from
+        // the CURRENT per-group table — which the Python finish-publish
+        // (request_finished_all_groups → set_per_group_device_blocks)
+        // refreshed BEFORE delegating here; this flush MUST run after that
+        // refresh or it would read stale ids. The transfer itself executes
+        // immediately (racing only the documented small free-window like
+        // the attention-only path); the per-leg metadata operations are
+        // deferred into the next build_connector_metadata because the
+        // request is no longer scheduled, so the slot's pending-op drain
+        // would never reach them.
+        let flush_ops = slot
+            .as_any_mut()
+            .downcast_mut::<VllmConnectorSlot>()
+            .ok_or_else(|| anyhow::anyhow!("Expected VllmConnectorSlot, got different type"))?
+            .take_hybrid_flush_offload()
+            .map_err(|e| anyhow::anyhow!("hybrid finish flush failed for {request_id}: {e}"))?;
+        if let Some(ops) = flush_ops {
+            tracing::debug!(
+                request_id = %request_id,
+                count = ops.len(),
+                "stashing hybrid finish-flush operations for the next connector metadata"
+            );
+            self.deferred_flush_ops.extend(ops);
+        }
+
         // remove the request from the inflight requests
         self.inflight_requests.remove(&request_id);
 
@@ -872,5 +947,47 @@ pub fn parse_kvbm_metrics_port() -> u16 {
             );
             6880
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dynamo_llm::block_manager::connector::protocol::TransferType;
+
+    /// Fix 1b's injection design: the per-leg operations a hybrid finish
+    /// flush produced at `request_finished` are stashed on the leader and
+    /// must land in the NEXT `build_connector_metadata` — the request is
+    /// no longer scheduled, so no pending-operations drain can reach
+    /// them. The take clears the stash: a later metadata build adds
+    /// nothing. (The `request_finished` wiring itself needs the
+    /// worker-handshake leader construction and is exercised on the GPU
+    /// node, like the worker save-trigger paths.)
+    #[test]
+    fn deferred_flush_ops_inject_into_the_next_metadata_and_clear() {
+        let op = |uuid| WorkerTransferRequest {
+            request_id: "req-done".to_string(),
+            uuid,
+            transfer_type: TransferType::Store,
+            request_type: RequestType::Scheduled,
+        };
+        let mut deferred = vec![op(uuid::Uuid::new_v4()), op(uuid::Uuid::new_v4())];
+
+        let mut md = ConnectorMetadata::new(1);
+        inject_deferred_flush_ops(&mut deferred, &mut md);
+        assert_eq!(md.operations.len(), 2);
+        assert_eq!(
+            md.operations
+                .iter()
+                .filter(|op| op.request_id == "req-done")
+                .count(),
+            2
+        );
+        assert!(deferred.is_empty(), "the injection must consume the stash");
+
+        // The next build carries nothing the flush did not produce.
+        let mut md_next = ConnectorMetadata::new(2);
+        inject_deferred_flush_ops(&mut deferred, &mut md_next);
+        assert!(md_next.operations.is_empty());
     }
 }

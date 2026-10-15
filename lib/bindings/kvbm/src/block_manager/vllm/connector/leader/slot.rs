@@ -926,7 +926,16 @@ impl Slot for VllmConnectorSlot {
         // Use max to advance both current_position and evaluated_blocks at least by num_computed_tokens.
         // This logic is to prevent redundant block offloading.
         self.current_position = max(self.current_position, num_computed_tokens);
-        self.evaluated_blocks = max(self.evaluated_blocks, num_computed_tokens / self.block_size);
+        // Hybrid multi-group (fix 1a): evaluated_blocks stays FROZEN here —
+        // the mid-flight offload below is suppressed and the finish flush
+        // (take_hybrid_flush_offload) must still see every completed
+        // position as a candidate. Only trigger_onboarding (which consumes
+        // the onboarded prefix) and the flush itself may advance it.
+        // Attention-only keeps the validated cursor advance.
+        if self.num_groups <= 1 {
+            self.evaluated_blocks =
+                max(self.evaluated_blocks, num_computed_tokens / self.block_size);
+        }
 
         // Apply new block_ids with the reconciliation contract — see
         // `reconcile_device_block_feed` for the cases: plain append,
@@ -1031,7 +1040,27 @@ impl Slot for VllmConnectorSlot {
             num_scheduled_tokens
         );
 
-        if num_candidate_blocks != 0 {
+        // Hybrid mid-flight offload suppression (fix 1a): the fp4 COWs its
+        // chunk-boundary block on EVERY chunked-prefill boundary (live
+        // cm008 evidence: the tracked ids walk [0,1]→[0,6]→[0,11]→
+        // [0,16] while the same hash stays matched), so a mid-flight copy
+        // captures the PRE-WRITE content of a soon-reassigned id, and BOTH
+        // the stale copy and a later final copy would match the same
+        // sequence hash — the host pool must contain only final copies.
+        // Skip creating the mid-flight op entirely: do not advance
+        // evaluated_blocks (frozen above); leave the candidates for the
+        // finish flush (take_hybrid_flush_offload), which runs after the
+        // Python finish-publish has settled the per-group table.
+        // Attention-only (num_groups <= 1) is byte-identical: its blocks
+        // are never reassigned mid-flight, and the validated coder path
+        // runs unchanged below.
+        if self.num_groups > 1 {
+            tracing::debug!(
+                request_id = %self.request_id,
+                num_candidate_blocks,
+                "hybrid multi-group request: mid-flight offload suppressed; the finish flush owns the candidates"
+            );
+        } else if num_candidate_blocks != 0 {
             // Get candidate block IDs
             let candidate_block_ids: Vec<usize> = self
                 .device_blocks
@@ -1615,6 +1644,127 @@ impl VllmConnectorSlot {
                 .map(|g| table[g][start..end].to_vec())
                 .collect(),
         ))
+    }
+
+    /// Finish-time offload for hybrid requests (fix 1b): the remaining
+    /// completed positions, using the CURRENT (final) per-group ids.
+    /// Called from the leader's `request_finished` AFTER the Python
+    /// finish-publish refreshed the per-group table (the COW churn has
+    /// settled; the content is final).
+    ///
+    /// Multi-group only — the mid-flight offload is suppressed (fix 1a),
+    /// so every mid-flight candidate is still pending here and
+    /// `evaluated_blocks` was frozen (only `trigger_onboarding`, which
+    /// consumes the onboarded prefix, advanced it). Attention-only slots
+    /// keep the validated mid-flight path and return `None`.
+    ///
+    /// Sends the [`LocalTransferRequest`] on the slot's transfer channel
+    /// IMMEDIATELY — the copy must execute right away, racing only the
+    /// documented small free-window like the attention-only path — and
+    /// RETURNS the per-leg [`WorkerTransferRequest`]s for the leader to
+    /// defer into the next `build_connector_metadata`: the request is no
+    /// longer scheduled, so the slot's pending-operations drain would
+    /// never reach them.
+    ///
+    /// This is the designated finish path: it deliberately does NOT go
+    /// through [`Self::offload_blocks`], whose "Finishing blocks new op
+    /// creation" guard does not apply here. A missing/short per-group
+    /// mapping errors, exactly like the mid-flight path: moving group
+    /// 0's ids through another group's pool transfers the wrong bytes.
+    pub(crate) fn take_hybrid_flush_offload(
+        &mut self,
+    ) -> Result<Option<Vec<WorkerTransferRequest>>, SlotError> {
+        if self.num_groups <= 1 {
+            return Ok(None);
+        }
+        debug_assert!(
+            matches!(self.state, SlotState::Finishing | SlotState::Finished),
+            "the finish flush runs after mark_as_finished; got {:?}",
+            self.state
+        );
+
+        // evaluated_blocks was frozen for hybrid since admission (fix 1a);
+        // only trigger_onboarding advanced it past the onboarded prefix.
+        let start = self.evaluated_blocks;
+        let total_completed = self.current_position / self.block_size;
+        let count = total_completed - start;
+        if count == 0 {
+            return Ok(None);
+        }
+
+        // The CURRENT (final) per-group ids for the flush positions; the
+        // group-0 flat list for the op is the same table's row 0 (the
+        // authoritative final ids — the flat device_blocks list can lag a
+        // transient COW step, the just-refreshed table cannot).
+        let Some(per_group_block_ids) = self.per_group_device_ids(start, count)? else {
+            return Ok(None); // unreachable for num_groups > 1
+        };
+        let block_ids = per_group_block_ids.first().cloned().unwrap_or_default();
+
+        let token_blocks: Vec<TokenBlock> = self
+            .sequence
+            .blocks()
+            .iter()
+            .skip(start)
+            .take(count)
+            .cloned()
+            .collect();
+        // Priorities: the stored per-block map (populated by the scheduler
+        // feeds), default 0 where absent — the same lookup the mid-flight
+        // path performs.
+        let priorities: Vec<u32> = block_ids
+            .iter()
+            .map(|id| self.stored_block_priorities.get(id).copied().unwrap_or(0))
+            .collect();
+
+        let operation_id = uuid::Uuid::new_v4();
+
+        let xfer_req = LocalTransferRequest::Offload(LocalOffloadRequest::new(
+            self.request_id.clone(),
+            block_ids,
+            token_blocks,
+            priorities,
+            operation_id,
+            per_group_block_ids,
+        ));
+
+        // ONE metadata operation PER GROUP LEG with its deterministic
+        // per-leg uuid (the Task-4 pattern): the transfer engine stamps
+        // the same uuids on the wire legs, and the worker-side
+        // rendezvous — one Worker + one Transfer per (request_id, uuid)
+        // — requires the 1:1 match.
+        let mut operations = Vec::with_capacity(self.num_groups);
+        for group in 0..self.num_groups {
+            operations.push(WorkerTransferRequest {
+                request_id: self.request_id.clone(),
+                uuid: derive_leg_uuid(operation_id, group),
+                transfer_type: TransferType::Store,
+                request_type: RequestType::Scheduled,
+            });
+        }
+
+        // The transfer executes right away — same channel, same engine as
+        // offload_blocks.
+        if let Err(e) = self.xfer_tx.send(xfer_req) {
+            tracing::error!("Failed to send transfer request: {:?}", e);
+            return Err(SlotError::InvalidOperation(format!(
+                "Transfer engine unavailable: {}; aborting hybrid finish flush",
+                e
+            )));
+        }
+
+        // The flush consumed the candidates.
+        self.evaluated_blocks += count;
+
+        tracing::debug!(
+            request_id = self.request_id,
+            operation_id = %operation_id,
+            legs = self.num_groups,
+            start,
+            count,
+            "hybrid finish flush offload issued"
+        );
+        Ok(Some(operations))
     }
 
     /// this method does two things which are related:
@@ -3216,13 +3366,23 @@ mod connector_tests {
         }
     }
 
+    // ---------------------------------------------------------------
+    // Hybrid mid-flight suppression (fix 1a): multi-group slots create
+    // NO offload op mid-flight — the fp4 COWs its chunk-boundary block
+    // on every chunked-prefill boundary ([0,1]→[0,6]→[0,11]→[0,16]
+    // live evidence), so a mid-flight copy captures pre-write content
+    // of a soon-reassigned id, and BOTH the stale and a later final
+    // copy would match the same hash. The candidates stay for the
+    // finish flush; evaluated_blocks is frozen. Single-group keeps
+    // today's op (pinned by test_offload_sends_correct_block_ids).
+    // ---------------------------------------------------------------
     #[test]
-    fn offload_records_one_metadata_operation_per_group() {
+    fn hybrid_mid_flight_offload_is_suppressed_and_candidates_frozen() {
         let num_tokens = 96; // 3 blocks
         let (mut slot, mut rx) = create_test_slot_with_groups(num_tokens, 0, 3);
 
-        // Multi-group slots require the per-group mapping before any
-        // transfer op: group 0's ids are only valid for group 0's pool.
+        // The mapping is published as usual — the suppression must hold
+        // even with everything a mid-flight offload would need.
         slot.set_per_group_device_blocks(&[
             block_ids(100, 3),
             block_ids(200, 3),
@@ -3235,13 +3395,71 @@ mod connector_tests {
         slot.apply_scheduler_output(&[], &[], 0, num_tokens, None, None)
             .unwrap();
 
-        // ONE wire request goes to the transfer engine (the engine fans it
-        // out per group); the SLOT records one metadata op per leg.
-        let offloads = drain_offload_block_ids(&mut rx);
-        assert_eq!(offloads.len(), 1, "expected exactly one offload batch");
+        // No transfer request, no metadata op, evaluated_blocks frozen.
+        assert!(
+            drain_offload_requests(&mut rx).is_empty(),
+            "hybrid mid-flight offload must be suppressed"
+        );
+        assert!(
+            slot.take_pending_operations().is_none(),
+            "hybrid mid-flight offload must record no metadata operations"
+        );
+        assert_eq!(
+            slot.evaluated_blocks, 0,
+            "the candidates must stay for the finish flush"
+        );
+        assert_eq!(slot.current_position, num_tokens);
 
-        let ops = slot.take_pending_operations().expect("pending ops");
-        assert_eq!(ops.len(), 3, "one metadata op per group leg");
+        // Single-group keeps today's mid-flight op (regression pin).
+        let (mut slot, mut rx) = create_test_slot(num_tokens, 0);
+        slot.append_mutable_device_blocks(&block_ids(100, 3))
+            .unwrap();
+        slot.apply_scheduler_output(&[], &[], 0, num_tokens, None, None)
+            .unwrap();
+        assert_eq!(
+            drain_offload_block_ids(&mut rx),
+            vec![vec![100, 101, 102]],
+            "attention-only must keep the validated mid-flight path"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // The hybrid finish flush (fix 1b): after mark_as_finished, the
+    // remaining completed positions are offloaded using the CURRENT
+    // (final) per-group table — the Python finish-publish refreshed it
+    // BEFORE the flush, so the COW-reassigned ids are what move. The
+    // transfer request is sent immediately; the per-leg metadata ops
+    // are RETURNED for the leader to defer into the next
+    // build_connector_metadata. evaluated_blocks advances; a second
+    // call is None; single-group returns None.
+    // ---------------------------------------------------------------
+    #[test]
+    fn hybrid_finish_flush_offloads_final_table_ids_and_defers_leg_ops() {
+        let num_tokens = 96; // 3 blocks at BLOCK_SIZE 32
+        let (mut slot, mut rx) = create_test_slot_with_groups(num_tokens, 0, 2);
+
+        // Mid-flight suppression left every completed position for the
+        // flush; the admission publish set the initial mapping.
+        slot.set_per_group_device_blocks(&[block_ids(100, 3), block_ids(900, 3)])
+            .unwrap();
+        slot.append_mutable_device_blocks(&block_ids(100, 3))
+            .unwrap();
+        slot.apply_scheduler_output(&[], &[], 0, num_tokens, None, None)
+            .unwrap();
+        assert!(drain_offload_requests(&mut rx).is_empty());
+
+        // The finish publish REPLACES the table with the FINAL ids: the
+        // chunk-boundary COW reassigned group 0's position 1 (101 → 6).
+        slot.set_per_group_device_blocks(&[vec![100, 6, 102], vec![900, 901, 902]])
+            .unwrap();
+
+        slot.mark_as_finished(1).unwrap();
+
+        let ops = slot
+            .take_hybrid_flush_offload()
+            .expect("the flush must not error")
+            .expect("a multi-group slot with 3 completed blocks must flush");
+        assert_eq!(ops.len(), 2, "one metadata op per group leg");
         for (group, op) in ops.iter().enumerate() {
             assert_eq!(op.request_id, "test-req");
             assert_eq!(op.transfer_type, TransferType::Store);
@@ -3252,10 +3470,45 @@ mod connector_tests {
                 "leg {group} uuid must be the deterministic derivative of leg 0"
             );
         }
-        // All legs distinct, leg 0 is the logical op uuid.
         assert_ne!(ops[0].uuid, ops[1].uuid);
-        assert_ne!(ops[0].uuid, ops[2].uuid);
         assert_eq!(ops[0].uuid, derive_leg_uuid(ops[0].uuid, 0));
+
+        // The transfer request carries the FINAL table ids — the stale,
+        // reassigned-away group-0 id (101) is never offloaded.
+        let offloads = drain_offload_requests(&mut rx);
+        assert_eq!(offloads.len(), 1);
+        assert_eq!(offloads[0].block_ids, vec![100, 6, 102]);
+        assert_eq!(
+            offloads[0].per_group_block_ids,
+            vec![vec![100, 6, 102], vec![900, 901, 902]]
+        );
+        assert_eq!(offloads[0].priorities, vec![0, 0, 0]);
+
+        // The flush consumed the candidates: evaluated advanced, a
+        // second call has nothing left.
+        assert_eq!(slot.evaluated_blocks, 3);
+        assert!(slot.take_hybrid_flush_offload().unwrap().is_none());
+    }
+
+    #[test]
+    fn hybrid_finish_flush_returns_none_for_single_group_and_zero_count() {
+        // Attention-only: byte-identical mid-flight path, never a flush.
+        let num_tokens = 96;
+        let (mut slot, mut rx) = create_test_slot(num_tokens, 0);
+        slot.append_mutable_device_blocks(&block_ids(100, 3))
+            .unwrap();
+        slot.apply_scheduler_output(&[], &[], 0, num_tokens, None, None)
+            .unwrap();
+        assert_eq!(drain_offload_requests(&mut rx).len(), 1, "today's op");
+        slot.mark_as_finished(1).unwrap();
+        assert!(slot.take_hybrid_flush_offload().unwrap().is_none());
+
+        // Multi-group with nothing completed: count == 0 → None.
+        let (mut slot, _rx) = create_test_slot_with_groups(96, 0, 2);
+        slot.set_per_group_device_blocks(&[block_ids(100, 3), block_ids(900, 3)])
+            .unwrap();
+        slot.mark_as_finished(1).unwrap();
+        assert!(slot.take_hybrid_flush_offload().unwrap().is_none());
     }
 
     /// Minimal [`AnyBlocks`] stand-in so onboard metadata recording can be
@@ -3386,31 +3639,6 @@ mod connector_tests {
     }
 
     #[test]
-    fn offload_carries_per_group_source_ids() {
-        let num_tokens = 96; // 3 blocks
-        let (mut slot, mut rx) = create_test_slot_with_groups(num_tokens, 0, 2);
-
-        // The HMA-PROBE shape: same position, DIFFERENT device id per group.
-        slot.set_per_group_device_blocks(&[block_ids(100, 3), block_ids(900, 3)])
-            .unwrap();
-        slot.append_mutable_device_blocks(&block_ids(100, 3))
-            .unwrap();
-        slot.apply_scheduler_output(&[], &[], 0, num_tokens, None, None)
-            .unwrap();
-
-        let offloads = drain_offload_requests(&mut rx);
-        assert_eq!(offloads.len(), 1);
-        let offload = &offloads[0];
-        // Group 0's flat list is unchanged (tier allocation count + legacy
-        // fallback), and each group's source ids are its OWN.
-        assert_eq!(offload.block_ids, vec![100, 101, 102]);
-        assert_eq!(
-            offload.per_group_block_ids,
-            vec![vec![100, 101, 102], vec![900, 901, 902]]
-        );
-    }
-
-    #[test]
     fn offload_single_group_keeps_legacy_empty_per_group_ids() {
         let num_tokens = 96;
         let (mut slot, mut rx) = create_test_slot_with_groups(num_tokens, 0, 1);
@@ -3428,18 +3656,26 @@ mod connector_tests {
         );
     }
 
+    // The mid-flight multi-group offload this test used to pin is
+    // suppressed (fix 1a); the refusal now lives on the finish flush:
+    // a multi-group slot whose mapping was never published must refuse
+    // to move group 0's ids through the other groups' pools there.
     #[test]
     #[should_panic(expected = "per-group device block mapping missing")]
-    fn offload_multi_group_without_mapping_refuses_to_move_group_zero_ids() {
+    fn hybrid_finish_flush_without_mapping_refuses_group_zero_ids() {
         let num_tokens = 96;
         let (mut slot, _rx) = create_test_slot_with_groups(num_tokens, 0, 2);
 
+        // Suppressed mid-flight: no panic at apply time even without a
+        // mapping (no consumer runs).
         slot.append_mutable_device_blocks(&block_ids(100, 3))
             .unwrap();
-        // No set_per_group_device_blocks: an offload here would move group
-        // 0's ids through group 1's pool — wrong bytes. It must fail.
         slot.apply_scheduler_output(&[], &[], 0, num_tokens, None, None)
             .unwrap();
+
+        // The finish flush, however, still needs every group's OWN ids.
+        slot.mark_as_finished(1).unwrap();
+        let _ = slot.take_hybrid_flush_offload().unwrap();
     }
 
     #[test]

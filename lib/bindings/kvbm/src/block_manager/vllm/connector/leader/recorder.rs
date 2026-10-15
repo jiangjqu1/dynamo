@@ -357,6 +357,7 @@ impl KvConnectorLeaderRecorder {
             onboarding_slots: HashSet::new(),
             iteration_counter: 0,
             kvbm_metrics,
+            deferred_flush_ops: Vec::new(),
         };
 
         Self {
