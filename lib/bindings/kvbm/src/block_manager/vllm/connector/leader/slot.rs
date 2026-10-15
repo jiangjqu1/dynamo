@@ -656,40 +656,94 @@ impl std::fmt::Debug for VllmConnectorSlot {
 /// Reconcile vLLM's per-step device-block feed against one tracked
 /// block-id sequence (the flat group-0 list, or one HMA group's row in
 /// the per-group table). vLLM's feed is authoritative for the request's
-/// CURRENT blocks:
+/// CURRENT blocks.
 ///
-/// (a) feed head not tracked → plain append of genuinely new blocks;
-/// (b) feed head tracked and the tracked suffix matches the feed's
-///     prefix → extend with the non-overlapping tail (overlap dedup);
-/// (c) feed head tracked at position 0 and the tracked tail diverged →
-///     vLLM reassigned the tracked ids (copy-on-write of a
-///     prefix-cache-shared block: its kv_cache_manager swaps
-///     `req_blocks[block_idx]` for a private `cow_block`, so a
-///     mid-list id the slot still tracks is no longer the request's).
-///     The feed is the request's current list — REPLACE the tracked
-///     list wholesale;
-/// (d) feed head tracked mid-list with a divergent continuation →
-///     inconsistent feed → Err. The flat apply panics on this; the
-///     advisory per-group table logs and skips the row update instead
-///     (its consumers fail loudly if a stale position is needed).
+/// Decision ladder (order matters — vLLM's HMA mamba groups legitimately
+/// report DUPLICATE block ids, e.g. `[0, 0, 0, 0, 11, 18]`, so any
+/// id-search must come after the alignment-exact cases):
+///
+/// 1. feed == tracked → no-op;
+/// 2. the feed matches the tracked list's natural suffix → no-op (the
+///    feed is already applied);
+/// 3. the tracked list is a prefix of the feed → extend with the tail.
+///
+/// Then the id-search cases:
+///
+/// 4. feed head not tracked → plain append of genuinely new blocks;
+/// 5. feed head tracked and the tracked suffix matches the feed's
+///    prefix → extend with the non-overlapping tail (overlap dedup);
+/// 6. feed head tracked at position 0 and the tracked tail diverged →
+///    vLLM reassigned the tracked ids (copy-on-write of a
+///    prefix-cache-shared block: its kv_cache_manager swaps
+///    `req_blocks[block_idx]` for a private `cow_block`, so a
+///    mid-list id the slot still tracks is no longer the request's).
+///    The feed is the request's current list — REPLACE the tracked
+///    list wholesale;
+/// 7. feed head tracked mid-list with a divergent continuation →
+///    inconsistent feed → Err. The flat apply panics on this; the
+///    advisory per-group table logs and skips the row update instead
+///    (its consumers fail loudly if a stale position is needed).
 ///
 /// Returns Err with a `device_blocks contract violation` message for
-/// case (d) and for feeds that would double-track an existing id.
+/// case 7 — mid-list id match with a divergent continuation. Already-
+/// tracked ids in append/extension tails only WARN: vLLM's HMA mamba
+/// groups legitimately report duplicate ids within one request.
 fn reconcile_device_block_feed(
     tracked: &mut Vec<BlockId>,
     feed: &[BlockId],
 ) -> Result<(), SlotError> {
+    if feed.is_empty() {
+        return Ok(());
+    }
+
+    // Ladder case 1: identical lists — nothing to do. (With duplicate ids
+    // in play, any search-based alignment can misfire; the exact match
+    // must be decided first.)
+    if tracked.as_slice() == feed {
+        return Ok(());
+    }
+
+    // Ladder case 2: the feed is the tracked list's natural suffix — the
+    // feed is already fully applied (a repeated or trimmed publish).
+    if tracked.len() >= feed.len() && tracked[tracked.len() - feed.len()..] == feed[..] {
+        return Ok(());
+    }
+
+    // Ladder case 3: the tracked list is a prefix of the feed — the feed
+    // adds new blocks at the tail. Checked before the id search so a
+    // duplicated head cannot pull the alignment to a later occurrence.
+    if feed.len() > tracked.len() && feed[..tracked.len()] == tracked[..] {
+        let new_ids = &feed[tracked.len()..];
+        let existing: HashSet<BlockId> = tracked.iter().copied().collect();
+        for id in new_ids {
+            if existing.contains(id) {
+                // vLLM's HMA mamba groups legitimately report duplicate
+                // block ids within one request (verified live: [0,0,0,0,
+                // 11,18]); a set-membership rejection would misfire there.
+                // Warn, not error — the alignment cases above are the
+                // real consistency guards.
+                tracing::warn!(
+                    block_id = id,
+                    "device-block feed extends with an already-tracked id \
+                     (vLLM duplicate reporting is legal for HMA mamba groups)"
+                );
+            }
+        }
+        tracked.extend_from_slice(new_ids);
+        tracing::debug!("DEDUP: prefix extend with {} new block_ids", new_ids.len());
+        return Ok(());
+    }
+
     let Some(pos) = tracked.iter().rposition(|&id| id == feed[0]) else {
         // Case (a): no overlap — the feed is all-new blocks.
         let existing: HashSet<BlockId> = tracked.iter().copied().collect();
         for id in feed {
             if existing.contains(id) {
-                return Err(SlotError::InvalidOperation(format!(
-                    "device_blocks contract violation: block {} already in device_blocks \
-                     but not part of suffix/prefix overlap (overlap_len={}, \
-                     device_blocks={:?}, block_ids={:?})",
-                    id, 0, tracked, feed
-                )));
+                tracing::warn!(
+                    block_id = id,
+                    "device-block feed appends an already-tracked id \
+                     (vLLM duplicate reporting is legal for HMA mamba groups)"
+                );
             }
         }
         tracked.extend_from_slice(feed);
@@ -704,12 +758,11 @@ fn reconcile_device_block_feed(
             let existing: HashSet<BlockId> = tracked.iter().copied().collect();
             for id in new_ids {
                 if existing.contains(id) {
-                    return Err(SlotError::InvalidOperation(format!(
-                        "device_blocks contract violation: block {} already in device_blocks \
-                         but not part of suffix/prefix overlap (overlap_len={}, \
-                         device_blocks={:?}, block_ids={:?})",
-                        id, suffix_len, tracked, feed
-                    )));
+                    tracing::warn!(
+                        block_id = id,
+                        "device-block overlap extends with an already-tracked id \
+                         (vLLM duplicate reporting is legal for HMA mamba groups)"
+                    );
                 }
             }
             tracked.extend_from_slice(new_ids);
@@ -2846,13 +2899,18 @@ mod connector_tests {
     }
 
     // ---------------------------------------------------------------
-    // Test 12: Non-contiguous duplicate panics (Case 3)
-    //          [10,11,12,13,14] + apply([13,14,10]) → block 10 already
-    //          exists but is not part of the suffix/prefix overlap.
+    // Test 12: Non-contiguous duplicate extends with a warning (relaxed).
+    //          [10,11,12,13,14] + apply([13,14,10]) — the suffix overlap
+    //          [13,14] matches; the tail id 10 is already tracked.
+    //          Historically a contract-violation panic; relaxed because
+    //          vLLM's HMA mamba groups legitimately report duplicate ids
+    //          within one request (live evidence: [0,0,0,0,11,18]) — the
+    //          alignment cases (1/2/3/b/c) are the real consistency
+    //          guards and case (d) still fails loud on genuinely
+    //          inconsistent feeds.
     // ---------------------------------------------------------------
     #[test]
-    #[should_panic(expected = "contract violation")]
-    fn test_non_contiguous_duplicate_panics() {
+    fn test_non_contiguous_duplicate_extends_with_warning() {
         let num_tokens = 192; // 6 blocks
         let (mut slot, _rx) = create_test_slot(num_tokens, 0);
 
@@ -2860,9 +2918,74 @@ mod connector_tests {
             .unwrap();
 
         // Overlap: suffix [13,14] matches prefix [13,14], overlap=2.
-        // new_ids = [10]. But 10 ∈ device_blocks → contract violation.
+        // new_ids = [10] — already tracked: warn, extend (no panic).
         slot.apply_scheduler_output(&[], &[13, 14, 10], 0, 192, None, None)
             .unwrap();
+
+        assert_eq!(slot.device_blocks_snapshot(), &[10, 11, 12, 13, 14, 10]);
+    }
+
+    // ---------------------------------------------------------------
+    // Test 12b: IDENTICAL duplicate-heavy lists are a no-op (the node
+    //           regression): vLLM's mamba group reported
+    //           [0,0,0,0,11,18] as BOTH the tracked list and the next
+    //           feed; the old rposition search aligned at the LAST 0
+    //           (pos 3) and panicked on a false suffix mismatch.
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_reconcile_equal_duplicate_lists_is_a_no_op() {
+        let num_tokens = 128;
+        let (mut slot, _rx) = create_test_slot(num_tokens, 0);
+
+        slot.append_mutable_device_blocks(&[0, 0, 0, 0, 11, 18])
+            .unwrap();
+
+        // The exact same feed — ladder case 1 short-circuits before any
+        // id search; no panic, no duplication.
+        slot.apply_scheduler_output(&[], &[0, 0, 0, 0, 11, 18], 0, 128, None, None)
+            .unwrap();
+
+        assert_eq!(slot.device_blocks_snapshot(), &[0, 0, 0, 0, 11, 18]);
+    }
+
+    // ---------------------------------------------------------------
+    // Test 12c: the feed matches the tracked list's natural suffix —
+    //           already applied, no-op (ladder case 2).
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_reconcile_natural_suffix_is_a_no_op() {
+        let num_tokens = 96;
+        let (mut slot, _rx) = create_test_slot(num_tokens, 0);
+
+        slot.append_mutable_device_blocks(&[5, 6, 7]).unwrap();
+
+        // [6,7] is the tracked list's natural suffix — nothing to do.
+        slot.apply_scheduler_output(&[], &[6, 7], 0, 96, None, None)
+            .unwrap();
+
+        assert_eq!(slot.device_blocks_snapshot(), &[5, 6, 7]);
+    }
+
+    // ---------------------------------------------------------------
+    // Test 12d: prefix extend with a duplicated head — the tracked list
+    //           is a prefix of the feed, and the feed's head repeats.
+    //           Ladder case 3 must align at position 0, not the last
+    //           occurrence of the head (the old rposition trap).
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_reconcile_prefix_extend_with_duplicate_head() {
+        let num_tokens = 96;
+        let (mut slot, _rx) = create_test_slot(num_tokens, 0);
+
+        slot.append_mutable_device_blocks(&[0, 0]).unwrap();
+
+        // feed [0,0,9] extends the tracked [0,0] — the old code's
+        // rposition would find head 0 at pos 1 (the LAST 0) and
+        // miscompare; the prefix case aligns correctly at 0.
+        slot.apply_scheduler_output(&[], &[0, 0, 9], 0, 96, None, None)
+            .unwrap();
+
+        assert_eq!(slot.device_blocks_snapshot(), &[0, 0, 9]);
     }
 
     // ---------------------------------------------------------------
