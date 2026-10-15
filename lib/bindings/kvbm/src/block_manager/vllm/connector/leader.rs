@@ -103,6 +103,21 @@ pub trait Leader: Send + Sync + std::fmt::Debug {
         per_group_block_ids: Vec<Vec<BlockId>>,
     ) -> anyhow::Result<()>;
 
+    /// Store the request's per-group onboard destination geometry (fix 2,
+    /// HMA multi-group): `per_group_starts[g]`/`per_group_ext_counts[g]`
+    /// are the vLLM reference's per-group tail arithmetic (group g's
+    /// external blocks sit at the TAIL of ITS OWN computed range — a
+    /// coarse-granularity group's tail is NOT the flat evaluated-blocks
+    /// position). Published by the Python leader at
+    /// `update_state_after_alloc` BEFORE the Rust onboard trigger runs
+    /// inside it. Unused on the TRT-LLM path (single-group).
+    fn set_onboard_geometry(
+        &self,
+        request_id: String,
+        per_group_starts: Vec<usize>,
+        per_group_ext_counts: Vec<usize>,
+    ) -> anyhow::Result<()>;
+
     fn build_connector_metadata(
         &mut self,
         scheduler_output: SchedulerOutput,
@@ -457,6 +472,17 @@ impl Leader for KvConnectorLeader {
     ) -> anyhow::Result<()> {
         self.per_group_slot_update(&request_id, |slot| {
             slot.append_per_group_device_blocks(&per_group_block_ids)
+        })
+    }
+
+    fn set_onboard_geometry(
+        &self,
+        request_id: String,
+        per_group_starts: Vec<usize>,
+        per_group_ext_counts: Vec<usize>,
+    ) -> anyhow::Result<()> {
+        self.per_group_slot_update(&request_id, |slot| {
+            slot.set_onboard_geometry(&per_group_starts, &per_group_ext_counts)
         })
     }
 
@@ -894,6 +920,27 @@ impl PyKvConnectorLeader {
     ) -> PyResult<()> {
         self.connector_leader
             .append_per_group_device_blocks(request_id.to_string(), per_group_block_ids)
+            .map_err(to_pyerr)
+    }
+
+    /// Per-group onboard destination geometry (fix 2, HMA multi-group):
+    /// each group's start position within its computed range and its
+    /// external-block count — the vLLM reference's per-group tail
+    /// arithmetic. Must be published BEFORE
+    /// `update_state_after_alloc` (the Rust onboard trigger runs inside
+    /// it).
+    fn set_onboard_geometry(
+        &self,
+        request_id: &str,
+        per_group_starts: Vec<usize>,
+        per_group_ext_counts: Vec<usize>,
+    ) -> PyResult<()> {
+        self.connector_leader
+            .set_onboard_geometry(
+                request_id.to_string(),
+                per_group_starts,
+                per_group_ext_counts,
+            )
             .map_err(to_pyerr)
     }
 

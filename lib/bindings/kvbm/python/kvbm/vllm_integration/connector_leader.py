@@ -173,6 +173,32 @@ class KvConnectorLeader:
         # get_num_new_matched_tokens).
         self._hybrid_onboard_gate_logged = False
 
+        # Per-group block sizes for the hybrid onboard geometry (fix 2):
+        # the vLLM reference's per-group tail arithmetic needs each
+        # group's OWN block size (``kv_cache_spec.block_size``) and the
+        # full-attention group's index (its hashed blocks count how many
+        # tokens were computed). Attribute absence is guarded — a config
+        # shape we cannot derive skips publishing geometry and the Rust
+        # falls back to today's positional destinations.
+        self._group_block_sizes: Optional[list[Optional[int]]] = (
+            [
+                getattr(getattr(group, "kv_cache_spec", None), "block_size", None)
+                for group in kv_cache_groups
+            ]
+            if kv_cache_groups
+            else None
+        )
+        self._fa_gidx = 0
+        if kv_cache_groups:
+            for g_idx, group in enumerate(kv_cache_groups):
+                # Name-keyed like _spec_is_mamba (group_plan.py): the spec
+                # TYPE NAME is the cross-version contract; an isinstance
+                # check would require importing vllm at runtime.
+                spec = getattr(group, "kv_cache_spec", None)
+                if spec is not None and type(spec).__name__ == "FullAttentionSpec":
+                    self._fa_gidx = g_idx
+                    break
+
         # Cumulative per-group device block lists per request (group-major).
         # This is the leader's authoritative view of what the Rust slot holds:
         # FULL lists at admission/resume, merged with each step's deltas for
@@ -318,6 +344,13 @@ class KvConnectorLeader:
         self._req_full_blocks[request.request_id] = tuple(
             list(group) for group in group_block_ids
         )
+        # Fix 2: multi-group onboards also need the per-group tail
+        # geometry — BEFORE the Rust call below, whose onboard trigger
+        # resolves each group's destinations from it.
+        if num_external_tokens > 0 and self._num_groups > 1:
+            self._publish_onboard_geometry(
+                request.request_id, blocks, num_external_tokens
+            )
         self._connector.update_state_after_alloc(
             request.request_id, block_ids, num_external_tokens
         )
@@ -492,6 +525,101 @@ class KvConnectorLeader:
             return
         self._connector.append_per_group_device_blocks(
             request_id, [list(group) for group in per_group_block_ids]
+        )
+
+    def _publish_onboard_geometry(
+        self,
+        request_id: str,
+        blocks: "KVCacheBlocks",
+        num_external_tokens: int,
+    ) -> None:
+        """Publish the per-group onboard destination geometry (fix 2).
+
+        The vLLM reference (``SimpleCPUOffloadScheduler.
+        update_state_after_alloc``) places a request's EXTERNAL blocks at
+        the TAIL of each group's OWN computed range:
+
+        - ``num_computed = num_cached_fa_blocks * fa_block_size`` where
+          the FA group is the first ``FullAttentionSpec`` group and its
+          hashed blocks are counted from ``blocks.blocks[fa_gidx]``;
+        - ``total_computed = num_computed + num_external_tokens``;
+        - per group g (``g_bs = groups[g].kv_cache_spec.block_size``):
+          ``n_ext_g = num_external_tokens // g_bs``,
+          ``n_computed_g = cdiv(total_computed, g_bs)``,
+          ``start_g = n_computed_g - n_ext_g``.
+
+        A flat positional index cannot express this for coarse-granularity
+        groups (the fp4: 3920 external tokens are 5 FA blocks at 784 but
+        only 2 of the 1960-token group's blocks). Any derivation failure
+        logs a warning and skips the publish — the Rust then falls back to
+        today's positional destinations.
+        """
+        group_block_sizes = self._group_block_sizes
+        if (
+            not group_block_sizes
+            or len(group_block_sizes) != self._num_groups
+            or any(bs is None for bs in group_block_sizes)
+        ):
+            logger.warning(
+                "request %s: onboard geometry skipped — per-group block "
+                "sizes unavailable (num_groups=%d); the Rust falls back to "
+                "positional destinations",
+                request_id,
+                self._num_groups,
+            )
+            return
+        try:
+            fa_blocks = blocks.blocks[self._fa_gidx]
+            num_cached_fa_blocks = sum(
+                1 for blk in fa_blocks if blk.block_hash is not None
+            )
+        except (AttributeError, IndexError, TypeError) as exc:
+            logger.warning(
+                "request %s: onboard geometry skipped — blocks structure "
+                "differs from the reference's shape (%s); the Rust falls "
+                "back to positional destinations",
+                request_id,
+                exc,
+            )
+            return
+
+        fa_block_size = group_block_sizes[self._fa_gidx]
+        total_computed = num_cached_fa_blocks * fa_block_size + num_external_tokens
+
+        per_group_starts: list[int] = []
+        per_group_ext_counts: list[int] = []
+        for g_block_size in group_block_sizes:
+            if num_external_tokens % g_block_size != 0:
+                logger.warning(
+                    "request %s: onboard geometry skipped — %d external "
+                    "tokens are not whole blocks of every group (block "
+                    "sizes %s); the Rust falls back to positional "
+                    "destinations",
+                    request_id,
+                    num_external_tokens,
+                    group_block_sizes,
+                )
+                return
+            n_ext_g = num_external_tokens // g_block_size
+            # cdiv: external blocks sit at the TAIL of the computed range.
+            n_computed_g = -(-total_computed // g_block_size)
+            start_g = n_computed_g - n_ext_g
+            if start_g < 0:
+                logger.warning(
+                    "request %s: onboard geometry skipped — group start "
+                    "%d is negative (external tokens %d, block size %d); "
+                    "the Rust falls back to positional destinations",
+                    request_id,
+                    start_g,
+                    num_external_tokens,
+                    g_block_size,
+                )
+                return
+            per_group_starts.append(start_g)
+            per_group_ext_counts.append(n_ext_g)
+
+        self._connector.set_onboard_geometry(
+            request_id, per_group_starts, per_group_ext_counts
         )
 
     def _store_full_blocks(

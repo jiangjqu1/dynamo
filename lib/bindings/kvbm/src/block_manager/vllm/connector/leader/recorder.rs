@@ -456,6 +456,23 @@ impl Leader for KvConnectorLeaderRecorder {
             .append_per_group_device_blocks(request_id, per_group_block_ids)
     }
 
+    // The onboard geometry is delegated but NOT recorded, same rationale
+    // as the per-group mapping updates: it is advisory slot state
+    // reproducible from the recorded UpdateStateAfterAlloc action (same
+    // inputs), and adding Action variants would change the trace schema.
+    fn set_onboard_geometry(
+        &self,
+        request_id: String,
+        per_group_starts: Vec<usize>,
+        per_group_ext_counts: Vec<usize>,
+    ) -> anyhow::Result<()> {
+        self.connector_leader.set_onboard_geometry(
+            request_id,
+            per_group_starts,
+            per_group_ext_counts,
+        )
+    }
+
     fn build_connector_metadata(
         &mut self,
         scheduler_output: SchedulerOutput,

@@ -188,6 +188,20 @@ pub trait ExternallyManagedDeviceSlot: Slot {
         &mut self,
         per_group_block_ids: &[Vec<BlockId>],
     ) -> Result<(), SlotError>;
+
+    /// Store the request's per-group onboard destination geometry (fix 2,
+    /// HMA multi-group): `per_group_starts[g]`/`per_group_ext_counts[g]`
+    /// describe group g's external blocks at the TAIL of ITS OWN computed
+    /// range — the vLLM reference's (`SimpleCPUOffloadScheduler::
+    /// update_state_after_alloc`) arithmetic, which the flat
+    /// evaluated-blocks position cannot express for coarse-granularity
+    /// groups. Consumed by the next `trigger_onboarding`; absent keeps
+    /// the positional fallback.
+    fn set_onboard_geometry(
+        &mut self,
+        per_group_starts: &[usize],
+        per_group_ext_counts: &[usize],
+    ) -> Result<(), SlotError>;
 }
 
 pub struct ConnectorSlotManager<R: RequestKey> {
@@ -480,6 +494,19 @@ pub struct VllmConnectorSlot {
     /// to index. Between preemption and resume no consumer runs (the
     /// request is unscheduled).
     per_group_block_table: Option<Vec<Vec<BlockId>>>,
+
+    /// Per-group onboard destination geometry published by the Python
+    /// leader (fix 2, HMA multi-group): group g's external blocks sit at
+    /// the TAIL of ITS OWN computed range
+    /// `starts[g] .. starts[g] + ext_counts[g]` — the vLLM reference's
+    /// (`SimpleCPUOffloadScheduler::update_state_after_alloc`)
+    /// arithmetic, which a flat `evaluated_blocks` position cannot express
+    /// for coarse-granularity groups. `None` (single-group, or the Python
+    /// side could not derive it) keeps the positional fallback
+    /// (`per_group_device_ids(evaluated_blocks, n)`). Consumed by the
+    /// next `trigger_onboarding`; the Python side republishes before
+    /// every `update_state_after_alloc` that triggers an onboard.
+    onboard_geometry: Option<OnboardGeometry>,
 }
 
 impl VllmConnectorSlot {
@@ -525,6 +552,7 @@ impl VllmConnectorSlot {
             stored_block_priorities: HashMap::new(),
             num_groups: num_groups.max(1),
             per_group_block_table: None,
+            onboard_geometry: None,
         }
     }
 
@@ -567,6 +595,7 @@ impl VllmConnectorSlot {
             stored_block_priorities: HashMap::new(),
             num_groups: num_groups.max(1),
             per_group_block_table: None,
+            onboard_geometry: None,
         }
     }
 
@@ -841,6 +870,9 @@ impl Slot for VllmConnectorSlot {
         self.total_blocks_queried = 0;
         self.offload_terminated_at_block = None;
         self.stored_block_priorities.clear();
+        // Consumed by the last trigger_onboarding; cleared defensively so
+        // a stale geometry can never outlive the request's tracking state.
+        self.onboard_geometry = None;
     }
 
     fn reset(&mut self) {
@@ -1434,6 +1466,14 @@ impl Slot for VllmConnectorSlot {
         // shift the evaluated blocks position to the end of the computed/cached blocks
         self.evaluated_blocks = num_computed_blocks;
 
+        // Fix 2: consume the per-group onboard geometry (published by the
+        // Python leader for multi-group requests before this trigger) —
+        // each group's destinations then come from its OWN row's tail
+        // slice instead of the flat evaluated-blocks position. Absent
+        // (single-group, or the Python side could not derive it): the
+        // positional fallback, exactly today's behavior.
+        let onboard_geometry = self.onboard_geometry.take();
+
         // match the host / disk blocks to the newly assigned mutable device blocks
         if let Some(host_blocks) = self.staging_from_host.take() {
             let num_host_blocks = host_blocks.len();
@@ -1452,7 +1492,7 @@ impl Slot for VllmConnectorSlot {
             // construct offload requests - transfer engine + worker
             let src_blocks = Box::new(AnyImmutableBlocks::<DevbarStorage, _, _>::new(host_blocks));
 
-            self.onboard_blocks(src_blocks, dst_block_ids)?;
+            self.onboard_blocks(src_blocks, dst_block_ids, onboard_geometry.as_ref())?;
 
             // shift the evaluated blocks position to the end of the computed/cached blocks
             self.evaluated_blocks += num_host_blocks;
@@ -1475,7 +1515,7 @@ impl Slot for VllmConnectorSlot {
             // construct offload requests - transfer engine + worker
             let src_blocks = Box::new(AnyImmutableBlocks::<DiskStorage, _, _>::new(disk_blocks));
 
-            self.onboard_blocks(src_blocks, dst_block_ids)?;
+            self.onboard_blocks(src_blocks, dst_block_ids, onboard_geometry.as_ref())?;
 
             // shift the evaluated blocks position to the end of the computed/cached blocks
             self.evaluated_blocks += num_disk_blocks;
@@ -1572,6 +1612,36 @@ impl ExternallyManagedDeviceSlot for VllmConnectorSlot {
             total = table.first().map(Vec::len).unwrap_or(0),
             "appended per-group device block delta to mapping"
         );
+        Ok(())
+    }
+
+    fn set_onboard_geometry(
+        &mut self,
+        per_group_starts: &[usize],
+        per_group_ext_counts: &[usize],
+    ) -> Result<(), SlotError> {
+        if per_group_starts.len() != self.num_groups
+            || per_group_ext_counts.len() != self.num_groups
+        {
+            return Err(SlotError::InvalidOperation(format!(
+                "onboard geometry for request {} expects {} per-group entries, \
+                 got starts={} ext_counts={}",
+                self.request_id,
+                self.num_groups,
+                per_group_starts.len(),
+                per_group_ext_counts.len()
+            )));
+        }
+        tracing::debug!(
+            request_id = self.request_id,
+            starts = ?per_group_starts,
+            ext_counts = ?per_group_ext_counts,
+            "storing per-group onboard destination geometry"
+        );
+        self.onboard_geometry = Some(OnboardGeometry {
+            starts: per_group_starts.to_vec(),
+            ext_counts: per_group_ext_counts.to_vec(),
+        });
         Ok(())
     }
 }
@@ -1764,7 +1834,57 @@ impl VllmConnectorSlot {
             count,
             "hybrid finish flush offload issued"
         );
+
         Ok(Some(operations))
+    }
+
+    /// Per-group onboard DESTINATION rows under the published geometry
+    /// (fix 2): group g's row is
+    /// `table[g][starts[g] .. starts[g] + ext_counts[g]]` — the vLLM
+    /// reference's per-group tail arithmetic (a coarse group's external
+    /// tail is NOT the flat evaluated-blocks position). Fails loudly on
+    /// a missing or short mapping, mirroring [`Self::per_group_device_ids`]:
+    /// moving group 0's ids through another group's pool transfers the
+    /// wrong bytes, so the op must not be issued.
+    fn onboard_geometry_dst_rows(
+        &self,
+        geometry: &OnboardGeometry,
+    ) -> Result<Vec<Vec<BlockId>>, SlotError> {
+        let Some(table) = &self.per_group_block_table else {
+            return Err(SlotError::InvalidOperation(format!(
+                "per-group device block mapping missing for request {} (num_groups={}): \
+                 the onboard geometry needs each group's own destination ids; refusing to \
+                 move group 0's ids through every group's pool",
+                self.request_id, self.num_groups
+            )));
+        };
+        if geometry.starts.len() < self.num_groups || geometry.ext_counts.len() < self.num_groups {
+            return Err(SlotError::InvalidOperation(format!(
+                "onboard geometry for request {} covers fewer than {} groups \
+                 (starts={}, ext_counts={})",
+                self.request_id,
+                self.num_groups,
+                geometry.starts.len(),
+                geometry.ext_counts.len()
+            )));
+        }
+        (0..self.num_groups)
+            .map(|g| {
+                let start = geometry.starts[g];
+                let count = geometry.ext_counts[g];
+                let end = start + count;
+                let row = &table[g];
+                if row.len() < end {
+                    return Err(SlotError::InvalidOperation(format!(
+                        "per-group device block mapping too short for request {} group {g}: \
+                         the onboard geometry needs positions {start}..{end}, the group has {}",
+                        self.request_id,
+                        row.len()
+                    )));
+                }
+                Ok(row[start..end].to_vec())
+            })
+            .collect()
     }
 
     /// this method does two things which are related:
@@ -1843,10 +1963,23 @@ impl VllmConnectorSlot {
         Ok(())
     }
 
+    /// Creates the transfer-engine onboard request and the matching
+    /// per-leg connector worker requests; they share the logical op uuid
+    /// (each leg carries its deterministic `derive_leg_uuid` derivative).
+    ///
+    /// `onboard_geometry` (fix 2, HMA multi-group): when present, each
+    /// group's destinations come from its OWN row's tail slice
+    /// `[starts[g] .. starts[g] + ext_counts[g]]` of the per-group table
+    /// (the vLLM reference's per-group arithmetic — a coarse group's
+    /// external tail is NOT the flat evaluated-blocks position); the
+    /// flat `dst_block_ids` (group 0's view) keeps the caller's
+    /// positional semantics. When absent: the positional resolution
+    /// over [`Self::per_group_device_ids`], exactly today's behavior.
     fn onboard_blocks(
         &mut self,
         src_blocks: Box<dyn AnyBlocks>,
         dst_block_ids: Vec<BlockId>,
+        onboard_geometry: Option<&OnboardGeometry>,
     ) -> Result<(), SlotError> {
         debug_assert_eq!(src_blocks.len(), dst_block_ids.len());
 
@@ -1854,14 +1987,12 @@ impl VllmConnectorSlot {
         let src_storage_pool = src_blocks.storage_pool();
         let operation_id = uuid::Uuid::new_v4();
 
-        // The destinations are the request's logical blocks at positions
-        // `evaluated_blocks..+n` — the SAME positions the caller just zipped
-        // from device_blocks (group 0's ids). Resolve each group's OWN
-        // destination ids for those positions; group 0's flat ids are only
-        // valid for group 0's pool.
-        let per_group_dst_block_ids = self
-            .per_group_device_ids(self.evaluated_blocks, dst_block_ids.len())?
-            .unwrap_or_default();
+        let per_group_dst_block_ids = match onboard_geometry {
+            Some(geometry) => self.onboard_geometry_dst_rows(geometry)?,
+            None => self
+                .per_group_device_ids(self.evaluated_blocks, dst_block_ids.len())?
+                .unwrap_or_default(),
+        };
 
         let xfer_req = LocalTransferRequest::Onboard(LocalOnboardRequest::new(
             self.request_id.clone(),
@@ -1943,6 +2074,19 @@ fn derive_leg_uuid(logical: uuid::Uuid, group: usize) -> uuid::Uuid {
     uuid::Uuid::from_bytes(bytes)
 }
 
+/// The per-group onboard destination geometry (fix 2, HMA multi-group):
+/// group g's external blocks occupy `starts[g] .. starts[g] + ext_counts[g]`
+/// of its OWN computed range — the reference
+/// `SimpleCPUOffloadScheduler::update_state_after_alloc` arithmetic (ext
+/// blocks at the TAIL, per group; a coarse-granularity group takes FEWER
+/// blocks than the scheduler-granularity flat count).
+struct OnboardGeometry {
+    /// First computed-range position of group g's external blocks.
+    starts: Vec<usize>,
+    /// How many external blocks group g takes (`n_ext_g`).
+    ext_counts: Vec<usize>,
+}
+
 struct LocalOffloadRequest {
     request_id: String,
     /// Group 0's device ids for the candidate blocks — also the logical
@@ -1998,9 +2142,13 @@ struct LocalOnboardRequest {
     /// Group 0's destination device ids — also the logical block count.
     dst_block_ids: Vec<BlockId>,
     operation_id: uuid::Uuid,
-    /// Per-group DESTINATION device ids, group-major and position-indexed
-    /// (`[g][p]` = group `g`'s device id for the p-th destination). Empty in
-    /// the legacy single-group path — every group then uses `dst_block_ids`.
+    /// Per-group DESTINATION device ids, group-major (`[g][p]` = group
+    /// `g`'s device id for the p-th destination). Empty in the legacy
+    /// single-group path — every group then uses `dst_block_ids`. With
+    /// the per-group onboard geometry (fix 2), row `g` carries group
+    /// `g`'s OWN ext-block count (`ext_counts[g]`): a coarse-granularity
+    /// group takes fewer destinations than the flat scheduler-granularity
+    /// count, and the transfer pairing truncates to its own count.
     per_group_dst_block_ids: Vec<Vec<BlockId>>,
 }
 
@@ -2018,10 +2166,11 @@ impl LocalOnboardRequest {
             "per-group destination ids are only recorded for multi-group onboards"
         );
         for ids in &per_group_dst_block_ids {
-            debug_assert_eq!(
+            debug_assert!(
+                ids.len() <= dst_block_ids.len(),
+                "per-group destination ids ({}) exceed the flat destination list ({})",
                 ids.len(),
-                dst_block_ids.len(),
-                "per-group destination ids must be position-aligned with the dst list"
+                dst_block_ids.len()
             );
         }
         Self {
@@ -2538,7 +2687,11 @@ async fn process_onboard_request(
     // The tier SOURCE ids are shared across groups (one tier pool); each
     // group writes into its OWN destination device ids. Legacy single-group
     // onboards carry no per-group mapping and use group 0's destinations
-    // for every group, exactly as before.
+    // for every group, exactly as before. With the per-group onboard
+    // geometry (fix 2), a group's row carries its OWN ext-block count: a
+    // coarse-granularity group takes FEWER blocks than the flat
+    // scheduler-granularity count, and its leg's pairing truncates to its
+    // own count (the leading tier ids pair with its destinations).
     let dst_ids_per_group: Vec<Vec<usize>> = if onboard_req.per_group_dst_block_ids.is_empty() {
         vec![onboard_req.dst_block_ids.clone(); num_groups]
     } else {
@@ -2547,10 +2700,13 @@ async fn process_onboard_request(
     let block_pairs_per_group: Vec<Vec<(usize, usize)>> = dst_ids_per_group
         .into_iter()
         .map(|dst_ids| {
-            debug_assert_eq!(
+            debug_assert!(
+                dst_ids.len() <= src_block_ids.len(),
+                "per-group destination ids ({}) exceed the source blocks ({}): a group's \
+                 leg carries its OWN ext-block count (the reference's per-group tail \
+                 arithmetic — coarse groups take fewer blocks)",
                 dst_ids.len(),
-                src_block_ids.len(),
-                "per-group destination ids must cover every source block"
+                src_block_ids.len()
             );
             src_block_ids.iter().copied().zip(dst_ids).collect()
         })
@@ -3547,6 +3703,7 @@ mod connector_tests {
                 pool: BlockTransferPool::Host,
             }),
             vec![0, 1],
+            None,
         )
         .unwrap();
 
@@ -3693,6 +3850,7 @@ mod connector_tests {
                 pool: BlockTransferPool::Host,
             }),
             vec![7, 8],
+            None,
         )
         .unwrap();
 
@@ -3706,6 +3864,85 @@ mod connector_tests {
         );
     }
 
+    // ---------------------------------------------------------------
+    // The per-group onboard tail geometry (fix 2): with the published
+    // geometry, group g's destinations are its OWN row's slice
+    // [starts[g] .. starts[g] + ext_counts[g]] — the vLLM reference's
+    // arithmetic (a coarse group's external tail is NOT the flat
+    // evaluated-blocks position). Group 0's flat dst list keeps
+    // today's semantics. Without geometry, exactly today's positional
+    // rows (onboard_carries_per_group_destination_ids pins that
+    // fallback).
+    // ---------------------------------------------------------------
+    #[test]
+    fn onboard_geometry_slices_each_group_from_its_own_start() {
+        let (mut slot, mut rx) = create_test_slot_with_groups(96, 0, 2);
+
+        slot.set_per_group_device_blocks(&[vec![10, 11, 12, 13, 14], vec![70, 71, 72, 73, 74]])
+            .unwrap();
+        slot.set_onboard_geometry(&[2, 1], &[3, 2]).unwrap();
+        let geometry = slot.onboard_geometry.take();
+
+        // Group 0's flat dst list keeps today's positional semantics:
+        // the staged blocks land at the device_blocks positions.
+        slot.append_mutable_device_blocks(&[10, 11, 12, 13, 14])
+            .unwrap();
+        slot.onboard_blocks(
+            Box::new(TestAnyBlocks {
+                ids: vec![500, 501, 502],
+                pool: BlockTransferPool::Host,
+            }),
+            vec![12, 13, 14],
+            geometry.as_ref(),
+        )
+        .unwrap();
+
+        let onboards = drain_onboard_requests(&mut rx);
+        assert_eq!(onboards.len(), 1);
+        assert_eq!(onboards[0].dst_block_ids, vec![12, 13, 14]);
+        assert_eq!(
+            onboards[0].per_group_dst_block_ids,
+            vec![vec![12, 13, 14], vec![71, 72]],
+            "group 1's destinations must come from ITS OWN tail [1..3], \
+             not the flat position [2..5]"
+        );
+    }
+
+    #[test]
+    fn onboard_geometry_row_too_short_fails_loudly() {
+        let (mut slot, _rx) = create_test_slot_with_groups(96, 0, 2);
+
+        slot.set_per_group_device_blocks(&[vec![10, 11], vec![70, 71]])
+            .unwrap();
+        slot.set_onboard_geometry(&[2, 1], &[3, 2]).unwrap();
+        let geometry = slot.onboard_geometry.take();
+
+        let err = slot
+            .onboard_blocks(
+                Box::new(TestAnyBlocks {
+                    ids: vec![500, 501, 502],
+                    pool: BlockTransferPool::Host,
+                }),
+                vec![12, 13, 14],
+                geometry.as_ref(),
+            )
+            .expect_err("a geometry slice beyond the mapping must fail");
+        assert!(
+            err.to_string()
+                .contains("per-group device block mapping too short"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn set_onboard_geometry_validates_group_count() {
+        let (mut slot, _rx) = create_test_slot_with_groups(96, 0, 2);
+        let err = slot
+            .set_onboard_geometry(&[2], &[3])
+            .expect_err("1 entry for a 2-group slot must fail");
+        assert!(err.to_string().contains("expects 2 per-group entries"));
+    }
+
     #[test]
     fn onboard_multi_group_without_mapping_refuses_group_zero_destinations() {
         let (mut slot, _rx) = create_test_slot_with_groups(96, 0, 2);
@@ -3716,6 +3953,7 @@ mod connector_tests {
                     pool: BlockTransferPool::Host,
                 }),
                 vec![7, 8],
+                None,
             )
             .expect_err("multi-group onboard without a mapping must fail");
         assert!(
