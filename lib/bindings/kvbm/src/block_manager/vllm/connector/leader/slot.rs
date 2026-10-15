@@ -653,6 +653,98 @@ impl std::fmt::Debug for VllmConnectorSlot {
     }
 }
 
+/// Reconcile vLLM's per-step device-block feed against one tracked
+/// block-id sequence (the flat group-0 list, or one HMA group's row in
+/// the per-group table). vLLM's feed is authoritative for the request's
+/// CURRENT blocks:
+///
+/// (a) feed head not tracked → plain append of genuinely new blocks;
+/// (b) feed head tracked and the tracked suffix matches the feed's
+///     prefix → extend with the non-overlapping tail (overlap dedup);
+/// (c) feed head tracked at position 0 and the tracked tail diverged →
+///     vLLM reassigned the tracked ids (copy-on-write of a
+///     prefix-cache-shared block: its kv_cache_manager swaps
+///     `req_blocks[block_idx]` for a private `cow_block`, so a
+///     mid-list id the slot still tracks is no longer the request's).
+///     The feed is the request's current list — REPLACE the tracked
+///     list wholesale;
+/// (d) feed head tracked mid-list with a divergent continuation →
+///     inconsistent feed → Err. The flat apply panics on this; the
+///     advisory per-group table logs and skips the row update instead
+///     (its consumers fail loudly if a stale position is needed).
+///
+/// Returns Err with a `device_blocks contract violation` message for
+/// case (d) and for feeds that would double-track an existing id.
+fn reconcile_device_block_feed(
+    tracked: &mut Vec<BlockId>,
+    feed: &[BlockId],
+) -> Result<(), SlotError> {
+    let Some(pos) = tracked.iter().rposition(|&id| id == feed[0]) else {
+        // Case (a): no overlap — the feed is all-new blocks.
+        let existing: HashSet<BlockId> = tracked.iter().copied().collect();
+        for id in feed {
+            if existing.contains(id) {
+                return Err(SlotError::InvalidOperation(format!(
+                    "device_blocks contract violation: block {} already in device_blocks \
+                     but not part of suffix/prefix overlap (overlap_len={}, \
+                     device_blocks={:?}, block_ids={:?})",
+                    id, 0, tracked, feed
+                )));
+            }
+        }
+        tracked.extend_from_slice(feed);
+        return Ok(());
+    };
+
+    let suffix_len = tracked.len() - pos;
+    if suffix_len <= feed.len() && tracked[pos..] == feed[..suffix_len] {
+        // Case (b): suffix/prefix overlap — extend with the remainder.
+        let new_ids = &feed[suffix_len..];
+        if !new_ids.is_empty() {
+            let existing: HashSet<BlockId> = tracked.iter().copied().collect();
+            for id in new_ids {
+                if existing.contains(id) {
+                    return Err(SlotError::InvalidOperation(format!(
+                        "device_blocks contract violation: block {} already in device_blocks \
+                         but not part of suffix/prefix overlap (overlap_len={}, \
+                         device_blocks={:?}, block_ids={:?})",
+                        id, suffix_len, tracked, feed
+                    )));
+                }
+            }
+            tracked.extend_from_slice(new_ids);
+        }
+        tracing::debug!(
+            "DEDUP: suffix/prefix overlap of {} block_ids, extended with {} new",
+            suffix_len,
+            new_ids.len()
+        );
+        return Ok(());
+    }
+
+    if pos == 0 {
+        // Case (c): head matches, tail diverged — vLLM reassigned the
+        // tracked ids (e.g. COW). The feed is the request's current list;
+        // the old tail ids are no longer the request's.
+        tracing::warn!(
+            old = ?tracked,
+            new = ?feed,
+            "device blocks reassigned by vLLM (e.g. copy-on-write of a \
+             prefix-cache-shared block); replacing the tracked list"
+        );
+        tracked.clear();
+        tracked.extend_from_slice(feed);
+        return Ok(());
+    }
+
+    // Case (d): mid-list match with a divergent continuation.
+    Err(SlotError::InvalidOperation(format!(
+        "device_blocks contract violation: block_ids[0]={} found at device_blocks[{}] but \
+         device_blocks[{}..] != block_ids[..{}] (device_blocks={:?}, block_ids={:?})",
+        feed[0], pos, pos, suffix_len, tracked, feed
+    )))
+}
+
 impl Slot for VllmConnectorSlot {
     fn request_id(&self) -> &str {
         &self.request_id
@@ -766,72 +858,14 @@ impl Slot for VllmConnectorSlot {
         self.current_position = max(self.current_position, num_computed_tokens);
         self.evaluated_blocks = max(self.evaluated_blocks, num_computed_tokens / self.block_size);
 
-        // Apply new block_ids with suffix/prefix overlap contract.
-        // Block IDs are unique, so we use an O(N) algorithm:
-        //   1. Locate block_ids[0] in device_blocks via rposition (at most one match).
-        //   2. Verify device_blocks[pos..] == block_ids[..suffix_len] (the overlap).
-        //   3. Extend with only the non-overlapping tail block_ids[overlap_len..].
-        //
-        // Valid cases:
-        //   [3,4,5] + [6,7]       → [3,4,5,6,7]       (no overlap)
-        //   [3,4,5,6,7] + [6,7,8,9] → [3,4,5,6,7,8,9] (suffix/prefix overlap of 2)
-        //   [3,4,5] + [3,4,5]     → [3,4,5]            (full overlap)
-        //
-        // Invalid (panics):
-        //   [3,4,5,6,7] + [6,8,9] → block 6 found but suffix doesn't match prefix
-        if !block_ids.is_empty() {
-            let overlap_len = if let Some(pos) = self
-                .device_blocks
-                .iter()
-                .rposition(|&id| id == block_ids[0])
-            {
-                let suffix_len = self.device_blocks.len() - pos;
-                assert!(
-                    suffix_len <= block_ids.len()
-                        && self.device_blocks[pos..] == block_ids[..suffix_len],
-                    "device_blocks contract violation: block_ids[0]={} found at \
-                     device_blocks[{}] but device_blocks[{}..] != block_ids[..{}] \
-                     (device_blocks={:?}, block_ids={:?})",
-                    block_ids[0],
-                    pos,
-                    pos,
-                    suffix_len,
-                    self.device_blocks,
-                    block_ids
-                );
-                suffix_len
-            } else {
-                0
-            };
-
-            let new_ids = &block_ids[overlap_len..];
-
-            if !new_ids.is_empty() {
-                // Validate: no block in the non-overlapping portion should already exist.
-                let existing: HashSet<BlockId> = self.device_blocks.iter().copied().collect();
-                for id in new_ids {
-                    assert!(
-                        !existing.contains(id),
-                        "device_blocks contract violation: block {} already in device_blocks \
-                         but not part of suffix/prefix overlap (overlap_len={}, \
-                         device_blocks={:?}, block_ids={:?})",
-                        id,
-                        overlap_len,
-                        self.device_blocks,
-                        block_ids
-                    );
-                }
-                self.device_blocks.extend_from_slice(new_ids);
-            }
-
-            if overlap_len > 0 {
-                tracing::debug!(
-                    "DEDUP: suffix/prefix overlap of {} block_ids for req={}, extended with {} new",
-                    overlap_len,
-                    self.request_id,
-                    new_ids.len()
-                );
-            }
+        // Apply new block_ids with the reconciliation contract — see
+        // `reconcile_device_block_feed` for the cases: plain append,
+        // suffix/prefix overlap dedup, COW-style head-match replacement,
+        // and loud failure for inconsistent feeds.
+        if !block_ids.is_empty()
+            && let Err(e) = reconcile_device_block_feed(&mut self.device_blocks, block_ids)
+        {
+            panic!("{}", e);
         }
 
         // Store block→priority mapping for use in subsequent chunked prefill iterations.
@@ -1390,8 +1424,21 @@ impl ExternallyManagedDeviceSlot for VllmConnectorSlot {
         let table = self
             .per_group_block_table
             .get_or_insert_with(|| vec![Vec::new(); self.num_groups]);
-        for (group_ids, delta) in table.iter_mut().zip(per_group_block_ids) {
-            group_ids.extend_from_slice(delta);
+        for (group, (group_ids, delta)) in table.iter_mut().zip(per_group_block_ids).enumerate() {
+            // Same reconciliation as the flat list: plain append, overlap
+            // dedup, and COW-style head-match replacement. The table is
+            // advisory, so an inconsistent feed (mid-list divergence) is
+            // logged and skips the row update instead of panicking — the
+            // flat apply enforces that contract; consumers fail loudly if
+            // they later need a stale position.
+            if let Err(e) = reconcile_device_block_feed(group_ids, delta) {
+                tracing::error!(
+                    request_id = %self.request_id,
+                    group = group,
+                    "skipping inconsistent per-group device block delta: {}",
+                    e
+                );
+            }
         }
         tracing::debug!(
             request_id = self.request_id,
@@ -2836,6 +2883,84 @@ mod connector_tests {
 
         assert_eq!(slot.num_device_blocks_allocated(), 7);
         assert_eq!(slot.device_blocks_snapshot(), &[10, 11, 12, 13, 14, 15, 16]);
+    }
+
+    // ---------------------------------------------------------------
+    // Test 15: COW block reassignment — head matches, tail diverged.
+    //          vLLM's kv_cache_manager replaced a prefix-cache-shared
+    //          block with a private copy (req_blocks[i] = cow_block),
+    //          so the feed is the request's authoritative CURRENT list:
+    //          [0,4] + apply([0,6]) → [0,6] (replace, no panic).
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_cow_head_match_replaces_divergent_tail() {
+        let num_tokens = 64; // 2 blocks at BLOCK_SIZE 32
+        let (mut slot, _rx) = create_test_slot(num_tokens, 0);
+
+        // Admission published the request's full list via
+        // update_state_after_alloc; block 4 was shared with the prefix cache.
+        slot.append_mutable_device_blocks(&[0, 4]).unwrap();
+        assert_eq!(slot.num_device_blocks_allocated(), 2);
+
+        // The request wrote into block 4's position; vLLM reassigned it to
+        // the private COW copy 6 and re-published the full list.
+        slot.apply_scheduler_output(&[], &[0, 6], 0, num_tokens, None, None)
+            .unwrap();
+
+        assert_eq!(slot.num_device_blocks_allocated(), 2);
+        assert_eq!(slot.device_blocks_snapshot(), &[0, 6]);
+    }
+
+    // ---------------------------------------------------------------
+    // Test 16: COW reassignment with a longer feed — the replacement
+    //          carries new blocks too: [0,4] + [0,6,7] → [0,6,7].
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_cow_head_match_replacement_with_new_tail_blocks() {
+        let num_tokens = 96; // 3 blocks
+        let (mut slot, _rx) = create_test_slot(num_tokens, 0);
+
+        slot.append_mutable_device_blocks(&[0, 4]).unwrap();
+
+        slot.apply_scheduler_output(&[], &[0, 6, 7], 0, num_tokens, None, None)
+            .unwrap();
+
+        assert_eq!(slot.num_device_blocks_allocated(), 3);
+        assert_eq!(slot.device_blocks_snapshot(), &[0, 6, 7]);
+    }
+
+    // ---------------------------------------------------------------
+    // Test 17: COW reassignment reconciles the per-group table the same
+    //          way — the replaced positions update in EVERY group's row
+    //          while rows without reassignment keep extending.
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_cow_reconciles_per_group_block_table() {
+        let num_tokens = 96;
+        let (mut slot, _rx) = create_test_slot_with_groups(num_tokens, 0, 4);
+
+        // The HMA-PROBE shape from the node: the long request's full
+        // per-group lists at update_state_after_alloc.
+        slot.set_per_group_device_blocks(&[vec![0, 4], vec![0, 3], vec![0, 2], vec![1, 5]])
+            .unwrap();
+
+        // The COW step re-published full per-group lists with group 0's
+        // second block reassigned 4 → 6.
+        slot.append_per_group_device_blocks(&[vec![0, 6], vec![0, 3], vec![0, 2], vec![1, 5]])
+            .unwrap();
+
+        assert_eq!(
+            slot.per_group_block_table_snapshot(),
+            Some(&[vec![0, 6], vec![0, 3], vec![0, 2], vec![1, 5]][..])
+        );
+
+        // A subsequent genuine delta still appends at the tail.
+        slot.append_per_group_device_blocks(&[vec![9], vec![9], vec![9], vec![9]])
+            .unwrap();
+        assert_eq!(
+            slot.per_group_block_table_snapshot(),
+            Some(&[vec![0, 6, 9], vec![0, 3, 9], vec![0, 2, 9], vec![1, 5, 9]][..])
+        );
     }
 
     // ---------------------------------------------------------------
