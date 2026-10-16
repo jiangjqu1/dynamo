@@ -732,6 +732,7 @@ fn derive_group_geometry(
     group: &LayerGroup,
     tensors: &[Arc<dyn TorchTensor>],
     explicit: (Option<usize>, Option<usize>),
+    num_device_blocks: usize,
 ) -> GroupGeometry {
     debug_assert!(
         !group.tensor_indices.is_empty(),
@@ -754,10 +755,21 @@ fn derive_group_geometry(
     } else {
         let first_idx = group.tensor_indices[0];
         let shape = tensors[first_idx].shape();
+        // The block-axis convention from the ACTUAL shape (the same rule as
+        // layer_separate_auto): a leading num_blocks axis ([num_blocks, ...])
+        // means outer_contiguous=false; a small leading axis ([outer_dim,
+        // num_blocks, ...], e.g. K/V-outer [2, num_blocks, ...] or MLA
+        // [1, num_blocks, ...]) means true. vLLM 0.29's LBNHC cache is
+        // [num_blocks, kv_heads, block_size, 2*head_size] — the FALSE
+        // convention. Hard-coding true derived inner_dim from shape[2..]
+        // instead of shape[1..] for LBNHC shapes (inner=128 vs 1024 for the
+        // 0.6B), truncating every stored block to 1/8th of its bytes (the
+        // determinism root cause: restored KV 87.5% missing).
+        let outer_contiguous = shape.first().copied().unwrap_or(0) < num_device_blocks;
         let (outer_dim, inner_dim) =
-            infer_layer_separate_dims(&shape, group.page_bytes, true, explicit);
+            infer_layer_separate_dims(&shape, group.page_bytes, outer_contiguous, explicit);
         GroupGeometry {
-            layout_type: group.layout_type(),
+            layout_type: LayoutType::LayerSeparate { outer_contiguous },
             num_layers: group.num_layers,
             outer_dim,
             inner_dim,
@@ -1153,6 +1165,7 @@ impl KvbmWorker {
                         group,
                         &config.tensors,
                         (config.outer_dim, config.inner_dim),
+                        config.num_device_blocks,
                     )
                 })
                 .collect();
@@ -2015,7 +2028,9 @@ mod layer_group_tests {
         ];
         let mut group = LayerGroup::attention(2, 16, 2, 64, 2);
         group.tensor_indices = vec![0, 1];
-        let geometry = derive_group_geometry(&group, &tensors, (None, None));
+        // shape [2, 4, 16, 64] with num_blocks=4: shape[0]=2 < 4 ->
+        // outer_contiguous=true (the K/V-outer convention).
+        let geometry = derive_group_geometry(&group, &tensors, (None, None), 4);
         // outer_contiguous shape [outer, n_blocks, page, inner]:
         // candidate = 2 <= 2 -> outer=2, inner = (16*64)/16 = 64.
         assert_eq!(geometry.outer_dim, 2);
@@ -2044,7 +2059,7 @@ mod layer_group_tests {
         ];
         let mut group = LayerGroup::mamba(2, 128);
         group.tensor_indices = vec![0, 1];
-        let geometry = derive_group_geometry(&group, &tensors, (None, None));
+        let geometry = derive_group_geometry(&group, &tensors, (None, None), 8);
         // Mamba geometry is authoritative from the group (1/1/C/1); the 2D
         // [B, C] tensor shape is never inferred over.
         assert_eq!(geometry.outer_dim, 1);
@@ -2053,6 +2068,55 @@ mod layer_group_tests {
         assert_eq!(geometry.dtype_width_bytes, 1);
         assert_eq!(geometry.num_layers, 2);
         assert_eq!(geometry.bytes_per_block, 2 * 128);
+    }
+
+    #[test]
+    fn lbnhc_live_shape_takes_the_mla_else_branch() {
+        // vLLM 0.29's LBNHC cache: [num_blocks, kv_heads=8, block_size=16,
+        // 2*head_size=128] (the live 0.6B). The inference must take the
+        // MLA-style else-branch (candidate = kv_heads = 8 > 2) and derive
+        // outer=1, inner = (8*16*128)/16 = 1024 — the geometry the pinned
+        // byte-parity GPU test then exercises.
+        let (outer, inner) = infer_layer_separate_dims(
+            &[64, 8, 16, 128],
+            16,
+            false, // outer_contiguous: shape[0]=64 >= num_blocks -> false
+            (None, None),
+        );
+        assert_eq!((outer, inner), (1, 1024));
+        // And the per-layer region: page(16) x inner(1024) x dtype(2) =
+        // 32,768 B == the true 8*16*128*2 block slice.
+        assert_eq!(16 * inner * 2, 8 * 16 * 128 * 2);
+    }
+
+    #[test]
+    fn derive_group_geometry_lbnhc_block_first_shape_derives_false_inner_1024() {
+        // THE REGRESSION PIN (the 0.6B determinism root cause): an attention
+        // group over vLLM 0.29 LBNHC tensors [nb, kv_heads, tokens, 2*head]
+        // must detect the BLOCK-FIRST convention (shape[0]=nb >= nb ->
+        // outer_contiguous=false) and derive inner from shape[1..]:
+        // (8*16*128)/16 = 1024. The hard-coded true derived inner from
+        // shape[2..] (128) — 1/8th the bytes — truncating every stored
+        // block to 16,384 of its 131,072 bytes.
+        let tensors: Vec<Arc<dyn TorchTensor>> = vec![Arc::new(FakeTensor {
+            shape: vec![64, 8, 16, 128],
+        })];
+        let mut group = LayerGroup::attention(1, 16, 1, 1024, 2);
+        group.tensor_indices = vec![0];
+        let geometry = derive_group_geometry(&group, &tensors, (None, None), 64);
+        assert_eq!(
+            geometry.layout_type,
+            LayoutType::LayerSeparate {
+                outer_contiguous: false
+            },
+            "LBNHC's block-first axis must detect outer_contiguous=false"
+        );
+        assert_eq!(geometry.outer_dim, 1);
+        assert_eq!(
+            geometry.inner_dim, 1024,
+            "inner from shape[1..], not shape[2..]"
+        );
+        assert_eq!(geometry.bytes_per_block, 1 * 1 * 16 * 1024 * 2);
     }
 
     #[test]
@@ -2297,7 +2361,12 @@ mod two_group_tests {
             .groups
             .iter()
             .map(|group| {
-                derive_group_geometry(group, &config.tensors, (config.outer_dim, config.inner_dim))
+                derive_group_geometry(
+                    group,
+                    &config.tensors,
+                    (config.outer_dim, config.inner_dim),
+                    config.num_device_blocks,
+                )
             })
             .collect();
         let bytes_per_block = geometries
@@ -2379,7 +2448,8 @@ mod two_group_tests {
         config.validate()?;
         let (group_layouts, _geometry) = build_two_group_specs(config)?;
         let num_groups = group_layouts.len();
-        assert_eq!(num_groups, 2, "the two-group scenario needs two groups");
+        // Callers assert their own group count (the two-group scenarios
+        // assert 2; the single-group LBNHC baseline asserts 1).
 
         let agent = build_agent(0, false)?;
         let pool_config = PoolConfig {
@@ -2984,5 +3054,132 @@ mod two_group_tests {
         run_offload_onboard_scenario(&pools, false).await;
 
         unsafe { std::env::remove_var(env_devbar::DYN_KVBM_DEVBAR_TRANSFERS) };
+    }
+
+    // ---------------------------------------------------------------
+    // THE LIVE-SHAPE BASELINE (single-group): vLLM 0.29's LBNHC cache
+    // [num_blocks, kv_heads, block_size, 2*head_size] (the 0.6B's real
+    // [7718, 8, 16, 128]) — the geometry inference's MLA-style
+    // ELSE-BRANCH (candidate = kv_heads = 8 > 2 -> outer_dim=1,
+    // inner = product/page = 1024), a path no byte-parity test had
+    // covered (the two-group tests all used outer=2 shapes). PINNED
+    // host storage + HostPointer semantics — the baseline D2H/H2D path
+    // with no devbar involvement. Stamp -> offload -> verify the host
+    // tier -> overwrite -> onboard -> byte-compare the restore.
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn lbnhc_single_group_pinned_offload_onboard_byte_parity() {
+        let num_blocks = 64;
+        let kv_heads = 8;
+        let tokens = 16; // page_size
+        let kv_and_head = 128; // 2 * head_size (K|V concatenated)
+
+        let tensors: Vec<Arc<dyn TorchTensor>> = (0..4)
+            .map(|_| -> Arc<dyn TorchTensor> {
+                Arc::new(FakeLayerTensor::new(
+                    vec![num_blocks, kv_heads, tokens, kv_and_head],
+                    2, // bf16
+                ))
+            })
+            .collect();
+
+        // The LEGACY registration's inference for this shape derives
+        // (verified by a CPU unit test): candidate = shape[1] = 8 > 2 ->
+        // the MLA-style else-branch: outer_dim=1, inner_dim =
+        // (8*16*128)/16 = 1024. The pool test provides that derived
+        // geometry EXPLICITLY as one group (build_two_group_specs only
+        // covers the grouped arm; the legacy path synthesizes the same
+        // single group in KvbmWorker::new).
+        let mut group = LayerGroup::attention(4, tokens, 1, 1024, 2);
+        group.tensor_indices = vec![0, 1, 2, 3];
+        let config = KvbmWorkerConfig::builder()
+            .cancel_token(CancellationToken::new())
+            .num_device_blocks(num_blocks)
+            .page_size(tokens)
+            .tensors(tensors)
+            .device_id(0)
+            .dtype_width_bytes(2)
+            .groups(vec![group])
+            .build()
+            .expect("LBNHC single-group config builds");
+
+        // The pinned host fallback — the baseline tier-2 (no devbar env).
+        let pools = build_two_group_pools(
+            &config,
+            Arc::new(DevbarAllocator::default()),
+            HostTransferSemantics::HostPointer,
+            num_blocks,
+        )
+        .await
+        .expect("LBNHC single-group pools over pinned host");
+        assert_eq!(pools.device_data.len(), 1, "single group");
+        assert_eq!(pools.host_data.len(), 1);
+
+        // Stamp DISTINCT patterns per (block, layer) and verify the stamp.
+        for block in MOVED_BLOCK_IDS {
+            let mut data = pools.device_data[0][block].clone();
+            stamp_device_block(&mut data, 0, block, false);
+        }
+        for block in MOVED_BLOCK_IDS {
+            assert_eq!(
+                read_device_block_image(&pools.device_data[0][block]),
+                expected_block_image(&pools.device_data[0][block], 0, block, false),
+                "stamp verification, block {block}"
+            );
+        }
+
+        // D2H: offload and verify the PINNED host tier received the exact
+        // bytes — layer-major-then-outer (outer=1: one 32,768 B segment
+        // per layer), the exact image the device blocks hold.
+        pools
+            .handler
+            .execute_transfer(group_request(
+                BlockTransferPool::Device,
+                BlockTransferPool::Host,
+                0,
+            ))
+            .await
+            .expect("LBNHC single-group offload");
+
+        for block in MOVED_BLOCK_IDS {
+            let host = read_host_block_image(&pools.host_data[0][block]);
+            assert_eq!(
+                host.len(),
+                4 * kv_heads * tokens * kv_and_head * 2,
+                "per-block byte count (4 layers x 32,768 B)"
+            );
+            assert_eq!(
+                host,
+                expected_block_image(&pools.device_data[0][block], 0, block, false),
+                "PINNED host tier content after offload, block {block} — the \
+                 offload must store the block's exact bytes"
+            );
+        }
+
+        // H2D: overwrite the device blocks, onboard, byte-compare the
+        // restore against the ORIGINAL pattern.
+        for block in MOVED_BLOCK_IDS {
+            let mut data = pools.device_data[0][block].clone();
+            stamp_device_block(&mut data, 0, block, true);
+        }
+        pools
+            .handler
+            .execute_transfer(group_request(
+                BlockTransferPool::Host,
+                BlockTransferPool::Device,
+                0,
+            ))
+            .await
+            .expect("LBNHC single-group onboard");
+
+        for block in MOVED_BLOCK_IDS {
+            assert_eq!(
+                read_device_block_image(&pools.device_data[0][block]),
+                expected_block_image(&pools.device_data[0][block], 0, block, false),
+                "device content after onboard, block {block} — the restore \
+                 must return the block's original bytes (the determinism \
+                 probe's requirement)"
+            );
+        }
     }
 }
