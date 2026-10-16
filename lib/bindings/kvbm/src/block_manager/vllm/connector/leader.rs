@@ -391,7 +391,18 @@ impl Leader for KvConnectorLeader {
         slot.acquire_local_matches(num_computed_tokens)?;
 
         // return the number of external tokens that are ready for onboarding
-        // we always return true here as we always asynchronously onboard matched blocks
+        //
+        // The load contract is SYNCHRONOUS (false): KVBM's onboard transfers
+        // are issued by the Rust leader at update_state_after_alloc (not from
+        // the Python start_load_kv like the vLLM reference connector), so
+        // they cannot be stream-ordered against the forward from the Python
+        // hook. With async=true, vLLM defers start_load_kv to POST-forward
+        // and the attention kernels read the target blocks before the
+        // restore lands — deterministically uninitialized KV (the 0.6B
+        // full-attention probe reproduced it as token-repetition loops,
+        // identical across R1/R2). With async=false, vLLM runs start_load_kv
+        // in PRE-forward, whose torch.cuda.synchronize() waits for the Rust
+        // transfers — the forward then reads the restored KV.
         if let SlotState::OnboardStaged(num_external_tokens) = slot.state() {
             debug_assert!(
                 (num_computed_tokens + num_external_tokens).is_multiple_of(self.block_size)
@@ -404,7 +415,7 @@ impl Leader for KvConnectorLeader {
             self.kvbm_metrics
                 .matched_tokens
                 .inc_by(num_external_tokens as u64);
-            Ok((num_external_tokens, true))
+            Ok((num_external_tokens, false))
         } else {
             Ok((0, false))
         }
