@@ -464,9 +464,18 @@ class KvConnectorWorker:
         Note:
             The number of elements in kv_caches and layer_names should be
             the same.
-
         """
-        pass
+        # Synchronize all CUDA streams before vLLM's forward pass reads
+        # the KV cache tensors: KVBM's onboard (H2D) transfers run on the
+        # KVBM transfer stream (a separate CUDA stream, completing a
+        # leader->ZMQ->worker roundtrip behind the scheduler step), while
+        # get_num_new_matched_tokens reports the load as async and vLLM
+        # executes the forward immediately — without this barrier the
+        # attention kernels read the target blocks BEFORE the restore
+        # lands (uninitialized KV -> degenerate output; the 0.6B/full-
+        # attention determinism probe reproduced it as token-repetition
+        # loops). Same fix as PR #8051's start_load_kv.
+        torch.cuda.synchronize()
 
     def save_kv_layer(
         self,

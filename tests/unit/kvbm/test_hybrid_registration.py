@@ -280,3 +280,27 @@ def test_plain_tensor_mamba_layers_normalize_to_flat_rows(
     # The fresh save event still fires for hybrid models.
     worker.wait_for_save()
     assert rust.wait_for_save_handles == [_FAKE_EVENT_HANDLE]
+
+
+def test_start_load_kv_synchronizes_before_the_forward_reads(
+    connector_worker_module, monkeypatch
+):
+    """The H2D timing barrier (the 0.6B determinism root cause): the onboard
+    copies run on the KVBM transfer stream behind the scheduler step; without
+    a barrier before the forward, the attention kernels read uninitialized
+    blocks (PR #8051's start_load_kv fix)."""
+    from tests.unit.kvbm.conftest import FakeVllmConfig
+
+    sync_calls = []
+    monkeypatch.setattr(
+        connector_worker_module.torch.cuda,
+        "synchronize",
+        lambda: sync_calls.append(1),
+    )
+    worker = connector_worker_module.KvConnectorWorker(
+        vllm_config=FakeVllmConfig(), engine_id="sync-test"
+    )
+
+    worker.start_load_kv(forward_context=None)
+
+    assert sync_calls == [1]
