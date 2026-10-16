@@ -2608,7 +2608,29 @@ where
     );
 
     // 5. Register the mutable blocks
-    let immutable_blocks = storage_pool.register_blocks(blocks_to_register).await?;
+    let immutable_blocks = match storage_pool.register_blocks(blocks_to_register).await {
+        Ok(blocks) => {
+            // TEMPORARY MATCH-PROBE (warning level; remove after the H2D
+            // validation): the registration succeeded — the hashes are now
+            // matchable in the pool's registry.
+            tracing::warn!(
+                request_id = %request_id,
+                operation_id = %operation_id,
+                registered = blocks.len(),
+                "STORE-PROBE: register_blocks OK"
+            );
+            blocks
+        }
+        Err(e) => {
+            tracing::warn!(
+                request_id = %request_id,
+                operation_id = %operation_id,
+                error = %e,
+                "STORE-PROBE: register_blocks FAILED — stored bytes are unmatchable"
+            );
+            return Err(e.into());
+        }
+    };
 
     tracing::debug!(
         request_id = request_id,
