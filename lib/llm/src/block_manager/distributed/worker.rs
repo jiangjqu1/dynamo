@@ -3182,4 +3182,118 @@ mod two_group_tests {
             );
         }
     }
+
+    // ---------------------------------------------------------------
+    // THE BAR-PATH ISOLATION (single-group): the SAME LBNHC live-shape
+    // roundtrip as the pinned test above, but through the REAL BAR window
+    // with DirectIo semantics (the live bar-direct configuration). The
+    // pinned baseline passed; the live bar-direct determinism garbled —
+    // this test isolates the direct-io executor at pool level. Requires
+    // root + the expander stand-in (the real-bar two-group test's guard).
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn lbnhc_single_group_direct_io_real_bar_byte_parity() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var(env_devbar::DYN_KVBM_DEVBAR_MEM_TYPE);
+            std::env::set_var(env_devbar::DYN_KVBM_DEVBAR_TRANSFERS, "direct");
+        }
+
+        let num_blocks = 64;
+        let kv_heads = 8;
+        let tokens = 16;
+        let kv_and_head = 128;
+
+        let tensors: Vec<Arc<dyn TorchTensor>> = (0..4)
+            .map(|_| -> Arc<dyn TorchTensor> {
+                Arc::new(FakeLayerTensor::new(
+                    vec![num_blocks, kv_heads, tokens, kv_and_head],
+                    2,
+                ))
+            })
+            .collect();
+
+        let mut group = LayerGroup::attention(4, tokens, 1, 1024, 2);
+        group.tensor_indices = vec![0, 1, 2, 3];
+        let config = KvbmWorkerConfig::builder()
+            .cancel_token(CancellationToken::new())
+            .num_device_blocks(num_blocks)
+            .page_size(tokens)
+            .tensors(tensors)
+            .device_id(0)
+            .dtype_width_bytes(2)
+            .groups(vec![group])
+            .build()
+            .expect("LBNHC direct-io config builds");
+
+        let bar_path = std::path::PathBuf::from("/sys/bus/pci/devices/0000:41:00.0/resource0");
+        let allocator = Arc::new(DevbarAllocator::bar(bar_path, 0, 0));
+        assert_eq!(
+            allocator.transfer_semantics(),
+            HostTransferSemantics::DirectIo
+        );
+        let pools = build_two_group_pools(
+            &config,
+            allocator,
+            HostTransferSemantics::DirectIo,
+            num_blocks,
+        )
+        .await
+        .expect("LBNHC direct-io pools over the real BAR window");
+        assert_eq!(
+            pools.io_mappings.len(),
+            1,
+            "the window's io mapping must be registered"
+        );
+
+        for block in MOVED_BLOCK_IDS {
+            let mut data = pools.device_data[0][block].clone();
+            stamp_device_block(&mut data, 0, block, false);
+        }
+
+        pools
+            .handler
+            .execute_transfer(group_request(
+                BlockTransferPool::Device,
+                BlockTransferPool::Host,
+                0,
+            ))
+            .await
+            .expect("LBNHC direct-io offload through the window");
+
+        for block in MOVED_BLOCK_IDS {
+            let host = read_host_block_image(&pools.host_data[0][block]);
+            assert_eq!(
+                host,
+                expected_block_image(&pools.device_data[0][block], 0, block, false),
+                "BAR-WINDOW content after offload, block {block} — the direct-io \
+                 D2H leg must store the block's exact bytes"
+            );
+        }
+
+        for block in MOVED_BLOCK_IDS {
+            let mut data = pools.device_data[0][block].clone();
+            stamp_device_block(&mut data, 0, block, true);
+        }
+        pools
+            .handler
+            .execute_transfer(group_request(
+                BlockTransferPool::Host,
+                BlockTransferPool::Device,
+                0,
+            ))
+            .await
+            .expect("LBNHC direct-io onboard through the window");
+
+        for block in MOVED_BLOCK_IDS {
+            assert_eq!(
+                read_device_block_image(&pools.device_data[0][block]),
+                expected_block_image(&pools.device_data[0][block], 0, block, false),
+                "device content after the direct-io onboard, block {block} — the \
+                 H2D leg must restore the block's original bytes"
+            );
+        }
+
+        unsafe { std::env::remove_var(env_devbar::DYN_KVBM_DEVBAR_TRANSFERS) };
+    }
 }
