@@ -2698,6 +2698,40 @@ mod two_group_tests {
         image
     }
 
+    /// CPU-write one host-tier block's whole image (the characterization
+    /// probe's direct stamp through the host VA).
+    fn write_host_block_image(data: &mut LocalBlockData<DevbarStorage>, image: &[u8]) {
+        let mut written = 0;
+        let block_data = data.block_data_mut();
+        for layer_idx in 0..block_data.num_layers() {
+            for outer_idx in 0..block_data.num_outer_dims() {
+                let size = block_data
+                    .layer_view(layer_idx, outer_idx)
+                    .expect("host layer view")
+                    .size();
+                let mut view = block_data
+                    .layer_view_mut(layer_idx, outer_idx)
+                    .expect("host layer view");
+                // SAFETY: as above — the view covers `size` writable bytes
+                // of host-accessible pool memory; the copy is within bounds.
+                let (dst, src) = unsafe {
+                    let dst = view.as_mut_ptr();
+                    let src = image[written..written + size].as_ptr();
+                    (dst, src)
+                };
+                unsafe {
+                    std::ptr::copy(src, dst, size);
+                }
+                written += size;
+            }
+        }
+        assert_eq!(
+            written,
+            image.len(),
+            "the image must tile the block exactly"
+        );
+    }
+
     /// One group-tagged request moving `MOVED_BLOCK_IDS` between two pool
     /// tiers at identical block ids — the request shape the leader's
     /// per-group fan-out produces.
@@ -3232,7 +3266,7 @@ mod two_group_tests {
             allocator.transfer_semantics(),
             HostTransferSemantics::DirectIo
         );
-        let pools = build_two_group_pools(
+        let mut pools = build_two_group_pools(
             &config,
             allocator,
             HostTransferSemantics::DirectIo,
@@ -3260,6 +3294,71 @@ mod two_group_tests {
             ))
             .await
             .expect("LBNHC direct-io offload through the window");
+
+        // TEMPORARY SCAN-PROBE (remove after the direct-io fix): find where
+        // block 5's expected pattern actually landed in the window — all-0xFF
+        // at the target says the write missed; a hit at another block region
+        // pins a translation/indexing bug.
+        {
+            let expected = expected_block_image(&pools.device_data[0][5], 0, 5, false);
+            let needle: Vec<u8> = expected[..64].to_vec();
+            let mut found: Vec<usize> = Vec::new();
+            for hb in 0..pools.host_data[0].len() {
+                let img = read_host_block_image(&pools.host_data[0][hb]);
+                let ff = img.iter().filter(|&&b| b == 0xFF).count();
+                let has_needle = img.windows(64).any(|w| w == needle.as_slice());
+                if has_needle {
+                    found.push(hb);
+                }
+                if ff != img.len() && !has_needle {
+                    eprintln!(
+                        "SCAN-PROBE: host block {hb}: {ff} / {} bytes 0xFF (partially written)",
+                        img.len()
+                    );
+                }
+            }
+            eprintln!("SCAN-PROBE: block 5 pattern found in host blocks {found:?}");
+        }
+
+        // CHARACTERIZATION (temporary; shape the fix): the D2H leg (GPU
+        // WRITES through the registered dev VA) delivered ZERO bytes (the
+        // scan found the pattern nowhere). Now test the reverse direction:
+        // CPU-stamp the window directly at the host VA, then H2D (GPU
+        // READS through the dev VA) — if the device blocks receive the
+        // pattern, the registration gives a working read path with a broken
+        // write path (one-directional); if not, the registration is
+        // vacuous on this hardware.
+        {
+            for block in MOVED_BLOCK_IDS {
+                let img = expected_block_image(&pools.device_data[0][block], 0, block, true);
+                write_host_block_image(&mut pools.host_data[0][block], &img);
+            }
+            pools
+                .handler
+                .execute_transfer(group_request(
+                    BlockTransferPool::Host,
+                    BlockTransferPool::Device,
+                    0,
+                ))
+                .await
+                .expect("characterization H2D");
+            for block in MOVED_BLOCK_IDS {
+                let got = read_device_block_image(&pools.device_data[0][block]);
+                let want = expected_block_image(&pools.device_data[0][block], 0, block, true);
+                let ok = got == want;
+                eprintln!(
+                    "CHAR-PROBE: H2D (GPU reads window) block {block}: {}",
+                    if ok { "DELIVERED" } else { "FAILED" }
+                );
+                if !ok {
+                    eprintln!(
+                        "CHAR-PROBE: got head {:?} want head {:?}",
+                        &got[..16.min(got.len())],
+                        &want[..16.min(want.len())]
+                    );
+                }
+            }
+        }
 
         for block in MOVED_BLOCK_IDS {
             let host = read_host_block_image(&pools.host_data[0][block]);
@@ -3293,7 +3392,116 @@ mod two_group_tests {
                  H2D leg must restore the block's original bytes"
             );
         }
+    }
 
-        unsafe { std::env::remove_var(env_devbar::DYN_KVBM_DEVBAR_TRANSFERS) };
+    // ---------------------------------------------------------------
+    // THE STAGED REAL-BAR BASELINE (single-group): the same LBNHC
+    // live-shape roundtrip through the REAL BAR window with STAGED CPU
+    // legs (the §1i proven path — CPU memcpys through the window's host
+    // VA). The direct-io characterization proved the IOMEMORY-registered
+    // device VA is VACUOUS on PCIe (both directions, zero delivery) — the
+    // staged CPU path is the byte-correct BAR-window route on this
+    // hardware class; the direct path remains the C2C-product design.
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn lbnhc_single_group_staged_real_bar_byte_parity() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var(env_devbar::DYN_KVBM_DEVBAR_MEM_TYPE);
+            std::env::remove_var(env_devbar::DYN_KVBM_DEVBAR_TRANSFERS);
+        }
+
+        let num_blocks = 64;
+        let kv_heads = 8;
+        let tokens = 16;
+        let kv_and_head = 128;
+
+        let tensors: Vec<Arc<dyn TorchTensor>> = (0..4)
+            .map(|_| -> Arc<dyn TorchTensor> {
+                Arc::new(FakeLayerTensor::new(
+                    vec![num_blocks, kv_heads, tokens, kv_and_head],
+                    2,
+                ))
+            })
+            .collect();
+
+        let mut group = LayerGroup::attention(4, tokens, 1, 1024, 2);
+        group.tensor_indices = vec![0, 1, 2, 3];
+        let config = KvbmWorkerConfig::builder()
+            .cancel_token(CancellationToken::new())
+            .num_device_blocks(num_blocks)
+            .page_size(tokens)
+            .tensors(tensors)
+            .device_id(0)
+            .dtype_width_bytes(2)
+            .groups(vec![group])
+            .build()
+            .expect("LBNHC staged real-BAR config builds");
+
+        let bar_path = std::path::PathBuf::from("/sys/bus/pci/devices/0000:41:00.0/resource0");
+        let allocator = Arc::new(DevbarAllocator::bar(bar_path, 0, 0));
+        assert_eq!(
+            allocator.transfer_semantics(),
+            HostTransferSemantics::StagedCpu
+        );
+        let mut pools = build_two_group_pools(
+            &config,
+            allocator,
+            HostTransferSemantics::StagedCpu,
+            num_blocks,
+        )
+        .await
+        .expect("LBNHC staged pools over the real BAR window");
+
+        for block in MOVED_BLOCK_IDS {
+            let mut data = pools.device_data[0][block].clone();
+            stamp_device_block(&mut data, 0, block, false);
+        }
+
+        // D2H: device -> window through the staged CPU legs.
+        pools
+            .handler
+            .execute_transfer(group_request(
+                BlockTransferPool::Device,
+                BlockTransferPool::Host,
+                0,
+            ))
+            .await
+            .expect("LBNHC staged offload through the window");
+
+        for block in MOVED_BLOCK_IDS {
+            let host = read_host_block_image(&pools.host_data[0][block]);
+            assert_eq!(
+                host,
+                expected_block_image(&pools.device_data[0][block], 0, block, false),
+                "BAR-WINDOW content after the staged offload, block {block} — the \
+                 staged CPU legs must store the block's exact bytes"
+            );
+        }
+
+        // H2D: overwrite the device blocks, onboard through the window,
+        // byte-compare the restore.
+        for block in MOVED_BLOCK_IDS {
+            let mut data = pools.device_data[0][block].clone();
+            stamp_device_block(&mut data, 0, block, true);
+        }
+        pools
+            .handler
+            .execute_transfer(group_request(
+                BlockTransferPool::Host,
+                BlockTransferPool::Device,
+                0,
+            ))
+            .await
+            .expect("LBNHC staged onboard through the window");
+
+        for block in MOVED_BLOCK_IDS {
+            assert_eq!(
+                read_device_block_image(&pools.device_data[0][block]),
+                expected_block_image(&pools.device_data[0][block], 0, block, false),
+                "device content after the staged onboard, block {block} — the \
+                 staged CPU legs must restore the block's original bytes"
+            );
+        }
     }
 }
