@@ -1396,6 +1396,19 @@ impl Slot for VllmConnectorSlot {
 
         let num_matched_blocks = num_matched_host_blocks + num_matched_disk_blocks;
 
+        // TEMPORARY MATCH-PROBE (warning level — the pinned-baseline external
+        // lookup returned zero hits with P's blocks stored; remove after the
+        // H2D validation lands).
+        tracing::warn!(
+            request_id = %self.request_id,
+            queried = blocks_to_lookup.len(),
+            search_offset,
+            first_hash = ?sequence_hashes.first().map(|h| h.to_string()),
+            matched_host = num_matched_host_blocks,
+            matched_disk = num_matched_disk_blocks,
+            "MATCH-PROBE: external lookup result"
+        );
+
         tracing::debug!(
             "successfully matched {} host blocks and {} disk blocks; {} total blocks",
             num_matched_host_blocks,
@@ -2475,6 +2488,15 @@ where
         .allocate_blocks(offload_req.block_ids.len())
         .await?;
     let token_blocks = offload_req.token_blocks;
+    // TEMPORARY STORE-PROBE (warning level; remove after the H2D validation):
+    // the hash chain the offload registers under — paired with the
+    // MATCH-PROBE in acquire_local_matches to diagnose zero-hit lookups.
+    tracing::warn!(
+        request_id = %offload_req.request_id,
+        num_blocks = token_blocks.len(),
+        first_hash = ?token_blocks.first().map(|b| b.sequence_hash().to_string()),
+        "STORE-PROBE: offload registering blocks"
+    );
 
     let allocated_block_ids: Vec<usize> = blocks.iter().map(|b| b.block_id()).collect();
     let num_blocks = allocated_block_ids.len();
