@@ -758,6 +758,12 @@ impl Leader for KvConnectorLeader {
             .ok_or_else(|| anyhow::anyhow!("Expected VllmConnectorSlot, got different type"))?
             .take_hybrid_flush_offload()
             .map_err(|e| anyhow::anyhow!("hybrid finish flush failed for {request_id}: {e}"))?;
+        // TEMPORARY FLUSH-PROBE (remove after the H2D fix validation)
+        tracing::warn!(
+            request_id = %request_id,
+            ops = flush_ops.as_ref().map_or(0, |v| v.len()),
+            "FLUSH-PROBE: finish flush returned"
+        );
         if let Some(ops) = flush_ops {
             tracing::debug!(
                 request_id = %request_id,

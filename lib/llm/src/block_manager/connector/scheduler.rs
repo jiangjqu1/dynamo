@@ -47,15 +47,17 @@ impl TransferSchedulerClient {
     ) -> anyhow::Result<Box<dyn TransferCompletionHandle>> {
         let scheduler_tx = self.scheduler_tx.clone();
         match request.request_type {
-            RequestType::Immediate => {
-                let handle = ImmediateTransferCompletionHandle::new(
-                    request.request_id,
-                    request.uuid,
-                    scheduler_tx.clone(),
-                );
-                Ok(Box::new(handle))
-            }
-            RequestType::Scheduled => {
+            RequestType::Immediate => Ok(Box::new(ImmediateTransferCompletionHandle::new(
+                request.request_id,
+                request.uuid,
+                scheduler_tx.clone(),
+            ))),
+            // Finish-flush legs (hybrid multi-group): same completion
+            // semantics as Scheduled — the transfer's execution drives the
+            // completion handle. (The engine currently stamps flush wire
+            // legs Scheduled; this arm makes the enum exhaustive and
+            // future-proofs a direct Flush stamping.)
+            RequestType::Flush | RequestType::Scheduled => {
                 let (response_tx, response_rx) = oneshot::channel();
                 let request = TransferScheduleRequest {
                     leader_request: request,
@@ -231,7 +233,10 @@ impl WorkerSchedulerClient {
 
         match request.request_type {
             RequestType::Immediate => {}
-            RequestType::Scheduled => {
+            // Flush ops are enqueued at bind time by the worker connector;
+            // the scheduler-side enqueue mirrors Scheduled so the
+            // completion tracking runs the normal rendezvous flow.
+            RequestType::Flush | RequestType::Scheduled => {
                 self.scheduler_tx
                     .send(SchedulerMessage::EnqueueRequest(request))
                     .expect("failed to enqueue request; disconnected");

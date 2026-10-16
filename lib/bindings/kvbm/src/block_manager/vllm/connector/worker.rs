@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use dynamo_llm::block_manager::connector::protocol::TransferType;
+use dynamo_llm::block_manager::connector::protocol::{RequestType, TransferType};
 use dynamo_llm::block_manager::connector::scheduler::{
     Scheduler, TransferSchedulerClient, WorkerSchedulerClient,
 };
@@ -488,6 +488,7 @@ impl Worker for KvConnectorWorker {
 
         let mut onboarding_operations = Vec::new();
         let mut offloading_operations = Vec::new();
+        let mut flush_operations = Vec::new();
 
         for operation in metadata.operations {
             tracing::debug!(
@@ -497,7 +498,17 @@ impl Worker for KvConnectorWorker {
 
             match operation.transfer_type {
                 TransferType::Load => onboarding_operations.push(operation),
-                TransferType::Store => offloading_operations.push(operation),
+                TransferType::Store => match operation.request_type {
+                    // Finish-flush Stores (hybrid multi-group): the data is
+                    // final at request finish and no forward pass remains to
+                    // gate them — enqueue at bind (like Immediate Loads).
+                    // A Scheduled hold would never release on the idle
+                    // step (no wait_for_save), the slot would be reaped as
+                    // vacuously complete, and the parked ZMQ transfer would
+                    // deadlock the transfer engine.
+                    RequestType::Flush => flush_operations.push(operation),
+                    _ => offloading_operations.push(operation),
+                },
             }
         }
 
@@ -506,6 +517,13 @@ impl Worker for KvConnectorWorker {
             let request_id = operation.request_id.clone();
             self.connector.enqueue_request(operation);
             self.maybe_finished_onboarding.insert(request_id);
+        }
+
+        // immediately enqueue the finish-flush operations (see above)
+        for operation in flush_operations {
+            let request_id = operation.request_id.clone();
+            self.connector.enqueue_request(operation);
+            self.maybe_finished_offloading.insert(request_id);
         }
 
         // Hybrid only: a prior iteration may still HOLD offload operations

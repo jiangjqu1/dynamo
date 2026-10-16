@@ -71,6 +71,16 @@ pub enum RequestType {
     /// If Immediate, then the [`super::scheduler::TransferSchedulerClient`] will immediately return a
     /// [`ImmediateTransferCompletionHandle`].
     Immediate,
+
+    /// Finish-flush offload (hybrid multi-group): the data is final at
+    /// request finish — there is no forward pass left to wait for, so the
+    /// worker enqueues these Store ops at bind time (like Immediate Loads)
+    /// instead of holding them for `wait_for_save`. Without this, a
+    /// finished request's flush ops would be held forever on the idle
+    /// step, the slot reaped as vacuously complete, the parked transfer
+    /// would deadlock the transfer engine, and vLLM's completion
+    /// reporting would leak the request (the always-return-true contract).
+    Flush,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]

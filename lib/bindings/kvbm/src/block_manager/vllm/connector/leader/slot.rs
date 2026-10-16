@@ -1744,6 +1744,17 @@ impl VllmConnectorSlot {
     pub(crate) fn take_hybrid_flush_offload(
         &mut self,
     ) -> Result<Option<Vec<WorkerTransferRequest>>, SlotError> {
+        // TEMPORARY FLUSH-PROBE (warning level — RUST_LOG is not honored by
+        // the worker's tracing init; remove after the H2D fix validation):
+        tracing::warn!(
+            request_id = %self.request_id,
+            num_groups = self.num_groups,
+            state = ?self.state,
+            evaluated_blocks = self.evaluated_blocks,
+            current_position = self.current_position,
+            block_size = self.block_size,
+            "FLUSH-PROBE: take_hybrid_flush_offload entered"
+        );
         if self.num_groups <= 1 {
             return Ok(None);
         }
@@ -1802,14 +1813,17 @@ impl VllmConnectorSlot {
         // per-leg uuid (the Task-4 pattern): the transfer engine stamps
         // the same uuids on the wire legs, and the worker-side
         // rendezvous — one Worker + one Transfer per (request_id, uuid)
-        // — requires the 1:1 match.
+        // — requires the 1:1 match. RequestType::Flush: the worker
+        // enqueues these at bind time (no forward pass remains to gate
+        // them — a Scheduled hold would deadlock the parked transfer on
+        // the idle step after the slot's vacuous reap).
         let mut operations = Vec::with_capacity(self.num_groups);
         for group in 0..self.num_groups {
             operations.push(WorkerTransferRequest {
                 request_id: self.request_id.clone(),
                 uuid: derive_leg_uuid(operation_id, group),
                 transfer_type: TransferType::Store,
-                request_type: RequestType::Scheduled,
+                request_type: RequestType::Flush,
             });
         }
 
@@ -3619,7 +3633,7 @@ mod connector_tests {
         for (group, op) in ops.iter().enumerate() {
             assert_eq!(op.request_id, "test-req");
             assert_eq!(op.transfer_type, TransferType::Store);
-            assert_eq!(op.request_type, RequestType::Scheduled);
+            assert_eq!(op.request_type, RequestType::Flush);
             assert_eq!(
                 op.uuid,
                 derive_leg_uuid(ops[0].uuid, group),
