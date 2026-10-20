@@ -176,6 +176,8 @@ impl<S: Storage, L: LocalityProvider + 'static, M: BlockMetadata> State<S, L, M>
         assert!(!blocks.is_empty(), "no blocks to register");
 
         let expected_len = blocks.len();
+        // TEMPORARY REG-PROBE capture (remove with the probe).
+        let first_hash_dbg = blocks.first().and_then(|b| b.sequence_hash().ok());
         let mut immutable_blocks = Vec::new();
 
         // raii object that will collect all the publish handles and publish them when the object is dropped
@@ -271,6 +273,20 @@ impl<S: Storage, L: LocalityProvider + 'static, M: BlockMetadata> State<S, L, M>
 
         assert_eq!(immutable_blocks.len(), expected_len);
 
+        // TEMPORARY REG-PROBE (debug level — enable via
+        // DYN_LOG=info,dynamo_llm::block_manager=debug; remove after the
+        // H2D index fix): the registration's state instance + the first
+        // hash — pairs with the match-entry probe to rule pool-instance
+        // divergence in or out.
+        if let Some(h0) = first_hash_dbg {
+            tracing::debug!(
+                state_ptr = std::ptr::from_ref(self) as usize,
+                first_hash = ?h0.to_string(),
+                registered = immutable_blocks.len(),
+                "REG-PROBE: register exit"
+            );
+        }
+
         Ok(immutable_blocks)
     }
 
@@ -279,6 +295,20 @@ impl<S: Storage, L: LocalityProvider + 'static, M: BlockMetadata> State<S, L, M>
         sequence_hashes: Vec<SequenceHash>,
         return_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Block<S, L, M>>,
     ) -> Vec<ImmutableBlock<S, L, M>> {
+        // TEMPORARY REG-PROBE (debug level — enable via
+        // DYN_LOG=info,dynamo_llm::block_manager=debug; remove after the
+        // H2D index fix): the match breaks silently at the first
+        // unregistered hash — name the first hash's registry state and the
+        // pool shapes at every failed entry.
+        if let Some(h0) = sequence_hashes.first() {
+            tracing::debug!(
+                state_ptr = std::ptr::from_ref(self) as usize,
+                first_hash = ?h0.to_string(),
+                queried = sequence_hashes.len(),
+                first_registered = self.registry.is_registered(*h0),
+                "REG-PROBE: match entry"
+            );
+        }
         let mut immutable_blocks = Vec::new();
         for sequence_hash in &sequence_hashes {
             if !self.registry.is_registered(*sequence_hash) {

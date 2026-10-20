@@ -119,6 +119,16 @@ impl BlockRegistry {
                     if let Some(handle) = blocks.get(&sequence_hash)
                         && handle.upgrade().is_none()
                     {
+                        // TEMPORARY REG-PROBE (debug level — enable via
+                        // DYN_LOG=info,dynamo_llm::block_manager=debug;
+                        // remove after the H2D index fix): every registry
+                        // removal is named — a stored hash vanishing
+                        // between store and match shows here with its
+                        // timestamp.
+                        tracing::debug!(
+                            first_hash = ?sequence_hash.to_string(),
+                            "REG-PROBE: registry removal (weak dead)"
+                        );
                         blocks.remove(&sequence_hash);
                     }
                 }

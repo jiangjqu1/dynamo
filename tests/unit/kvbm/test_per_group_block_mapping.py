@@ -180,6 +180,7 @@ def load_connector_leader_module(monkeypatch):
 
     utils_mod = types.ModuleType("kvbm.utils")
     utils_mod.is_dyn_runtime_enabled = lambda: False
+    utils_mod.probe_log_enabled = lambda: False
     monkeypatch.setitem(sys.modules, "kvbm.utils", utils_mod)
 
     vllm_integration = types.ModuleType("kvbm.vllm_integration")

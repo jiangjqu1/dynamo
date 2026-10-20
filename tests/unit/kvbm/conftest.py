@@ -148,6 +148,7 @@ def load_connector_worker_module(monkeypatch):
 
     utils_mod = types.ModuleType("kvbm.utils")
     utils_mod.is_dyn_runtime_enabled = lambda: False
+    utils_mod.probe_log_enabled = lambda: False
     utils_mod.nvtx_annotate = lambda category: (lambda func: func)
     monkeypatch.setitem(sys.modules, "kvbm.utils", utils_mod)
 
@@ -199,6 +200,7 @@ def load_connector_module(monkeypatch):
 
     utils_mod = types.ModuleType("kvbm.utils")
     utils_mod.is_dyn_runtime_enabled = lambda: False
+    utils_mod.probe_log_enabled = lambda: False
     utils_mod.nvtx_annotate = lambda category: (lambda func: func)
     monkeypatch.setitem(sys.modules, "kvbm.utils", utils_mod)
 

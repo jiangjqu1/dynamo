@@ -1396,10 +1396,11 @@ impl Slot for VllmConnectorSlot {
 
         let num_matched_blocks = num_matched_host_blocks + num_matched_disk_blocks;
 
-        // TEMPORARY MATCH-PROBE (warning level — the pinned-baseline external
-        // lookup returned zero hits with P's blocks stored; remove after the
-        // H2D validation lands).
-        tracing::warn!(
+        // TEMPORARY MATCH-PROBE (debug level — enable via
+        // DYN_LOG=info,_core::block_manager=debug; remove after the H2D
+        // validation lands): the pinned-baseline external lookup returned
+        // zero hits with P's blocks stored.
+        tracing::debug!(
             request_id = %self.request_id,
             queried = blocks_to_lookup.len(),
             search_offset,
@@ -1757,9 +1758,10 @@ impl VllmConnectorSlot {
     pub(crate) fn take_hybrid_flush_offload(
         &mut self,
     ) -> Result<Option<Vec<WorkerTransferRequest>>, SlotError> {
-        // TEMPORARY FLUSH-PROBE (warning level — RUST_LOG is not honored by
-        // the worker's tracing init; remove after the H2D fix validation):
-        tracing::warn!(
+        // TEMPORARY FLUSH-PROBE (debug level — enable via
+        // DYN_LOG=info,_core::block_manager=debug; remove after the H2D fix
+        // validation):
+        tracing::debug!(
             request_id = %self.request_id,
             num_groups = self.num_groups,
             state = ?self.state,
@@ -2488,18 +2490,21 @@ where
         .allocate_blocks(offload_req.block_ids.len())
         .await?;
     let token_blocks = offload_req.token_blocks;
-    // TEMPORARY STORE-PROBE (warning level; remove after the H2D validation):
-    // the hash chain the offload registers under — paired with the
-    // MATCH-PROBE in acquire_local_matches to diagnose zero-hit lookups.
-    tracing::warn!(
+    let allocated_block_ids: Vec<usize> = blocks.iter().map(|b| b.block_id()).collect();
+    let num_blocks = allocated_block_ids.len();
+
+    // TEMPORARY STORE-PROBE (debug level — enable via
+    // DYN_LOG=info,_core::block_manager=debug; remove after the H2D
+    // validation): the hash chain the offload registers under — paired with
+    // the MATCH-PROBE in acquire_local_matches to diagnose zero-hit lookups —
+    // plus the allocated tier slots (pairs with the ONBOARD-PROBE).
+    tracing::debug!(
         request_id = %offload_req.request_id,
         num_blocks = token_blocks.len(),
         first_hash = ?token_blocks.first().map(|b| b.sequence_hash().to_string()),
+        first_ids = ?allocated_block_ids.iter().take(3).collect::<Vec<_>>(),
         "STORE-PROBE: offload registering blocks"
     );
-
-    let allocated_block_ids: Vec<usize> = blocks.iter().map(|b| b.block_id()).collect();
-    let num_blocks = allocated_block_ids.len();
 
     // Each group moves its OWN source device ids into the SAME freshly
     // allocated tier blocks (the tier pool's ids index every group's
@@ -2610,10 +2615,11 @@ where
     // 5. Register the mutable blocks
     let immutable_blocks = match storage_pool.register_blocks(blocks_to_register).await {
         Ok(blocks) => {
-            // TEMPORARY MATCH-PROBE (warning level; remove after the H2D
+            // TEMPORARY STORE-PROBE (debug level — enable via
+            // DYN_LOG=info,_core::block_manager=debug; remove after the H2D
             // validation): the registration succeeded — the hashes are now
             // matchable in the pool's registry.
-            tracing::warn!(
+            tracing::debug!(
                 request_id = %request_id,
                 operation_id = %operation_id,
                 registered = blocks.len(),
@@ -2770,6 +2776,23 @@ async fn process_onboard_request(
         })
         .collect();
 
+    // TEMPORARY ONBOARD-PROBE (debug level — enable via
+    // DYN_LOG=info,_core::block_manager=debug; remove after the H2D content
+    // fix): the source tier slots + their first bytes and the first dst
+    // device ids — pairs with the STORE-PROBE's allocated ids and the
+    // pinned-run's same probe to discriminate slot-map divergence from
+    // content divergence.
+    tracing::debug!(
+        request_id = %request_id,
+        operation_id = %operation_id,
+        n_src = onboard_req.src_blocks.len(),
+        src_probe = ?onboard_req.src_blocks.probe_heads(3),
+        dst_first = ?block_pairs_per_group
+            .first()
+            .map(|g| g.iter().take(3).collect::<Vec<_>>()),
+        "ONBOARD-PROBE: onboard issued"
+    );
+
     // Issue the onboard: ONE logical op fanned out to one request PER GROUP
     // (shared tier sources into each group's own device destinations), each
     // leg with its own deterministic uuid. All legs are sent before any is
@@ -2809,6 +2832,11 @@ pub trait AnyBlocks: Send {
     fn len(&self) -> usize;
     fn storage_pool(&self) -> BlockTransferPool;
     fn block_ids(&self) -> Vec<BlockId>;
+
+    /// TEMPORARY ONBOARD-PROBE support (remove after the H2D content fix):
+    /// (block_id, first-16-bytes-hex) of the first `n` blocks — the source
+    /// content discriminator between the pinned and devbar tiers.
+    fn probe_heads(&self, n: usize) -> Vec<(BlockId, String)>;
 }
 
 struct AnyImmutableBlocks<S: Storage, L: LocalityProvider, M: BlockMetadata> {
@@ -2859,6 +2887,33 @@ impl<S: Storage, L: LocalityProvider, M: BlockMetadata> AnyBlocks for AnyImmutab
 
     fn block_ids(&self) -> Vec<BlockId> {
         self.block_ids()
+    }
+
+    fn probe_heads(&self, n: usize) -> Vec<(BlockId, String)> {
+        use dynamo_llm::block_manager::block::data::{BlockDataExt as _, BlockDataProvider as _};
+        self.blocks
+            .iter()
+            .take(n)
+            .map(|b| {
+                // The host tier is FullyContiguous — the whole-block view is
+                // the readable surface (layer_view is the LayerSeparate API).
+                let head = b
+                    .block_data()
+                    .block_view()
+                    .ok()
+                    .map(|v| {
+                        let take = 16.min(v.size());
+                        // SAFETY: the view covers `v.size()` >= `take`
+                        // readable bytes of pool-owned storage that outlives
+                        // this probe read.
+                        let bytes: Vec<u8> =
+                            unsafe { std::slice::from_raw_parts(v.as_ptr(), take) }.to_vec();
+                        bytes.iter().map(|x| format!("{x:02x}")).collect::<String>()
+                    })
+                    .unwrap_or_else(|| "n/a".to_string());
+                (b.block_id(), head)
+            })
+            .collect()
     }
 }
 
@@ -3743,6 +3798,10 @@ mod connector_tests {
 
         fn block_ids(&self) -> Vec<BlockId> {
             self.ids.clone()
+        }
+
+        fn probe_heads(&self, _n: usize) -> Vec<(BlockId, String)> {
+            Vec::new()
         }
     }
 

@@ -14,7 +14,7 @@ use crate::block_manager::{
     BasicMetadata, Storage,
     block::{
         Block, BlockDataProvider, BlockDataProviderMut, ReadableBlock, WritableBlock,
-        data::local::LocalBlockData,
+        data::{BlockDataExt as _, local::LocalBlockData},
         locality,
         transfer::{TransferContext, WriteTo, WriteToStrategy},
     },
@@ -316,6 +316,52 @@ impl BlockTransferHandler {
         })
     }
 
+    /// TEMPORARY XFER-PROBE helper (remove after the H2D content fix): the
+    /// first 16 bytes of one host-tier block, as hex — the host tier is
+    /// CPU-readable on every backing (pinned RAM, the BAR window's host VA).
+    fn host_head_bytes(&self, group: usize, slot: usize) -> Option<String> {
+        let list = Self::pool_for_group(&self.host, group, "probe-host").ok()?;
+        let block = list.get(slot)?;
+        let view = block.block_data().layer_view(0, 0).ok()?;
+        let take = 16.min(view.size());
+        // SAFETY: the view covers `view.size()` >= `take` readable bytes of
+        // pool-owned storage that outlives this probe read.
+        let bytes = unsafe { std::slice::from_raw_parts(view.as_ptr(), take) };
+        Some(bytes.iter().map(|x| format!("{x:02x}")).collect())
+    }
+
+    /// TEMPORARY XFER-PROBE helper (remove after the H2D content fix): the
+    /// first 16 bytes of one DEVICE-tier block via a 16-byte D2H copy on
+    /// the transfer stream — the source-content fingerprint for offloads
+    /// and the restored-content fingerprint for onboards.
+    fn device_head_bytes(&self, group: usize, slot: usize) -> Option<String> {
+        let list = Self::pool_for_group(&self.device, group, "probe-dev").ok()?;
+        let block = list.get(slot)?;
+        let view = block.block_data().layer_view(0, 0).ok()?;
+        let take = 16.min(view.size());
+        let mut buf = vec![0u8; take];
+        let stream = self.context.stream();
+        // SAFETY: the view covers `take` readable device bytes owned by the
+        // pool; the copy is stream-ordered and synchronized before use.
+        unsafe {
+            if cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                buf.as_mut_ptr() as *mut core::ffi::c_void,
+                view.as_ptr() as u64,
+                take,
+                stream.cu_stream(),
+            ) != cudarc::driver::sys::CUresult::CUDA_SUCCESS
+            {
+                return None;
+            }
+            if cudarc::driver::sys::cuStreamSynchronize(stream.cu_stream())
+                != cudarc::driver::sys::CUresult::CUDA_SUCCESS
+            {
+                return None;
+            }
+        }
+        Some(buf.iter().map(|x| format!("{x:02x}")).collect())
+    }
+
     fn get_local_data<S: Storage>(
         blocks: Option<Vec<LocalBlock<S, BasicMetadata>>>,
     ) -> Option<LocalBlockDataList<S>> {
@@ -406,6 +452,41 @@ impl BlockTransferHandler {
 
         tracing::debug!("request: {request:#?}");
 
+        // TEMPORARY XFER-PROBE (debug level — enable via
+        // DYN_LOG=info,dynamo_llm::block_manager=debug; remove after the
+        // H2D content fix): for transfers touching the host tier, the first
+        // transferred host slot's first 16 bytes, read PRE (what an onboard
+        // is about to read / the window state before an offload lands) and
+        // POST (what the offload landed). The pinned-vs-window diff of these
+        // bytes names the corrupted link. NOTE: the dispatch handler TAKES
+        // connector_req before this point, so it cannot gate the probe —
+        // the enabled! check gates it instead: every Host<->Device transfer
+        // is probed (engine + tests) ONLY while debug logging is on; at
+        // info the fingerprint reads (including the D2H copies) are skipped
+        // entirely.
+        let xfer_probe_enabled = tracing::enabled!(tracing::Level::DEBUG);
+        let xfer_probe_slot = match (request.from_pool, request.to_pool) {
+            (Device, Host) => request.blocks.first().map(|(_, to)| *to),
+            (Host, Device) => request.blocks.first().map(|(from, _)| *from),
+            _ => None,
+        };
+        let xfer_probe_group = request.group;
+        let xfer_probe_pair = request.blocks.first().copied();
+        let xfer_probe_dir = (request.from_pool, request.to_pool);
+        let (xfer_pre, xfer_slot0_pre, xfer_src_dev) = if !xfer_probe_enabled {
+            (None, None, None)
+        } else {
+            let pre = xfer_probe_slot.and_then(|s| self.host_head_bytes(xfer_probe_group, s));
+            let slot0_pre = self.host_head_bytes(xfer_probe_group, 0);
+            // The device-side source fingerprint for offloads (pre-transfer).
+            let src_dev = match xfer_probe_dir {
+                (Device, Host) => xfer_probe_pair
+                    .and_then(|(from, _)| self.device_head_bytes(xfer_probe_group, from)),
+                _ => None,
+            };
+            (pre, slot0_pre, src_dev)
+        };
+
         let notify = match (request.from_pool(), request.to_pool()) {
             (Device, Host) => self.begin_transfer(&self.device, &self.host, request).await,
             (Device, Disk) => self.begin_transfer(&self.device, &self.disk, request).await,
@@ -418,6 +499,61 @@ impl BlockTransferHandler {
         }?;
 
         notify.await?;
+
+        if xfer_probe_enabled && let Some(slot) = xfer_probe_slot {
+            let post = self.host_head_bytes(xfer_probe_group, slot);
+            // The restored-content fingerprint for onboards (post-transfer).
+            let xfer_dst_dev = match xfer_probe_dir {
+                (Host, Device) => {
+                    xfer_probe_pair.and_then(|(_, to)| self.device_head_bytes(xfer_probe_group, to))
+                }
+                _ => None,
+            };
+            let slot0_post = self.host_head_bytes(xfer_probe_group, 0);
+            // Abnormal = the transferred bytes diverge between the tiers:
+            // offload — device source vs landed host bytes; onboard — host
+            // source vs restored device bytes. A mismatch warns (visible at
+            // info while the probe is enabled); a clean transfer stays at
+            // debug.
+            let content_mismatch = match xfer_probe_dir {
+                (Device, Host) => {
+                    matches!((&xfer_src_dev, &post), (Some(src), Some(landed)) if src != landed)
+                }
+                (Host, Device) => {
+                    matches!((&xfer_pre, &xfer_dst_dev), (Some(src), Some(restored)) if src != restored)
+                }
+                _ => false,
+            };
+            if content_mismatch {
+                tracing::warn!(
+                    dir = ?xfer_probe_dir,
+                    group = xfer_probe_group,
+                    slot,
+                    first_pair = ?xfer_probe_pair,
+                    src_dev = ?xfer_src_dev,
+                    dst_dev = ?xfer_dst_dev,
+                    pre = ?xfer_pre,
+                    post = ?post,
+                    slot0_pre = ?xfer_slot0_pre,
+                    slot0_post = ?slot0_post,
+                    "XFER-PROBE: host-tier head bytes MISMATCH — content diverges between tiers"
+                );
+            } else {
+                tracing::debug!(
+                    dir = ?xfer_probe_dir,
+                    group = xfer_probe_group,
+                    slot,
+                    first_pair = ?xfer_probe_pair,
+                    src_dev = ?xfer_src_dev,
+                    dst_dev = ?xfer_dst_dev,
+                    pre = ?xfer_pre,
+                    post = ?post,
+                    slot0_pre = ?xfer_slot0_pre,
+                    slot0_post = ?slot0_post,
+                    "XFER-PROBE: host-tier head bytes"
+                );
+            }
+        }
         Ok(())
     }
 

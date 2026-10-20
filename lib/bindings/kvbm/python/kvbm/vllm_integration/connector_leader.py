@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 # from kvbm.vllm_integration.rust import SchedulerOutput as RustSchedulerOutput
 
 from kvbm import KvbmLeader
-from kvbm.utils import is_dyn_runtime_enabled
+from kvbm.utils import is_dyn_runtime_enabled, probe_log_enabled
 from kvbm.vllm_integration.consolidator_config import get_consolidator_mode
 from kvbm.vllm_integration.rust import KvbmRequest
 from kvbm.vllm_integration.rust import KvConnectorLeader as RustKvConnectorLeader
@@ -318,17 +318,20 @@ class KvConnectorLeader:
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
-        # TEMPORARY HMA-PROBE (remove after Task 9's probe verdicts): verify
-        # the shared-index assumption — vLLM HMA hands per-group block-id
-        # lists and the multi-group pool design requires them to be identical
-        # (group 0 is authoritative here and in build_connector_meta). The
-        # probe lives here rather than in get_num_new_matched_tokens because
-        # the Request object does not carry block_ids in this vLLM line and
-        # the blocks are not allocated yet when that hook runs;
-        # update_state_after_alloc receives the allocated KVCacheBlocks,
-        # whose get_block_ids() is the per-group tuple.
+        # TEMPORARY HMA-PROBE (DYN_LOG-gated; remove after Task 9's probe
+        # verdicts): verify the shared-index assumption — vLLM HMA hands
+        # per-group block-id lists and the multi-group pool design requires
+        # them to be identical (group 0 is authoritative here and in
+        # build_connector_meta). The probe lives here rather than in
+        # get_num_new_matched_tokens because the Request object does not
+        # carry block_ids in this vLLM line and the blocks are not
+        # allocated yet when that hook runs; update_state_after_alloc
+        # receives the allocated KVCacheBlocks, whose get_block_ids() is
+        # the per-group tuple. EngineCore never shows kvbm debug/info
+        # (root WARNING, no bridge), so the DYN_LOG gate is the only
+        # common control that reaches it.
         group_block_ids = blocks.get_block_ids()
-        if len(group_block_ids) > 1 and logger.isEnabledFor(logging.WARNING):
+        if len(group_block_ids) > 1 and probe_log_enabled():
             logger.warning(
                 "HMA-PROBE: request %s block_ids per group: %s",
                 request.request_id,

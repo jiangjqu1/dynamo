@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from kvbm.utils import is_dyn_runtime_enabled
+from kvbm.utils import is_dyn_runtime_enabled, probe_log_enabled
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.model_executor.models.utils import extract_layer_index
@@ -273,16 +273,19 @@ class KvConnectorWorker:
                         raw_tensor = value.reshape(value.shape[0], -1)
                     # TEMPORARY shape probe (Phase-1-style): confirms the
                     # plain-tensor form from the node log; remove after the
-                    # Probe A/B verdicts.
-                    logger.warning(
-                        "mamba layer %s: value type %s, shape %s, dtype %s "
-                        "-> normalized %s",
-                        layer_name,
-                        type(value).__name__,
-                        list(value.shape),
-                        value.dtype,
-                        list(raw_tensor.shape),
-                    )
+                    # Probe A/B verdicts. DYN_LOG-gated (EngineCore never
+                    # shows kvbm debug/info, so an explicit gate is the
+                    # only common control that reaches it).
+                    if probe_log_enabled():
+                        logger.warning(
+                            "mamba layer %s: value type %s, shape %s, dtype %s "
+                            "-> normalized %s",
+                            layer_name,
+                            type(value).__name__,
+                            list(value.shape),
+                            value.dtype,
+                            list(raw_tensor.shape),
+                        )
                 mamba_layer_names.add(layer_name)
                 recurrent_layer_count += 1
                 normalized_kv_caches.append((layer_name, raw_tensor))
@@ -292,23 +295,25 @@ class KvConnectorWorker:
         ordered_kv_caches = normalized_kv_caches
         self.mamba_layer_names = mamba_layer_names
 
-        # TEMPORARY probe level (warning, not info): python logging's default
-        # level is WARNING and nothing configures the kvbm loggers — the
-        # Phase 1 probe proved INFO lines never reach the worker log.
-        logger.warning(
-            "register_kv_caches: %d KV layers (%d attention, %d recurrent/HMA)",
-            len(ordered_kv_caches),
-            attention_layer_count,
-            recurrent_layer_count,
-        )
-        for group in group_plans:
+        # TEMPORARY registration probes (DYN_LOG-gated): EngineCore leaves
+        # the kvbm loggers unconfigured (root WARNING) — debug/info never
+        # reach the worker log — so the probes fire only when DYN_LOG
+        # enables debug for kvbm (or globally).
+        if probe_log_enabled():
             logger.warning(
-                "register_kv_caches: group %d: %d layers (mamba=%s), layers=%s",
-                group.group_id,
-                len(group.layer_names),
-                group.is_mamba,
-                group.layer_names[:4],
+                "register_kv_caches: %d KV layers (%d attention, %d recurrent/HMA)",
+                len(ordered_kv_caches),
+                attention_layer_count,
+                recurrent_layer_count,
             )
+            for group in group_plans:
+                logger.warning(
+                    "register_kv_caches: group %d: %d layers (mamba=%s), layers=%s",
+                    group.group_id,
+                    len(group.layer_names),
+                    group.is_mamba,
+                    group.layer_names[:4],
+                )
 
         events = [
             torch.cuda.Event(enable_timing=False, interprocess=False)

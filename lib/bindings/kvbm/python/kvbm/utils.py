@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+import functools
 import logging
 import os
 
@@ -60,6 +61,31 @@ def is_dyn_runtime_enabled() -> bool:
     """
     val = os.environ.get("DYN_RUNTIME_ENABLED_KVBM", "").strip().lower()
     return val in {"1", "true"}
+
+
+@functools.lru_cache(maxsize=1)
+def probe_log_enabled() -> bool:
+    """Whether DYN_LOG enables the temporary connector probes.
+
+    The EngineCore subprocess runs without the Dynamo log bridge and
+    nothing configures the kvbm loggers there (root stays at WARNING), so
+    Python-side debug/info records never reach the worker log. The
+    temporary probes therefore key off the same DYN_LOG directives the
+    Rust probes use: they fire only when a global debug/trace level — or a
+    kvbm-targeted debug/trace directive — is configured.
+    """
+    dyn_log = os.environ.get("DYN_LOG", "info")
+    for directive in dyn_log.split(","):
+        directive = directive.strip()
+        if not directive:
+            continue
+        target, _, level = directive.rpartition("=")
+        if level.strip().lower() not in ("debug", "trace"):
+            continue
+        target = target.strip()
+        if not target or target == "kvbm" or target.startswith("kvbm"):
+            return True
+    return False
 
 
 def nvtx_annotate(func=None, *, domain="kvbm", category=None):
