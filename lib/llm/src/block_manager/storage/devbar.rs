@@ -988,6 +988,17 @@ impl DevbarAllocator {
     }
 }
 
+/// Process-wide lock for every test that mutates the `DYN_KVBM_DEVBAR_*` env
+/// or allocates GPU memory near a `mem_get_info` sample. This file's test
+/// modules and the worker-level `two_group_tests` previously held separate
+/// module-local locks while `std::env::*` is process-global — run in one
+/// process they raced a `TRANSFERS=direct` setter against a `StagedCpu`
+/// construction, and the VMM leak check sampled parallel contexts'
+/// allocations (the 2026-10-16 broad-family run). ONE lock, shared by all
+/// of them.
+#[cfg(test)]
+pub(crate) static DEVBAR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1178,7 +1189,7 @@ mod tests {
         }
     }
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::DEVBAR_ENV_LOCK as ENV_LOCK;
 
     /// `DYN_KVBM_DEVBAR_VMM=1` selects the Vmm region; mock wins over VMM;
     /// VMM alone (no BDF) selects Vmm; nothing set = pinned fallback.
@@ -1421,6 +1432,10 @@ mod vmm_tests {
     /// directions, leak-detected teardown.
     #[test]
     fn test_devbar_vmm_roundtrip_and_descriptor() {
+        // The leak check below samples GLOBAL free memory twice — parallel
+        // tests' contexts/allocations between the samples read as leaks, so
+        // hold the shared lock for the whole test.
+        let _guard = DEVBAR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let alloc = DevbarAllocator::vmm(0);
         let ctx = cudarc::driver::CudaContext::new(0).unwrap();
         ctx.bind_to_thread().unwrap();
@@ -1512,6 +1527,10 @@ mod staged_tests {
     /// full executor + routing are proven by the e2e on real hardware.
     #[test]
     fn test_devbar_staged_roundtrip_mock() {
+        // Serialize against the VMM leak check (shared lock): this test's
+        // context + allocations must not land between its mem_get_info
+        // samples.
+        let _guard = DEVBAR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let alloc = DevbarAllocator::mock(0);
         let mut storage = alloc.allocate(64 * 1024).expect("mock alloc");
 
