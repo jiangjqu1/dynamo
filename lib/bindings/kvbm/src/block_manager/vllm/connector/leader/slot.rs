@@ -1903,15 +1903,38 @@ impl VllmConnectorSlot {
                 let count = geometry.ext_counts[g];
                 let end = start + count;
                 let row = &table[g];
-                if row.len() < end {
+                if row.len() < count {
                     return Err(SlotError::InvalidOperation(format!(
                         "per-group device block mapping too short for request {} group {g}: \
-                         the onboard geometry needs positions {start}..{end}, the group has {}",
+                         the onboard geometry needs {count} destination blocks, the group has {}",
                         self.request_id,
                         row.len()
                     )));
                 }
-                Ok(row[start..end].to_vec())
+                // vLLM HMA groups are not all token-position-indexed: mamba
+                // groups report checkpoint-entry rows (shorter than the
+                // computed token range — the 2026-10-21 fatal shape: the
+                // geometry asked for positions 10..19 of a 10-entry row), and
+                // the scheduler may accept fewer blocks than the connector
+                // reported (vLLM's own documented case). The external
+                // destinations are the row's tail-most `count` entries of the
+                // computed range: slice absolutely when the row covers it
+                // (token-position groups — unchanged behavior), else fall
+                // back row-relatively from the row's own end.
+                let slice_start = start.min(row.len() - count);
+                if slice_start != start {
+                    tracing::warn!(
+                        request_id = %self.request_id,
+                        group = g,
+                        geometry_start = start,
+                        geometry_end = end,
+                        row_len = row.len(),
+                        "onboard geometry position diverges from the group row \
+                         (vLLM HMA checkpoint-indexed group); slicing destinations \
+                         from the row's tail"
+                    );
+                }
+                Ok(row[slice_start..slice_start + count].to_vec())
             })
             .collect()
     }
@@ -3549,6 +3572,70 @@ mod connector_tests {
         assert_eq!(
             slot.per_group_block_table_snapshot(),
             Some(&[vec![0, 6, 9], vec![0, 3, 9], vec![0, 2, 9], vec![1, 5, 9]][..])
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Test 18: the 2026-10-21 fatal shape — an onboard geometry whose
+    // absolute computed-position slice indexes past a checkpoint-
+    // indexed HMA group row (mamba rows are entry-indexed, shorter
+    // than the computed token range; the live worker died on "needs
+    // positions 10..19, the group has 10"). The destinations must fall
+    // back to the row's tail; a token-position-indexed row that
+    // covers the range keeps the exact absolute slice.
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_onboard_geometry_tail_fallback_for_short_group_rows() {
+        let num_tokens = 32 * 64; // ample blocks for the shape below
+        let (mut slot, _rx) = create_test_slot_with_groups(num_tokens, 0, 4);
+
+        // Group 3 (attention, token-position-indexed): the full 19-block
+        // computed range. Groups 0..2 (mamba, checkpoint-indexed): 10
+        // entries for the same token range — the live [4,4,4,12] shape.
+        let attention_row = block_ids(100, 19);
+        let mut rows: Vec<Vec<BlockId>> =
+            vec![block_ids(200, 10), block_ids(300, 10), block_ids(400, 10)];
+        rows.push(attention_row.clone());
+        slot.set_per_group_device_blocks(&rows).unwrap();
+
+        // The death's geometry: 7,840 internal + 7,056 external tokens,
+        // every group at bspb 784 → start=10, count=9 per group.
+        let geometry = OnboardGeometry {
+            starts: vec![10, 10, 10, 10],
+            ext_counts: vec![9, 9, 9, 9],
+        };
+
+        let dst_rows = slot
+            .onboard_geometry_dst_rows(&geometry)
+            .expect("a short checkpoint-indexed row must tail-fallback, not fatal");
+
+        // The attention row covers the absolute range: exact slice [10..19).
+        assert_eq!(dst_rows[3], attention_row[10..19]);
+        // The mamba rows cannot host positions 10..19 (len 10): the
+        // destinations are their TAIL 9 entries (the allocator appends the
+        // external destinations at the row's end).
+        assert_eq!(dst_rows[0], rows[0][1..10]);
+        assert_eq!(dst_rows[1], rows[1][1..10]);
+        assert_eq!(dst_rows[2], rows[2][1..10]);
+    }
+
+    // ---------------------------------------------------------------
+    // Test 19: a row too short to host even `count` destinations is a
+    // genuine contract violation — the loud error must survive the
+    // tail-fallback fix.
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_onboard_geometry_uncoverable_row_still_errors() {
+        let (mut slot, _rx) = create_test_slot_with_groups(32 * 64, 0, 2);
+        slot.set_per_group_device_blocks(&[block_ids(100, 2), block_ids(200, 2)])
+            .unwrap();
+        let geometry = OnboardGeometry {
+            starts: vec![0, 0],
+            ext_counts: vec![3, 3],
+        };
+        assert!(
+            slot.onboard_geometry_dst_rows(&geometry).is_err(),
+            "a row shorter than the ext count has nothing to host — must stay loud"
         );
     }
 
