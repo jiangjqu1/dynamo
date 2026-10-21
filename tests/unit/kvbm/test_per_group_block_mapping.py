@@ -567,14 +567,23 @@ def test_hybrid_gate_blocks_external_lookup_by_default(leader_module, monkeypatc
     assert calls == []
 
 
-def test_hybrid_gate_opens_with_the_experimental_env(leader_module, monkeypatch):
+def test_hybrid_gate_refuses_even_with_the_experimental_env(leader_module, monkeypatch):
+    """The env no longer opens the gate: an override would restore
+    known-wrong data (the mamba coordinate system + the final-state
+    checkpoint boundary — both proven content-incorrect; see the DEP).
+    The refusal is unconditional until the per-boundary checkpoint
+    capture lands."""
     monkeypatch.setenv("DYN_KVBM_HYBRID_EXPERIMENTAL_ONBOARD", "1")
     leader, _ = _make_leader(leader_module, 4)
     calls = _gate_probe(leader)
 
-    leader.get_num_new_matched_tokens(_GateProbeRequest(), num_computed_tokens=40)
+    num_computed, deferred = leader.get_num_new_matched_tokens(
+        _GateProbeRequest(), num_computed_tokens=40
+    )
 
-    assert len(calls) == 1
+    # The no-hit answer (recompute), and the external lookup never ran.
+    assert (num_computed, deferred) == (40, False)
+    assert calls == []
 
 
 def test_single_group_bypasses_the_gate(leader_module, monkeypatch):

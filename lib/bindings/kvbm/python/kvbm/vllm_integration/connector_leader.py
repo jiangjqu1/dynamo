@@ -282,31 +282,50 @@ class KvConnectorLeader:
                   asynchronously (between scheduler steps).
         """
         self._create_slot(request)
-        if (
-            self._num_groups > 1
-            and not os.environ.get("DYN_KVBM_HYBRID_EXPERIMENTAL_ONBOARD", "").strip()
-        ):
-            # SAFETY GATE (2026-10-15): the hybrid external ONBOARD is
-            # disabled by default. The determinism test on the fp4 proved
-            # that onboarding restores content that corrupts generation
-            # (temp-0 replay garbles after h2d onboards; coherent without):
-            # vLLM 0.29 HMA per-group block lists are NOT position-aligned
-            # for cached prefixes (live evidence: group_lengths [4,4,4,10]
-            # — the mamba state collapses to checkpoint entries with a
-            # different indexing than attention KV blocks), so the tier-2
-            # copies restored under positionally-matched hashes carry the
-            # wrong content for those positions. Offload (D2H) continues
-            # (harmless copies at rest); onboarding requires the
-            # per-group semantics from the DEP. Opt back in explicitly
-            # with DYN_KVBM_HYBRID_EXPERIMENTAL_ONBOARD=1 for experiments.
+        if self._num_groups > 1:
+            # INTEGRITY GATE (unconditional; 2026-10-21 hardening of the
+            # 2026-10-15 safety gate): the hybrid external match is REFUSED —
+            # not merely gated — because the onboard restore is provably
+            # content-incorrect on two independently-proven grounds:
+            # (1) COORDINATES: vLLM 0.29 HMA mamba rows are position-indexed
+            #     at the MAMBA block size (align mode: one state checkpoint
+            #     per mamba block, only ~2 + speculative resident, earlier
+            #     entries nulled by remove_skipped_blocks; the fp4's live
+            #     cadence is 1960 tokens vs the connector's metadata-uniform
+            #     784), so destination geometry derived from the metadata
+            #     block sizes pairs the wrong device slots — byte-faithful
+            #     transfers of the wrong pairings.
+            # (2) CHECKPOINTS: the finish-flush stores only the request's
+            #     FINAL mamba state (the checkpoint at its prompt+output
+            #     end); a prefix match needs the checkpoint AT the match
+            #     boundary — restoring the final state mid-prefix makes
+            #     decode continue from a state that includes tokens the
+            #     replay never processed.
+            # vLLM's own reference connector flags the same question
+            # unresolved (PR #8051's phase-4 test). Until the DEP lands the
+            # per-boundary checkpoint capture and the true per-group
+            # coordinate system, recompute is the only integrity-safe
+            # answer. D2H offload continues (harmless copies at rest;
+            # they only fill tier-2 with unmatched data).
             if not self._hybrid_onboard_gate_logged:
                 self._hybrid_onboard_gate_logged = True
+                env_set = bool(
+                    os.environ.get(
+                        "DYN_KVBM_HYBRID_EXPERIMENTAL_ONBOARD", ""
+                    ).strip()
+                )
                 logger.warning(
-                    "hybrid multi-group model detected: external KV onboarding "
-                    "is DISABLED (the HMA per-group block semantics are not "
-                    "position-aligned for cached prefixes; onboarding restores "
-                    "wrong content — see the phase-2 plan §12). Set "
-                    "DYN_KVBM_HYBRID_EXPERIMENTAL_ONBOARD=1 to override."
+                    "hybrid multi-group model detected: external KV matches "
+                    "are REFUSED unconditionally — the onboard restore is "
+                    "provably content-incorrect (the mamba rows' checkpoint "
+                    "coordinate system and the final-state checkpoint "
+                    "boundary; see the DEP). Recompute is always correct. "
+                    + (
+                        "DYN_KVBM_HYBRID_EXPERIMENTAL_ONBOARD is set but no "
+                        "longer overrides — it would restore known-wrong data."
+                        if env_set
+                        else ""
+                    )
                 )
             return num_computed_tokens, False
         return self._connector.get_num_new_matched_tokens(
