@@ -562,8 +562,11 @@ def test_hybrid_gate_blocks_external_lookup_by_default(leader_module, monkeypatc
         _GateProbeRequest(), num_computed_tokens=40
     )
 
-    # The no-hit answer (recompute), and the external lookup never ran.
-    assert (num_computed, deferred) == (40, False)
+    # The no-match answer: ZERO EXTERNAL tokens (never the local hit the
+    # scheduler passed in — that double-counts and trips the scheduler's
+    # num_computed_tokens <= num_tokens assert; the 2026-10-21 crash), and
+    # the external lookup never ran.
+    assert (num_computed, deferred) == (0, False)
     assert calls == []
 
 
@@ -581,8 +584,9 @@ def test_hybrid_gate_refuses_even_with_the_experimental_env(leader_module, monke
         _GateProbeRequest(), num_computed_tokens=40
     )
 
-    # The no-hit answer (recompute), and the external lookup never ran.
-    assert (num_computed, deferred) == (40, False)
+    # Zero external tokens (the no-match answer — see the default-gate
+    # test), and the external lookup never ran.
+    assert (num_computed, deferred) == (0, False)
     assert calls == []
 
 

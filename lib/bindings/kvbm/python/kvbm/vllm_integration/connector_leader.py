@@ -327,7 +327,19 @@ class KvConnectorLeader:
                         else ""
                     )
                 )
-            return num_computed_tokens, False
+            # The no-match answer. The connector contract (vLLM
+            # scheduler.py) treats the return value as the number of
+            # EXTERNAL tokens loadable BEYOND the local computed prefix —
+            # 0 means "recompute everything not locally cached". NEVER
+            # return num_computed_tokens here: that is the LOCAL hit the
+            # scheduler passed in, and vLLM would add it to
+            # num_external_computed_tokens — double-counting the local
+            # prefix and tripping `assert num_computed_tokens <=
+            # request.num_tokens` (the 2026-10-21 crash: a 8,790-token
+            # replay with a ~7,840-token internal hit doubled to 15,680;
+            # latent since the 2026-10-15 gate, exposed when the refusal
+            # became unconditional).
+            return 0, False
         return self._connector.get_num_new_matched_tokens(
             request.request_id,
             request.num_tokens,
