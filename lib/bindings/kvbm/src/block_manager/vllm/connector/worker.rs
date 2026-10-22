@@ -742,9 +742,17 @@ impl Worker for KvConnectorWorker {
                     tracing::debug!(request_id, "request slot is not finished");
                 }
             } else {
-                panic!(
-                    "request slot missing for {request_id}; however, it was present when added to the maybe finished onboarding set"
+                // The offloading loop above already reaped and removed
+                // this slot — a request that finishes generating while
+                // its onboard is still in flight enters BOTH tracking
+                // sets (fix #4), and the offloading loop runs first.
+                // Not an error; reap from this set too. (The 2026-10-22
+                // ssd-bypass fatal at worker.rs:745 was this case.)
+                tracing::debug!(
+                    request_id,
+                    "slot already reaped by the offloading loop; removing from onboarding set"
                 );
+                completed_onboarding.insert(request_id.clone());
             }
         }
 

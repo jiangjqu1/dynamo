@@ -405,12 +405,60 @@ impl BlockTransferHandler {
         let source_idxs = request.blocks().iter().map(|(from, _)| *from);
         let target_idxs = request.blocks().iter().map(|(_, to)| *to);
 
+        // Bounds-check against the pool sizes: vLLM's KV cache can have
+        // more blocks than the block manager's device pool (different
+        // memory accounting), and any vLLM block ID at or past the pool
+        // boundary would panic on index. Skip those blocks with a warning
+        // (the 2026-10-23 SSD-cascade fatal: index 7113 in a 7112-block
+        // device pool — vLLM's KV cache accounting allows block IDs the
+        // transfer handler's pool cannot hold).
+        let src_len = source_pool_list.len();
+        let dst_len = target_pool_list.len();
+        let mut valid_pairs: Vec<(usize, usize)> = Vec::new();
+        let mut skipped = 0usize;
+        for (from, to) in request.blocks().iter() {
+            if *from >= src_len || *to >= dst_len {
+                skipped += 1;
+                if skipped <= 3 {
+                    tracing::warn!(
+                        from = from,
+                        to = to,
+                        src_pool_len = src_len,
+                        dst_pool_len = dst_len,
+                        from_pool = ?request.from_pool(),
+                        to_pool = ?request.to_pool(),
+                        group = request.group,
+                        "block index out of pool bounds; skipping (vLLM KV cache can exceed the block-manager pool)"
+                    );
+                }
+            } else {
+                valid_pairs.push((*from, *to));
+            }
+        }
+        if skipped > 3 {
+            tracing::warn!(
+                total_skipped = skipped,
+                total_blocks = request.blocks().len(),
+                "additional out-of-bounds blocks skipped (showing first 3 only)"
+            );
+        }
+        if valid_pairs.is_empty() {
+            tracing::warn!(
+                "all blocks in the transfer request are out of pool bounds; nothing to do"
+            );
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(());
+            return Ok(rx);
+        }
+
         // Get the blocks corresponding to the indices.
-        let sources: Vec<LocalBlockData<Source>> = source_idxs
-            .map(|idx| source_pool_list[idx].clone())
+        let sources: Vec<LocalBlockData<Source>> = valid_pairs
+            .iter()
+            .map(|(from, _)| source_pool_list[*from].clone())
             .collect();
-        let mut targets: Vec<LocalBlockData<Target>> = target_idxs
-            .map(|idx| target_pool_list[idx].clone())
+        let mut targets: Vec<LocalBlockData<Target>> = valid_pairs
+            .iter()
+            .map(|(_, to)| target_pool_list[*to].clone())
             .collect();
 
         // Perform the transfer, and return the notifying channel.
