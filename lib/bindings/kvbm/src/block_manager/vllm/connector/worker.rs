@@ -640,7 +640,7 @@ impl Worker for KvConnectorWorker {
         // on each forward pass we visit the maybe slots to see if they are finished
 
         let mut is_finished_offloading = HashSet::new();
-        let mut is_finished_onboarding = HashSet::new();
+        let mut completed_onboarding = HashSet::new();
 
         // before we process the maybes, add any newly annotated finished requests
         // to the maybe finished set
@@ -660,6 +660,13 @@ impl Worker for KvConnectorWorker {
                     request_id,
                     "got a finished warning for a request that is onboarding"
                 );
+                // The request finished generating while its onboard is
+                // still in flight — track it in the offloading set TOO, so
+                // its completion is reported via finished_sending once the
+                // slot completes. Without this, the request would never be
+                // reported and vLLM would keep it forever under the
+                // leader's always-return-true finish contract.
+                self.maybe_finished_offloading.insert(request_id.clone());
             } else if self.maybe_finished_offloading.contains(&request_id) {
                 tracing::warn!(
                     request_id,
@@ -712,8 +719,25 @@ impl Worker for KvConnectorWorker {
         for request_id in self.maybe_finished_onboarding.iter() {
             if self.connector.has_slot(request_id) {
                 if self.connector.is_complete(request_id) {
-                    tracing::debug!(request_id, "request slot is finished");
-                    is_finished_onboarding.insert(request_id.clone());
+                    // The onboard (load) completed. Under kvbm's
+                    // SYNCHRONOUS load contract (async_load=false: vLLM
+                    // stream-ordered the transfers before the forward),
+                    // vLLM does not consume the finished_recving channel
+                    // for these — reporting a LIVE request there trips
+                    // scheduler.py:_update_from_kv_xfer_finished's
+                    // `assert RequestStatus.is_finished(...)` (the
+                    // 2026-10-22 defect #4 fatal, which fired 0.7s after
+                    // the first-ever completed H2D onboard). Reap the
+                    // tracking entry only; KEEP the worker slot so the
+                    // request's finish-time offload flow still finds it
+                    // (removing it here would strand the request's
+                    // finished_sending report and leak it in vLLM under
+                    // the always-return-true finish contract).
+                    tracing::debug!(
+                        request_id,
+                        "onboarding complete (sync contract: not reported via finished_recving; slot kept for the finish flow)"
+                    );
+                    completed_onboarding.insert(request_id.clone());
                 } else {
                     tracing::debug!(request_id, "request slot is not finished");
                 }
@@ -724,15 +748,15 @@ impl Worker for KvConnectorWorker {
             }
         }
 
-        // remove the finished requests from the maybe finished set
-        for request_id in &is_finished_onboarding {
+        // reap the completed onboarding entries from the maybe set
+        for request_id in &completed_onboarding {
             self.maybe_finished_onboarding.remove(request_id);
-            if self.connector.has_slot(request_id) {
-                self.connector.remove_slot(request_id);
-            }
         }
 
-        (is_finished_offloading, is_finished_onboarding)
+        // finished_recving stays empty under the sync load contract:
+        // vLLM's recving path is only for WAITING_FOR_REMOTE_KVS
+        // (async_load=true) or finished requests, and kvbm uses neither.
+        (is_finished_offloading, HashSet::new())
     }
 }
 

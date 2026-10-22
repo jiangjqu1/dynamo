@@ -1424,9 +1424,19 @@ impl Slot for VllmConnectorSlot {
 
         let mut num_new_matched_tokens = num_matched_blocks * block_size;
 
-        // we are on a block boundary, so we need to throw away the last block
-        if (num_computed_tokens + num_new_matched_tokens) == self.sequence().total_tokens() {
-            tracing::debug!("on a block boundary, throwing away the last block");
+        // The matched region is block-quantized; the request's token count
+        // need not be (chat templates leave a sub-block tail, so a
+        // full-history match can land up to one block PAST total_tokens).
+        // Drop the last matched block in both cases: on the exact boundary
+        // the final block stays locally computed, and on the overshoot the
+        // tail is a partial block that can never be onboarded. (The
+        // 2026-10-22 EngineCore fatal — "cannot advance computed position
+        // ... total tokens is ..." on every prefix-shared reuse turn —
+        // was the missing overshoot arm.)
+        if (num_computed_tokens + num_new_matched_tokens) >= self.sequence().total_tokens() {
+            tracing::debug!(
+                "matched region reaches the request end (boundary or past the unaligned tail); throwing away the last block"
+            );
 
             // we should have matched at least one block
             assert!(!host_blocks.is_empty() || !disk_blocks.is_empty());
@@ -1474,6 +1484,37 @@ impl Slot for VllmConnectorSlot {
         debug_assert_eq!(self.evaluated_blocks, 0);
         debug_assert_eq!(self.current_position % self.block_size, 0);
         debug_assert_eq!(num_external_tokens % self.block_size, 0);
+
+        // The staged/external count was computed at LOOKUP time against
+        // the then-current computed position; vLLM can advance the
+        // position before this trigger (prefill progress registered
+        // between the two hooks), so the block-quantized count can now
+        // overshoot the request's unaligned tail by up to a block — the
+        // 2026-10-22 EngineCore fatal ("cannot advance computed position
+        // ... total tokens is ..." on every prefix-shared reuse turn).
+        // Same treatment as the lookup-time boundary case: drop the
+        // last staged block and clamp the advance to the whole blocks
+        // that still fit — the sub-block tail is locally computed anyway
+        // (a partial block can never be onboarded).
+        let mut num_external_tokens = num_external_tokens;
+        if self.current_position + num_external_tokens > self.sequence().total_tokens() {
+            let fitting = self.sequence().total_tokens() - self.current_position;
+            let clamped = fitting - (fitting % self.block_size);
+            tracing::debug!(
+                request_id = %self.request_id,
+                "clamping external advance from {} to {} tokens (computed position advanced since the lookup; the tail stays locally computed)",
+                num_external_tokens, clamped
+            );
+            if clamped == 0 {
+                self.staging_from_host = None;
+                self.staging_from_disk = None;
+            } else if let Some(blocks) = self.staging_from_disk.as_mut() {
+                blocks.pop();
+            } else if let Some(blocks) = self.staging_from_host.as_mut() {
+                blocks.pop();
+            }
+            num_external_tokens = clamped;
+        }
 
         let num_computed_blocks = self.current_position / self.block_size;
 

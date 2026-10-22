@@ -576,11 +576,16 @@ impl Leader for KvConnectorLeader {
 
             // Skip if this slot was already created in the onboarding_slots loop above.
             // This prevents overwriting the slot with expected_immediate_ops=0 when it should have the correct count.
+            //
+            // NOTE: do NOT assert inflight removal here — the
+            // onboarding_slots loop above already removed this request from
+            // the local clone in this same build. vLLM 0.29's two-phase
+            // onboarding lifecycle overlaps: the same request appears in
+            // onboarding_slots AND new_requests in one scheduler step, so
+            // re-asserting the removal double-removes and panics (the
+            // 2026-10-22 leader.rs:580 fatal, which fired AFTER the
+            // first-ever completed H2D onboard).
             if already_created {
-                assert!(
-                    inflight_requests.remove(request_id),
-                    "request_id {request_id} not found in inflight_requests: "
-                );
                 continue;
             }
 
