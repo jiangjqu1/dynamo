@@ -579,6 +579,11 @@ pub struct VllmConnectorSlot {
     /// mamba restore).
     mamba_groups: Vec<usize>,
     mamba_block_tokens: usize,
+
+    /// Single-group only: the under-coverage WARN fired once for this
+    /// request (the chunked-prefill COW transient bursts per step; one
+    /// warning carries the whole story — the 2026-10-24 log-flood fix).
+    under_cover_warned: bool,
 }
 
 impl VllmConnectorSlot {
@@ -629,6 +634,7 @@ impl VllmConnectorSlot {
             onboard_geometry: None,
             mamba_groups,
             mamba_block_tokens,
+            under_cover_warned: false,
         }
     }
 
@@ -676,6 +682,7 @@ impl VllmConnectorSlot {
             onboard_geometry: None,
             mamba_groups,
             mamba_block_tokens,
+            under_cover_warned: false,
         }
     }
 
@@ -1092,20 +1099,43 @@ impl Slot for VllmConnectorSlot {
         // cumulative full lists every step, and the offload candidate
         // selection below clamps to the tracked list; the next pure-append
         // step restores coverage. Genuine feed inconsistency still fails
-        // loudly in `reconcile_device_block_feed`. The token-to-block math is
-        // also only exact for the group whose block size equals `block_size`
-        // (hybrid groups can differ), so a hard assert here is wrong for HMA.
+        // loudly in `reconcile_device_block_feed`.
+        //
+        // EMISSION POLICY (2026-10-24, after the ladder-log flood): for
+        // MULTI-GROUP (HMA) slots the under-coverage is STRUCTURAL, not
+        // transient — `device_blocks` is the flat list = group 0's blocks,
+        // and group 0 is a mamba group on the fp4 (a checkpoint-cadence row
+        // of ~cdiv(len/1960)+2 entries) while the math divides by the
+        // attention block size, so every request beyond ~2.6K tokens trips
+        // this on every step; the clamp is inert anyway (fix 1a suppressed
+        // multi-group mid-flight offloads — the finish-flush owns the
+        // store). Log at DEBUG there. For SINGLE-GROUP slots the case is a
+        // genuine one-step COW transient worth one WARN — rate-limited to
+        // the first occurrence per request (the bursts fire per step).
         let next_position = self.current_position + num_scheduled_tokens;
         if next_position > self.device_blocks.len() * self.block_size {
-            tracing::warn!(
-                request_id = %self.request_id,
-                next_position,
-                tracked_blocks = self.device_blocks.len(),
-                block_size = self.block_size,
-                "tracked device blocks under-cover the scheduled tokens \
-                 (chunked-prefill COW transient); clamping offload candidates \
-                 to the tracked list"
-            );
+            if self.num_groups > 1 {
+                tracing::debug!(
+                    request_id = %self.request_id,
+                    next_position,
+                    tracked_blocks = self.device_blocks.len(),
+                    block_size = self.block_size,
+                    "tracked device blocks under-cover the scheduled tokens \
+                     (structural for HMA: the flat list is group 0's mamba \
+                     row); clamping offload candidates to the tracked list"
+                );
+            } else if !self.under_cover_warned {
+                self.under_cover_warned = true;
+                tracing::warn!(
+                    request_id = %self.request_id,
+                    next_position,
+                    tracked_blocks = self.device_blocks.len(),
+                    block_size = self.block_size,
+                    "tracked device blocks under-cover the scheduled tokens \
+                     (chunked-prefill COW transient, once per request); clamping \
+                     offload candidates to the tracked list"
+                );
+            }
         }
 
         if next_position > self.sequence.total_tokens() {
@@ -3411,6 +3441,43 @@ mod connector_tests {
         slot.state = SlotState::Onboarding(14896);
         slot.acquire_local_matches(0)
             .expect("an in-flight onboard must skip the re-lookup, not fatal");
+    }
+
+    // ---------------------------------------------------------------
+    // Test 1c: the 2026-10-24 log-flood fix — the under-coverage emission
+    // is STRUCTURAL for multi-group slots (the flat list is group 0's
+    // mamba row vs the attention block math → always under-covers) and
+    // must not mark the request warned; single-group slots warn ONCE per
+    // request (the COW transient bursts per step).
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_under_cover_warn_rate_limit() {
+        // Multi-group (HMA): the flag NEVER sets (the emission is debug).
+        let (mut slot, _rx) = create_test_slot_with_groups(96, 0, 4);
+        slot.current_position = 90 * 32; // beyond the tracked coverage
+        slot.apply_scheduler_output(&[], &[], 96, 96, None, None)
+            .unwrap();
+        assert!(
+            !slot.under_cover_warned,
+            "multi-group under-coverage is structural — never the warned path"
+        );
+
+        // Single-group: the FIRST under-covering step sets the flag; the
+        // second does not re-mark (the emission is once-per-request).
+        let (mut slot, _rx) = create_test_slot(96, 0);
+        slot.current_position = 90 * 32;
+        slot.apply_scheduler_output(&[], &[], 96, 96, None, None)
+            .unwrap();
+        assert!(
+            slot.under_cover_warned,
+            "single-group under-coverage warns (the first time)"
+        );
+        slot.apply_scheduler_output(&[], &[], 96, 96, None, None)
+            .unwrap();
+        assert!(
+            slot.under_cover_warned,
+            "the flag stays set (once-per-request)"
+        );
     }
 
     // ---------------------------------------------------------------
