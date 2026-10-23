@@ -46,6 +46,17 @@ if is_dyn_runtime_enabled():
 logger = logging.getLogger(__name__)
 
 
+def mamba_contract_configured() -> bool:
+    """DYN_KVBM_MAMBA_GROUPS ("0,1,2") + DYN_KVBM_MAMBA_BLOCK_TOKENS (e.g.
+    1960 — the fp4 GDN state-checkpoint cadence): BOTH required to enable
+    the hybrid multi-turn continuation contract (Phase A). The same pair
+    configures the Rust slots (the state-slot restore geometry); either
+    missing keeps the multi-group external-match refusal in force."""
+    groups = os.environ.get("DYN_KVBM_MAMBA_GROUPS", "").strip()
+    tokens = os.environ.get("DYN_KVBM_MAMBA_BLOCK_TOKENS", "").strip()
+    return bool(groups) and bool(tokens)
+
+
 def _rposition(tracked: list[int], block_id: int) -> Optional[int]:
     """Last index of ``block_id`` in ``tracked``, or None (Rust rposition)."""
     for idx in range(len(tracked) - 1, -1, -1):
@@ -172,6 +183,11 @@ class KvConnectorLeader:
         # One-time gate log for the hybrid onboard safety gate (see
         # get_num_new_matched_tokens).
         self._hybrid_onboard_gate_logged = False
+        # Phase A: the multi-turn continuation contract's configuration —
+        # read ONCE (the process env is fixed); the Rust slot manager
+        # reads the SAME two vars for the state-slot restore geometry.
+        self._mamba_contract_configured = mamba_contract_configured()
+        self._hybrid_onboard_active_logged = False
 
         # Per-group block sizes for the hybrid onboard geometry (fix 2):
         # the vLLM reference's per-group tail arithmetic needs each
@@ -282,11 +298,11 @@ class KvConnectorLeader:
                   asynchronously (between scheduler steps).
         """
         self._create_slot(request)
-        if self._num_groups > 1:
-            # INTEGRITY GATE (unconditional; 2026-10-21 hardening of the
-            # 2026-10-15 safety gate): the hybrid external match is REFUSED —
-            # not merely gated — because the onboard restore is provably
-            # content-incorrect on two independently-proven grounds:
+        if self._num_groups > 1 and not self._mamba_contract_configured:
+            # INTEGRITY GATE (2026-10-21): the hybrid external match is
+            # REFUSED while the mamba restore contract is UNCONFIGURED —
+            # the onboard restore is content-incorrect on two proven
+            # grounds:
             # (1) COORDINATES: vLLM 0.29 HMA mamba rows are position-indexed
             #     at the MAMBA block size (align mode: one state checkpoint
             #     per mamba block, only ~2 + speculative resident, earlier
@@ -301,12 +317,14 @@ class KvConnectorLeader:
             #     boundary — restoring the final state mid-prefix makes
             #     decode continue from a state that includes tokens the
             #     replay never processed.
-            # vLLM's own reference connector flags the same question
-            # unresolved (PR #8051's phase-4 test). Until the DEP lands the
-            # per-boundary checkpoint capture and the true per-group
-            # coordinate system, recompute is the only integrity-safe
-            # answer. D2H offload continues (harmless copies at rest;
-            # they only fill tier-2 with unmatched data).
+            # With the contract configured (DYN_KVBM_MAMBA_GROUPS +
+            # DYN_KVBM_MAMBA_BLOCK_TOKENS — the multi-turn continuation
+            # contract, Phase A 2026-10-22), the lookup runs: the Rust side
+            # accepts ONLY matches ending at a stored chain end (where the
+            # mamba checkpoint lives) and restores the checkpoint into the
+            # engine's own state slot ((P-1)//mamba_block_tokens, vLLM's
+            # preprocess_mamba contract). Without the configuration,
+            # recompute remains the only integrity-safe answer.
             if not self._hybrid_onboard_gate_logged:
                 self._hybrid_onboard_gate_logged = True
                 env_set = bool(
@@ -316,13 +334,13 @@ class KvConnectorLeader:
                 )
                 logger.warning(
                     "hybrid multi-group model detected: external KV matches "
-                    "are REFUSED unconditionally — the onboard restore is "
-                    "provably content-incorrect (the mamba rows' checkpoint "
-                    "coordinate system and the final-state checkpoint "
-                    "boundary; see the DEP). Recompute is always correct. "
+                    "are REFUSED — the mamba restore contract is unconfigured "
+                    "(set DYN_KVBM_MAMBA_GROUPS + DYN_KVBM_MAMBA_BLOCK_TOKENS "
+                    "to enable the multi-turn continuation contract; see the "
+                    "DEP). Recompute is always correct. "
                     + (
-                        "DYN_KVBM_HYBRID_EXPERIMENTAL_ONBOARD is set but no "
-                        "longer overrides — it would restore known-wrong data."
+                        "(DYN_KVBM_HYBRID_EXPERIMENTAL_ONBOARD is set but "
+                        "inert.)"
                         if env_set
                         else ""
                     )
@@ -340,6 +358,14 @@ class KvConnectorLeader:
             # latent since the 2026-10-15 gate, exposed when the refusal
             # became unconditional).
             return 0, False
+        if self._num_groups > 1 and not self._hybrid_onboard_active_logged:
+            self._hybrid_onboard_active_logged = True
+            logger.warning(
+                "hybrid multi-group model detected: external KV matches are "
+                "ACTIVE under the multi-turn continuation contract — matches "
+                "end at stored chain ends only, and the mamba restore targets "
+                "the engine's own state slot (see the DEP)"
+            )
         return self._connector.get_num_new_matched_tokens(
             request.request_id,
             request.num_tokens,

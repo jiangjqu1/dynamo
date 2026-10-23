@@ -590,6 +590,26 @@ def test_hybrid_gate_refuses_even_with_the_experimental_env(leader_module, monke
     assert calls == []
 
 
+def test_hybrid_gate_opens_with_the_mamba_contract(leader_module, monkeypatch):
+    """Phase A: with the mamba restore contract configured
+    (DYN_KVBM_MAMBA_GROUPS + DYN_KVBM_MAMBA_BLOCK_TOKENS), the multi-group
+    lookup RUNS — the Rust side enforces the chain-end rule; the Python
+    gate is only the configuration check."""
+    monkeypatch.setenv("DYN_KVBM_MAMBA_GROUPS", "0,1,2")
+    monkeypatch.setenv("DYN_KVBM_MAMBA_BLOCK_TOKENS", "1960")
+    leader, _ = _make_leader(leader_module, 4)
+    calls = _gate_probe(leader)
+
+    num_computed, deferred = leader.get_num_new_matched_tokens(
+        _GateProbeRequest(), num_computed_tokens=40
+    )
+
+    # The lookup ran and the leader's own answer passes through (the
+    # recording fake returns its num_computed argument).
+    assert len(calls) == 1
+    assert (num_computed, deferred) == (40, False)
+
+
 def test_single_group_bypasses_the_gate(leader_module, monkeypatch):
     monkeypatch.delenv("DYN_KVBM_HYBRID_EXPERIMENTAL_ONBOARD", raising=False)
     leader, _ = _make_leader(leader_module, 1)

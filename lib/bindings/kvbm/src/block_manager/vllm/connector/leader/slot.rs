@@ -41,6 +41,54 @@ pub enum SlotError {
     BlockPoolError(#[from] BlockPoolError),
 }
 
+/// DYN_KVBM_MAMBA_GROUPS ("0,1,2") + DYN_KVBM_MAMBA_BLOCK_TOKENS (e.g.
+/// 1960 — the fp4 GDN state-checkpoint cadence). BOTH must be set: either
+/// missing means the hybrid multi-turn continuation contract is OFF (the
+/// Python gate refuses multi-group external matches, and the slots never
+/// plan a mamba restore). Read once at slot-manager construction — the
+/// same two env vars gate the Python side.
+fn read_mamba_config_from_env() -> (Vec<usize>, usize) {
+    let groups = std::env::var("DYN_KVBM_MAMBA_GROUPS").ok().and_then(|s| {
+        let parsed: Option<Vec<usize>> = s
+            .split(',')
+            .map(|t| t.trim().parse::<usize>().ok())
+            .collect();
+        parsed.filter(|v| !v.is_empty())
+    });
+    let tokens = std::env::var("DYN_KVBM_MAMBA_BLOCK_TOKENS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&t| t > 0);
+    match (groups, tokens) {
+        (Some(groups), Some(tokens)) => (groups, tokens),
+        _ => (Vec::new(), 0),
+    }
+}
+
+/// Phase A chain-end registry: the hash of the LAST block stored by each
+/// finished multi-group request's flush. A multi-group external match is
+/// valid ONLY when its end lands on one of these — the tier-2 content at a
+/// chain end carries the mamba checkpoint AT that boundary (the storing
+/// request's FINAL state); a mid-chain end has no checkpoint and would
+/// restore wrong bytes. Populated by `take_hybrid_flush_offload`;
+/// consulted by `acquire_local_matches`. The cap guards only memory — an
+/// entry's absence after a clear simply refuses matches until the next
+/// finish re-records (recompute is always safe).
+static HYBRID_CHAIN_END_HASHES: std::sync::LazyLock<std::sync::Mutex<HashSet<SequenceHash>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+fn record_hybrid_chain_end(hash: SequenceHash) {
+    let mut set = HYBRID_CHAIN_END_HASHES.lock().unwrap();
+    if set.len() > 1_000_000 {
+        set.clear();
+    }
+    set.insert(hash);
+}
+
+fn is_hybrid_chain_end(hash: SequenceHash) -> bool {
+    HYBRID_CHAIN_END_HASHES.lock().unwrap().contains(&hash)
+}
+
 pub trait SlotManager<R: RequestKey>: Send + Sync {
     type SlotType: Slot + ?Sized;
 
@@ -223,6 +271,10 @@ pub struct ConnectorSlotManager<R: RequestKey> {
     /// records one metadata op per leg) and to the transfer engine (which
     /// sends one wire leg per group), keeping the two sides in lockstep.
     num_groups: usize,
+    /// Phase A: the mamba restore geometry (see the slot field docs),
+    /// stamped into every slot at creation.
+    mamba_groups: Vec<usize>,
+    mamba_block_tokens: usize,
 }
 
 impl std::fmt::Debug for ConnectorSlotManager<String> {
@@ -243,6 +295,11 @@ impl<R: RequestKey> ConnectorSlotManager<R> {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
+        // Phase A: the hybrid mamba restore geometry (see the slot field
+        // docs) — the same env pattern as the offload priority above; the
+        // restart scripts own the model's constants, and the Python gate
+        // reads the SAME two env vars so both sides agree.
+        let (mamba_groups, mamba_block_tokens) = read_mamba_config_from_env();
         let kvbm_metrics_clone = kvbm_metrics.clone();
         let cache_stats_clone = cache_stats.clone();
 
@@ -305,6 +362,8 @@ impl<R: RequestKey> ConnectorSlotManager<R> {
             kvbm_metrics: kvbm_metrics.clone(),
             offload_min_priority,
             num_groups,
+            mamba_groups,
+            mamba_block_tokens,
         }
     }
 
@@ -356,6 +415,8 @@ impl<R: RequestKey> SlotManager<R> for ConnectorSlotManager<R> {
             self.cache_stats.clone(),
             self.offload_min_priority,
             self.num_groups,
+            self.mamba_groups.clone(),
+            self.mamba_block_tokens,
         );
         self.slots
             .lock()
@@ -507,6 +568,17 @@ pub struct VllmConnectorSlot {
     /// next `trigger_onboarding`; the Python side republishes before
     /// every `update_state_after_alloc` that triggers an onboard.
     onboard_geometry: Option<OnboardGeometry>,
+
+    /// Phase A (the hybrid multi-turn continuation contract): the mamba
+    /// group indices and the TRUE mamba block size in tokens — the ENGINE's
+    /// state-checkpoint cadence (1,960 for the fp4's GDN groups), never the
+    /// metadata-uniform block size the factory config reports. Configured
+    /// via DYN_KVBM_MAMBA_GROUPS ("0,1,2") + DYN_KVBM_MAMBA_BLOCK_TOKENS;
+    /// both required — either missing means the contract is OFF (the Python
+    /// gate refuses multi-group external matches and the slots never plan a
+    /// mamba restore).
+    mamba_groups: Vec<usize>,
+    mamba_block_tokens: usize,
 }
 
 impl VllmConnectorSlot {
@@ -520,6 +592,8 @@ impl VllmConnectorSlot {
         cache_stats: Arc<CacheStatsTracker>,
         offload_min_priority: u32,
         num_groups: usize,
+        mamba_groups: Vec<usize>,
+        mamba_block_tokens: usize,
     ) -> Self {
         assert!(!tokens.is_empty(), "tokens must be non-empty");
         let block_size = block_manager.block_size();
@@ -553,6 +627,8 @@ impl VllmConnectorSlot {
             num_groups: num_groups.max(1),
             per_group_block_table: None,
             onboard_geometry: None,
+            mamba_groups,
+            mamba_block_tokens,
         }
     }
 
@@ -567,6 +643,8 @@ impl VllmConnectorSlot {
         cache_stats: Arc<CacheStatsTracker>,
         offload_min_priority: u32,
         num_groups: usize,
+        mamba_groups: Vec<usize>,
+        mamba_block_tokens: usize,
     ) -> Self {
         assert!(!tokens.is_empty(), "tokens must be non-empty");
         let sequence = TokenBlockSequence::new(tokens, block_size as u32, Some(salt_hash));
@@ -596,6 +674,8 @@ impl VllmConnectorSlot {
             num_groups: num_groups.max(1),
             per_group_block_table: None,
             onboard_geometry: None,
+            mamba_groups,
+            mamba_block_tokens,
         }
     }
 
@@ -1377,7 +1457,6 @@ impl Slot for VllmConnectorSlot {
             .unwrap_or_default();
 
         let num_matched_host_blocks = host_blocks.len();
-        self.record_cached_host_tokens(num_matched_host_blocks * block_size);
 
         // advance the search offset by the number of matched host blocks
         let search_offset = search_offset + num_matched_host_blocks;
@@ -1392,7 +1471,6 @@ impl Slot for VllmConnectorSlot {
             .unwrap_or_default();
 
         let num_matched_disk_blocks = disk_blocks.len();
-        self.record_cached_disk_tokens(num_matched_disk_blocks * block_size);
 
         let num_matched_blocks = num_matched_host_blocks + num_matched_disk_blocks;
 
@@ -1456,6 +1534,32 @@ impl Slot for VllmConnectorSlot {
         if num_new_matched_tokens == 0 {
             return Ok(());
         }
+
+        // Phase A (the hybrid multi-turn continuation contract): a
+        // MULTI-GROUP external match is valid ONLY when its end lands on a
+        // stored chain end — the tier-2 block there carries the mamba
+        // checkpoint AT that boundary (the storing request's FINAL state);
+        // every other end has no checkpoint and would restore wrong bytes.
+        // Refuse (recompute is always correct) — the lookup itself stays
+        // counted so the hit-rate metrics reflect the refusal honestly.
+        if self.num_groups > 1 {
+            let staged_blocks = host_blocks.len() + disk_blocks.len();
+            let match_end_hash = sequence_hashes[num_computed_blocks + staged_blocks - 1];
+            if !is_hybrid_chain_end(match_end_hash) {
+                tracing::debug!(
+                    request_id = %self.request_id,
+                    matched = staged_blocks,
+                    "multi-group match does not end at a stored chain end \
+                     (no mamba checkpoint at the boundary); refusing — recompute"
+                );
+                return Ok(());
+            }
+        }
+
+        // Count the served tokens only now, post-validation: a refused match
+        // must not inflate the hit-rate metrics.
+        self.record_cached_host_tokens(host_blocks.len() * block_size);
+        self.record_cached_disk_tokens(disk_blocks.len() * block_size);
 
         self.staging_from_host = if !host_blocks.is_empty() {
             Some(host_blocks)
@@ -1529,6 +1633,15 @@ impl Slot for VllmConnectorSlot {
         // positional fallback, exactly today's behavior.
         let onboard_geometry = self.onboard_geometry.take();
 
+        // Phase A (the hybrid multi-turn continuation contract): plan the
+        // mamba restore — vLLM's align-mode engine reads the resumed state
+        // from row position (P-1)/mamba_block_tokens (preprocess_mamba),
+        // and the checkpoint content (the storing request's FINAL state)
+        // lives in the LAST staged tier-2 block, the chain end the match
+        // was validated against. The plan applies to the op carrying the
+        // last staged block.
+        let mamba_plan = self.build_mamba_restore_plan(num_external_tokens)?;
+
         // match the host / disk blocks to the newly assigned mutable device blocks
         if let Some(host_blocks) = self.staging_from_host.take() {
             let num_host_blocks = host_blocks.len();
@@ -1547,7 +1660,19 @@ impl Slot for VllmConnectorSlot {
             // construct offload requests - transfer engine + worker
             let src_blocks = Box::new(AnyImmutableBlocks::<DevbarStorage, _, _>::new(host_blocks));
 
-            self.onboard_blocks(src_blocks, dst_block_ids, onboard_geometry.as_ref())?;
+            // The mamba plan belongs to the LAST staged block: the disk op
+            // carries it when disk blocks exist, else this host op does.
+            let mamba_for_op = if self.staging_from_disk.is_some() {
+                None
+            } else {
+                mamba_plan.as_ref()
+            };
+            self.onboard_blocks(
+                src_blocks,
+                dst_block_ids,
+                onboard_geometry.as_ref(),
+                mamba_for_op,
+            )?;
 
             // shift the evaluated blocks position to the end of the computed/cached blocks
             self.evaluated_blocks += num_host_blocks;
@@ -1570,7 +1695,14 @@ impl Slot for VllmConnectorSlot {
             // construct offload requests - transfer engine + worker
             let src_blocks = Box::new(AnyImmutableBlocks::<DiskStorage, _, _>::new(disk_blocks));
 
-            self.onboard_blocks(src_blocks, dst_block_ids, onboard_geometry.as_ref())?;
+            // The disk op (when it exists) carries the last staged block —
+            // the mamba plan's checkpoint source.
+            self.onboard_blocks(
+                src_blocks,
+                dst_block_ids,
+                onboard_geometry.as_ref(),
+                mamba_plan.as_ref(),
+            )?;
 
             // shift the evaluated blocks position to the end of the computed/cached blocks
             self.evaluated_blocks += num_disk_blocks;
@@ -1702,12 +1834,74 @@ impl ExternallyManagedDeviceSlot for VllmConnectorSlot {
 }
 
 impl VllmConnectorSlot {
+    /// Phase A: plan the mamba groups' restore for the onboard. The
+    /// external range ends at P = current_position + num_external_tokens
+    /// tokens; vLLM's align-mode engine reads the resumed state from row
+    /// position (P-1)/mamba_block_tokens (preprocess_mamba's
+    /// `prev_state_idx`), and the checkpoint content — the storing
+    /// request's FINAL state — lives in the LAST staged tier-2 block (the
+    /// chain end the match was validated against). Returns Ok(None) when
+    /// the contract is unconfigured or nothing is staged; errors LOUDLY
+    /// when a mamba row cannot host the engine's state slot — restoring
+    /// wrong bytes is never acceptable, and recompute is no longer
+    /// possible past the match (the tokens were already promised).
+    fn build_mamba_restore_plan(
+        &self,
+        num_external_tokens: usize,
+    ) -> Result<Option<MambaRestorePlan>, SlotError> {
+        if self.mamba_groups.is_empty() {
+            return Ok(None);
+        }
+        if self.staging_from_host.is_none() && self.staging_from_disk.is_none() {
+            return Ok(None);
+        }
+        let p_tokens = self.current_position + num_external_tokens;
+        if p_tokens == 0 {
+            return Ok(None);
+        }
+        let state_slot = (p_tokens - 1) / self.mamba_block_tokens;
+        let Some(table) = &self.per_group_block_table else {
+            return Err(SlotError::InvalidOperation(format!(
+                "multi-group onboard for request {} without a per-group device table",
+                self.request_id
+            )));
+        };
+        let mut dst_per_group = HashMap::new();
+        for &group in &self.mamba_groups {
+            let row = table.get(group).ok_or_else(|| {
+                SlotError::InvalidOperation(format!(
+                    "per-group table of request {} is missing group {group}",
+                    self.request_id
+                ))
+            })?;
+            if row.len() <= state_slot {
+                return Err(SlotError::InvalidOperation(format!(
+                    "mamba row of group {group} for request {} does not cover the \
+                     engine's state slot {state_slot} (P={p_tokens} tokens, row \
+                     length {}): refusing to restore wrong bytes",
+                    self.request_id,
+                    row.len()
+                )));
+            }
+            dst_per_group.insert(group, row[state_slot]);
+        }
+        tracing::debug!(
+            request_id = %self.request_id,
+            p_tokens,
+            state_slot,
+            groups = ?self.mamba_groups,
+            "Phase A mamba restore planned (state-slot targets)"
+        );
+        Ok(Some(MambaRestorePlan { dst_per_group }))
+    }
+
     /// Shared shape validation for per-group mapping updates: exactly one
-    /// list per HMA group. Group lists of UNEQUAL length are warned (vLLM's
-    /// groups are expected to allocate in step — one block per group per
-    /// logical block, as the HMA-PROBE showed — but a warning keeps a
-    /// benign divergence visible without killing scheduling; the consumers
-    /// fail loudly if a needed position is missing).
+    /// list per HMA group. Group lists of UNEQUAL length are logged at
+    /// DEBUG: the 2026-10-22 store-model pin proved divergent lengths are
+    /// the EXPECTED growing state (mamba rows are checkpoint-cadence while
+    /// attention rows are position-indexed — 6,134 WARNs per ladder cell
+    /// before the demotion); the consumers fail loudly if a needed
+    /// position is missing.
     fn validate_per_group_shape(
         per_group_block_ids: &[Vec<BlockId>],
         num_groups: usize,
@@ -1721,10 +1915,10 @@ impl VllmConnectorSlot {
         if num_groups > 1 {
             let lengths: Vec<usize> = per_group_block_ids.iter().map(Vec::len).collect();
             if lengths.windows(2).any(|w| w[0] != w[1]) {
-                tracing::warn!(
+                tracing::debug!(
                     group_lengths = ?lengths,
-                    "per-group device block lists have unequal lengths; groups are expected \
-                     to allocate in step (one block per group per logical block)"
+                    "per-group device block lists have unequal lengths (expected: the \
+                     mamba rows grow at checkpoint cadence, attention at position cadence)"
                 );
             }
         }
@@ -1846,6 +2040,15 @@ impl VllmConnectorSlot {
             .take(count)
             .cloned()
             .collect();
+
+        // Phase A: record the chain end — the tier-2 block at this position
+        // carries this request's FINAL mamba state (the checkpoint AT this
+        // boundary), the only mamba content a multi-group restore may ever
+        // move. A later multi-group match ending HERE is valid; anything
+        // shorter has no checkpoint and is refused by acquire_local_matches.
+        if let Some(last) = token_blocks.last() {
+            record_hybrid_chain_end(last.sequence_hash());
+        }
         // Priorities: the stored per-block map (populated by the scheduler
         // feeds), default 0 where absent — the same lookup the mid-flight
         // path performs.
@@ -2073,6 +2276,7 @@ impl VllmConnectorSlot {
         src_blocks: Box<dyn AnyBlocks>,
         dst_block_ids: Vec<BlockId>,
         onboard_geometry: Option<&OnboardGeometry>,
+        mamba_plan: Option<&MambaRestorePlan>,
     ) -> Result<(), SlotError> {
         debug_assert_eq!(src_blocks.len(), dst_block_ids.len());
 
@@ -2080,12 +2284,33 @@ impl VllmConnectorSlot {
         let src_storage_pool = src_blocks.storage_pool();
         let operation_id = uuid::Uuid::new_v4();
 
-        let per_group_dst_block_ids = match onboard_geometry {
-            Some(geometry) => self.onboard_geometry_dst_rows(geometry)?,
-            None => self
-                .per_group_device_ids(self.evaluated_blocks, dst_block_ids.len())?
-                .unwrap_or_default(),
+        let (mut per_group_dst_block_ids, mut per_group_src_offsets) = match onboard_geometry {
+            Some(geometry) => (
+                self.onboard_geometry_dst_rows(geometry)?,
+                vec![0usize; self.num_groups],
+            ),
+            None => (
+                self.per_group_device_ids(self.evaluated_blocks, dst_block_ids.len())?
+                    .unwrap_or_default(),
+                Vec::new(),
+            ),
         };
+
+        // Phase A: the mamba groups' destinations are NOT positional — the
+        // engine reads the resumed state from ONE row slot, and the source
+        // is the LAST staged block (the chain end carrying the checkpoint).
+        // Override those groups' destination rows and source offsets; the
+        // attention group keeps the positional slice.
+        if let Some(plan) = mamba_plan {
+            if per_group_src_offsets.is_empty() && self.num_groups > 1 {
+                per_group_src_offsets = vec![0usize; self.num_groups];
+            }
+            let last_src = num_blocks.saturating_sub(1);
+            for (&group, &dst) in &plan.dst_per_group {
+                per_group_dst_block_ids[group] = vec![dst];
+                per_group_src_offsets[group] = last_src;
+            }
+        }
 
         let xfer_req = LocalTransferRequest::Onboard(LocalOnboardRequest::new(
             self.request_id.clone(),
@@ -2093,6 +2318,7 @@ impl VllmConnectorSlot {
             dst_block_ids,
             operation_id,
             per_group_dst_block_ids,
+            per_group_src_offsets,
         ));
 
         // ONE metadata operation PER GROUP LEG, each with its deterministic
@@ -2180,6 +2406,17 @@ struct OnboardGeometry {
     ext_counts: Vec<usize>,
 }
 
+/// Phase A (the hybrid multi-turn continuation contract): the mamba groups'
+/// restore plan for one onboard op — each mamba group's SINGLE destination
+/// row slot (vLLM's align-mode engine reads the resumed state from row
+/// position `(P-1)/mamba_block_tokens`; see preprocess_mamba). The source
+/// is always the op's LAST staged tier-2 block (the chain end carrying the
+/// checkpoint) — wired via the per-group source offsets, not this struct.
+struct MambaRestorePlan {
+    /// group index → the engine state-slot device id.
+    dst_per_group: HashMap<usize, BlockId>,
+}
+
 struct LocalOffloadRequest {
     request_id: String,
     /// Group 0's device ids for the candidate blocks — also the logical
@@ -2243,6 +2480,11 @@ struct LocalOnboardRequest {
     /// group takes fewer destinations than the flat scheduler-granularity
     /// count, and the transfer pairing truncates to its own count.
     per_group_dst_block_ids: Vec<Vec<BlockId>>,
+    /// Per-group SOURCE offsets into the staged tier-2 block list (Phase
+    /// A): all-zero (or empty) = identity pairing (today's behavior). The
+    /// mamba groups' leg pairs its ONE destination with the LAST staged
+    /// block (the chain end carrying the checkpoint), not the first.
+    per_group_src_offsets: Vec<usize>,
 }
 
 impl LocalOnboardRequest {
@@ -2252,18 +2494,36 @@ impl LocalOnboardRequest {
         dst_block_ids: Vec<BlockId>,
         operation_id: uuid::Uuid,
         per_group_dst_block_ids: Vec<Vec<BlockId>>,
+        per_group_src_offsets: Vec<usize>,
     ) -> Self {
         debug_assert!(src_blocks.len() == dst_block_ids.len());
         debug_assert!(
             per_group_dst_block_ids.is_empty() || per_group_dst_block_ids.len() > 1,
             "per-group destination ids are only recorded for multi-group onboards"
         );
-        for ids in &per_group_dst_block_ids {
+        debug_assert!(
+            per_group_src_offsets.is_empty()
+                || per_group_src_offsets.len() == per_group_dst_block_ids.len().max(1),
+            "per-group source offsets ({}) must match the per-group destination rows ({})",
+            per_group_src_offsets.len(),
+            per_group_dst_block_ids.len()
+        );
+        for (ids, offset) in per_group_dst_block_ids
+            .iter()
+            .zip(per_group_src_offsets.iter().chain(std::iter::repeat(&0)))
+        {
             debug_assert!(
                 ids.len() <= dst_block_ids.len(),
                 "per-group destination ids ({}) exceed the flat destination list ({})",
                 ids.len(),
                 dst_block_ids.len()
+            );
+            debug_assert!(
+                offset + ids.len() <= src_blocks.len(),
+                "per-group source offset ({}) + destinations ({}) exceed the source blocks ({})",
+                offset,
+                ids.len(),
+                src_blocks.len()
             );
         }
         Self {
@@ -2272,6 +2532,7 @@ impl LocalOnboardRequest {
             dst_block_ids,
             operation_id,
             per_group_dst_block_ids,
+            per_group_src_offsets,
         }
     }
 }
@@ -2825,18 +3086,27 @@ async fn process_onboard_request(
     } else {
         onboard_req.per_group_dst_block_ids.clone()
     };
+    // Phase A: per-group SOURCE offsets into the staged tier-2 list — the
+    // mamba groups' leg pairs its checkpoint destination with the LAST
+    // staged block instead of the first.
+    let src_offsets = &onboard_req.per_group_src_offsets;
     let block_pairs_per_group: Vec<Vec<(usize, usize)>> = dst_ids_per_group
         .into_iter()
-        .map(|dst_ids| {
+        .enumerate()
+        .map(|(group, dst_ids)| {
+            let src_offset = src_offsets.get(group).copied().unwrap_or(0);
             debug_assert!(
-                dst_ids.len() <= src_block_ids.len(),
-                "per-group destination ids ({}) exceed the source blocks ({}): a group's \
-                 leg carries its OWN ext-block count (the reference's per-group tail \
-                 arithmetic — coarse groups take fewer blocks)",
+                src_offset + dst_ids.len() <= src_block_ids.len(),
+                "group {group}: source offset ({src_offset}) + destinations ({}) exceed \
+                 the source blocks ({}) — a group's leg carries its OWN pairing",
                 dst_ids.len(),
                 src_block_ids.len()
             );
-            src_block_ids.iter().copied().zip(dst_ids).collect()
+            src_block_ids[src_offset..]
+                .iter()
+                .copied()
+                .zip(dst_ids)
+                .collect()
         })
         .collect();
 
@@ -3014,6 +3284,32 @@ mod connector_tests {
         VllmConnectorSlot,
         mpsc::UnboundedReceiver<LocalTransferRequest>,
     ) {
+        create_test_slot_with_groups_mamba(
+            num_tokens,
+            offload_min_priority,
+            num_groups,
+            Vec::new(),
+            0,
+        )
+    }
+
+    /// Variant with the Phase A mamba restore geometry configured (the
+    /// slot's mamba groups + their TRUE state-checkpoint cadence in
+    /// tokens). NOTE: for the mamba tests the block size is 32 (the test
+    /// constant), so pass the mamba block tokens in the same units the
+    /// slot will divide by — the ARITHMETIC is what's under test, not the
+    /// fp4's constants.
+    #[allow(clippy::too_many_arguments)]
+    fn create_test_slot_with_groups_mamba(
+        num_tokens: usize,
+        offload_min_priority: u32,
+        num_groups: usize,
+        mamba_groups: Vec<usize>,
+        mamba_block_tokens: usize,
+    ) -> (
+        VllmConnectorSlot,
+        mpsc::UnboundedReceiver<LocalTransferRequest>,
+    ) {
         let tokens: Vec<u32> = (1..=num_tokens as u32).collect();
         let (xfer_tx, xfer_rx) = mpsc::unbounded_channel();
         let cache_stats = Arc::new(CacheStatsTracker::new(None));
@@ -3026,6 +3322,8 @@ mod connector_tests {
             cache_stats,
             offload_min_priority,
             num_groups,
+            mamba_groups,
+            mamba_block_tokens,
         );
         (slot, xfer_rx)
     }
@@ -3681,6 +3979,156 @@ mod connector_tests {
     }
 
     // ---------------------------------------------------------------
+    // Test 20: the Phase A chain-end registry — a multi-group external
+    // match is valid ONLY at a recorded chain end (the tier-2 content
+    // there carries the mamba checkpoint AT the boundary).
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_hybrid_chain_end_registry() {
+        let h: SequenceHash = 0xDEAD_BEEF;
+        assert!(
+            !is_hybrid_chain_end(h),
+            "an unrecorded hash must not validate a multi-group match"
+        );
+        record_hybrid_chain_end(h);
+        assert!(
+            is_hybrid_chain_end(h),
+            "a recorded chain end must validate the match ending there"
+        );
+        assert!(
+            !is_hybrid_chain_end(0xBEEF_CAFE),
+            "other hashes stay refused"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Test 21: the Phase A mamba restore plan — the engine's state-slot
+    // arithmetic ((P-1)/mamba_block_tokens) against the 2026-10-21 fatal
+    // shape: P=14,896 tokens with mamba rows of 10 entries → slot 7
+    // (scaled to the test block size: the ARITHMETIC is under test).
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_mamba_restore_plan_targets_engine_state_slot() {
+        // The 2026-10-21 fatal, scaled: current_position 7,840 tokens,
+        // num_external 7,056 → P=14,896; mamba cadence 1,960 → slot 7.
+        // The test block size is 32, so build the equivalent in 32-token
+        // units: use mamba_block_tokens=1960 directly with the REAL numbers
+        // (the slot divides tokens, not blocks).
+        let (mut slot, _rx) =
+            create_test_slot_with_groups_mamba(32 * 1024, 0, 4, vec![0, 1, 2], 1960);
+        slot.current_position = 7840;
+        // staged (contents unused by the plan builder)
+        slot.staging_from_host = Some(Vec::new());
+        // The finish-shape rows: mamba rows long enough for slot 7.
+        slot.set_per_group_device_blocks(&[
+            block_ids(200, 10),
+            block_ids(300, 10),
+            block_ids(400, 10),
+            block_ids(100, 19),
+        ])
+        .unwrap();
+
+        let plan = slot
+            .build_mamba_restore_plan(7056)
+            .expect("the plan must build for a covered row")
+            .expect("the mamba contract is configured and staging exists");
+        assert_eq!(plan.dst_per_group.len(), 3, "one slot per mamba group");
+        assert_eq!(plan.dst_per_group[&0], 207, "group 0 row[7]");
+        assert_eq!(plan.dst_per_group[&1], 307, "group 1 row[7]");
+        assert_eq!(plan.dst_per_group[&2], 407, "group 2 row[7]");
+        assert!(
+            !plan.dst_per_group.contains_key(&3),
+            "the attention group is not in the mamba plan"
+        );
+
+        // The uncovered-row case stays LOUD: refusing wrong bytes.
+        slot.set_per_group_device_blocks(&[
+            block_ids(200, 4), // shorter than slot 7
+            block_ids(300, 10),
+            block_ids(400, 10),
+            block_ids(100, 19),
+        ])
+        .unwrap();
+        assert!(
+            slot.build_mamba_restore_plan(7056).is_err(),
+            "an uncovered state slot must error, not restore wrong bytes"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Test 22: the Phase A onboard leg shape — the mamba groups' leg
+    // carries ONE destination (the engine state slot) with a source
+    // offset pointing at the LAST staged block; the attention group
+    // keeps the positional pairing.
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_onboard_blocks_mamba_leg_shape() {
+        struct FakeSrc(Vec<BlockId>);
+        impl AnyBlocks for FakeSrc {
+            fn len(&self) -> usize {
+                self.0.len()
+            }
+            fn storage_pool(&self) -> BlockTransferPool {
+                BlockTransferPool::Host
+            }
+            fn block_ids(&self) -> Vec<BlockId> {
+                self.0.clone()
+            }
+            fn probe_heads(&self, n: usize) -> Vec<(BlockId, String)> {
+                self.0.iter().take(n).map(|&id| (id, "x".into())).collect()
+            }
+        }
+
+        let (mut slot, mut rx) =
+            create_test_slot_with_groups_mamba(32 * 64, 0, 4, vec![0, 1, 2], 1960);
+        slot.evaluated_blocks = 0;
+        slot.set_per_group_device_blocks(&[
+            block_ids(200, 10),
+            block_ids(300, 10),
+            block_ids(400, 10),
+            block_ids(100, 5),
+        ])
+        .unwrap();
+        let geometry = OnboardGeometry {
+            starts: vec![0, 0, 0, 0],
+            ext_counts: vec![5, 5, 5, 5],
+        };
+        let plan = MambaRestorePlan {
+            dst_per_group: HashMap::from([(0usize, 207usize), (1, 307), (2, 407)]),
+        };
+        let src = FakeSrc(block_ids(1000, 5));
+        slot.onboard_blocks(
+            Box::new(src),
+            block_ids(500, 5),
+            Some(&geometry),
+            Some(&plan),
+        )
+        .unwrap();
+
+        let req = rx.try_recv().expect("the onboard request must be queued");
+        let LocalTransferRequest::Onboard(onboard) = req else {
+            panic!("expected an onboard request");
+        };
+        // The attention group keeps the positional geometry slice of its
+        // OWN table row (starts[3]=0, ext[3]=5 → row 3's first 5 ids).
+        assert_eq!(onboard.per_group_dst_block_ids[3], block_ids(100, 5));
+        assert_eq!(onboard.per_group_src_offsets[3], 0);
+        // Each mamba group: ONE destination (the state slot) sourced from
+        // the LAST staged block (offset 5-1=4).
+        for (group, slot_id) in [(0, 207usize), (1, 307), (2, 407)] {
+            assert_eq!(
+                onboard.per_group_dst_block_ids[group],
+                vec![slot_id],
+                "mamba group {group} carries exactly the state slot"
+            );
+            assert_eq!(
+                onboard.per_group_src_offsets[group], 4,
+                "mamba group {group} pairs with the last staged block"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Test 18: The cm008 chunked-prefill COW cadence — a non-resumed
     //          step's replacement-shaped feed ([0,6]) under-covers the
     //          tokens scheduled so far. Must not panic (the former
@@ -3949,6 +4397,7 @@ mod connector_tests {
             }),
             vec![0, 1],
             None,
+            None,
         )
         .unwrap();
 
@@ -4096,6 +4545,7 @@ mod connector_tests {
             }),
             vec![7, 8],
             None,
+            None,
         )
         .unwrap();
 
@@ -4139,6 +4589,7 @@ mod connector_tests {
             }),
             vec![12, 13, 14],
             geometry.as_ref(),
+            None,
         )
         .unwrap();
 
@@ -4170,6 +4621,7 @@ mod connector_tests {
                 }),
                 vec![12, 13, 14],
                 geometry.as_ref(),
+                None,
             )
             .expect_err("a geometry slice beyond the mapping must fail");
         assert!(
@@ -4198,6 +4650,7 @@ mod connector_tests {
                     pool: BlockTransferPool::Host,
                 }),
                 vec![7, 8],
+                None,
                 None,
             )
             .expect_err("multi-group onboard without a mapping must fail");
