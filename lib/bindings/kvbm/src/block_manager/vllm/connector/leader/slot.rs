@@ -1384,6 +1384,21 @@ impl Slot for VllmConnectorSlot {
             return Ok(());
         }
 
+        // A previous onboard is still in flight (vLLM's multi-step
+        // onboarding lifecycle re-queries get_num_new_matched_tokens on
+        // later scheduler steps — the 2026-10-24 ladder fatal: "slot must
+        // be in the NotScheduled or Preempted state ...; got
+        // Onboarding(14896)" killed EngineCore mid-run). The in-flight match
+        // completes on its own; this step reports no NEW external tokens.
+        if matches!(self.state(), SlotState::Onboarding(_)) {
+            tracing::debug!(
+                request_id = %self.request_id,
+                state = ?self.state(),
+                "onboard in flight; skipping this lookup step"
+            );
+            return Ok(());
+        }
+
         if !matches!(self.state(), SlotState::Initialized | SlotState::Preempted) {
             return Err(SlotError::InvalidOperation(format!(
                 "slot must be in the NotScheduled or Preempted state to acquire local matches; got {:?}",
@@ -3381,6 +3396,21 @@ mod connector_tests {
 
         // device_blocks should still be exactly 3 — no double-add
         assert_eq!(slot.num_device_blocks_allocated(), 3);
+    }
+
+    // ---------------------------------------------------------------
+    // Test 1b: the 2026-10-24 ladder fatal — vLLM re-queries
+    // get_num_new_matched_tokens while a previous onboard is IN FLIGHT
+    // (slot state Onboarding). The lookup must skip gracefully (the
+    // in-flight match completes on its own; the step answers 0 new
+    // external tokens), never fatal the EngineCore.
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_lookup_skips_while_onboarding() {
+        let (mut slot, _rx) = create_test_slot(96, 0);
+        slot.state = SlotState::Onboarding(14896);
+        slot.acquire_local_matches(0)
+            .expect("an in-flight onboard must skip the re-lookup, not fatal");
     }
 
     // ---------------------------------------------------------------
