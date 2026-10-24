@@ -2855,10 +2855,31 @@ where
     L: LocalityProvider,
     M: BlockMetadata,
 {
-    // 1. Acquire mutable blocks
-    let blocks = storage_pool
+    // 1. Acquire mutable blocks — BEST-EFFORT: the tier-2 pool can be
+    // momentarily full under multi-user churn (the finish-flush of several
+    // requests landing together). Losing a store only means that prefix
+    // is not reusable from tier-2; the request's serving is unaffected
+    // (the offload is a copy at rest). Log at WARN and skip — the "No
+    // blocks to register" ERROR (2026-10-23/24 runs) polluted the health
+    // check and buried real diagnostics for a benign condition.
+    let blocks = match storage_pool
         .allocate_blocks(offload_req.block_ids.len())
-        .await?;
+        .await
+    {
+        Ok(blocks) => blocks,
+        Err(e) => {
+            tracing::warn!(
+                request_id = %offload_req.request_id,
+                requested = offload_req.block_ids.len(),
+                pool = storage_name,
+                error = %e,
+                "tier-2 allocation failed (pool momentarily full); skipping \
+                 this store — the prefix is not reusable from tier-2 but \
+                 serving is unaffected"
+            );
+            return Ok(());
+        }
+    };
     let token_blocks = offload_req.token_blocks;
     let allocated_block_ids: Vec<usize> = blocks.iter().map(|b| b.block_id()).collect();
     let num_blocks = allocated_block_ids.len();
