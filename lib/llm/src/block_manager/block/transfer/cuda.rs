@@ -989,6 +989,129 @@ where
     Ok(())
 }
 
+/// P1 — the span-coalesced bulk copy (the batching plan §4's core win):
+/// for a list of block pairs, check if the (layer, outer) segments are
+/// MEMORY-CONTIGUOUS across consecutive blocks in BOTH the source and
+/// destination pools; if so, issue ONE memcpy per (layer, outer) covering
+/// the entire contiguous run instead of per-block. Falls back to the
+/// per-block `copy_block` for any non-contiguous gap.
+///
+/// The key insight (the 2026-10-25 P0 analysis): for LayerSeparate pools
+/// (per-layer allocations), consecutive block IDs' layer-L segments ARE
+/// contiguous within layer L's pool region — `block[i+1].layer_view(L,O)`
+/// == `block[i].layer_view(L,O)` + segment_size. The per-segment fixed
+/// cost (~27µs launch + translation) dominates the Coder's ~52K small
+/// copies (96% overhead on pinned); coalescing to ~48 per (layer, group)
+/// removes it (21× on pinned, 3× on bar-direct).
+///
+/// SAFETY: the contiguity check compares raw pointers; blocks that pass
+/// are verified adjacent in the SAME pool region (the pool's block-ID →
+/// address mapping is a simple stride within each per-layer region, and
+/// the ID-contiguity implies address-contiguity — the pre-P1 per-block
+/// path is byte-identical for any pair that FAILS the check).
+pub fn copy_blocks_span_coalesced<'a, Source, Destination>(
+    sources: &'a [Source],
+    destinations: &'a mut [Destination],
+    stream: &CudaStream,
+    strategy: TransferStrategy,
+) -> Result<(), TransferError>
+where
+    Source: BlockDataProvider,
+    Destination: BlockDataProviderMut,
+{
+    debug_assert_eq!(sources.len(), destinations.len());
+    if sources.is_empty() {
+        return Ok(());
+    }
+    let memcpy_fn = cuda_memcpy_fn_ptr(&strategy)?;
+    let num_layers = sources[0].block_data().num_layers();
+    let num_outer = sources[0].block_data().num_outer_dims();
+
+    #[cfg(debug_assertions)]
+    {
+        assert_strategy_valid::<Source, Destination>(strategy);
+    }
+
+    // Walk the pair list, coalescing contiguous runs and falling back to
+    // per-block copies at every gap. A run [i..j) is contiguous when BOTH
+    // src and dst have `view[k+1].ptr == view[k].ptr + view[k].size` for
+    // all k in [i..j-1) for EVERY (layer, outer) — the per-layer segments
+    // within a pool region share a stride, so checking one (L, O) suffices
+    // (all layers of the same pool have the same block-ID → address stride).
+    let mut i = 0;
+    while i < sources.len() {
+        // Find the contiguous run starting at i
+        let mut j = i + 1;
+        while j < sources.len() {
+            let src_prev = sources[j - 1].block_data();
+            let src_next = sources[j].block_data();
+            let dst_prev = destinations[j - 1].block_data();
+            let dst_next = destinations[j].block_data();
+
+            // Check the FIRST (layer, outer) for the stride match — all
+            // layers of the same pool share the same block stride.
+            // SAFETY: the views cover pool-owned data that outlives the
+            // pointer arithmetic (the blocks are not written or freed
+            // during the check — only address values are compared).
+            let (src_contiguous, dst_contiguous) = unsafe {
+                let src_prev_ptr = src_prev.layer_view(0, 0)?.as_ptr() as usize;
+                let src_next_ptr = src_next.layer_view(0, 0)?.as_ptr() as usize;
+                let dst_prev_ptr = dst_prev.layer_view(0, 0)?.as_ptr() as usize;
+                let dst_next_ptr = dst_next.layer_view(0, 0)?.as_ptr() as usize;
+                (
+                    src_next_ptr == src_prev_ptr + src_prev.layer_view(0, 0)?.size(),
+                    dst_next_ptr == dst_prev_ptr + dst_prev.layer_view(0, 0)?.size(),
+                )
+            };
+
+            if !src_contiguous || !dst_contiguous {
+                break;
+            }
+            j += 1;
+        }
+
+        let run_len = j - i;
+        if run_len == 1 {
+            // Single block (or gap start): the per-block path
+            cuda::copy_block(&sources[i], &mut destinations[i], stream, strategy)?;
+        } else {
+            // Contiguous run [i..j): ONE memcpy per (layer, outer) covering
+            // all `run_len` blocks — the segments are stride-contiguous.
+            let src_data = sources[i].block_data();
+            let dst_data = destinations[i].block_data_mut();
+            for layer_idx in 0..num_layers {
+                for outer_idx in 0..num_outer {
+                    let src_view = src_data.layer_view(layer_idx, outer_idx)?;
+                    let mut dst_view = dst_data.layer_view_mut(layer_idx, outer_idx)?;
+                    let seg_size = src_view.size();
+                    let bulk_size = seg_size * run_len;
+                    // SAFETY: the contiguity check proved the span [i..j)
+                    // has stride-contiguous memory in both pools for every
+                    // (layer, outer) — the bulk pointer is block i's segment
+                    // start, and the size covers all run_len blocks. The
+                    // per-block path issues the same bytes as run_len
+                    // sequential memcpys; the pool memory outlives the
+                    // transfer (the stream-ordered completion applies).
+                    unsafe {
+                        memcpy_fn(src_view.as_ptr(), dst_view.as_mut_ptr(), bulk_size, stream)?;
+                    }
+                }
+            }
+            tracing::debug!(
+                blocks = run_len,
+                layers = num_layers,
+                outer = num_outer,
+                "span coalesced: {} blocks into {} memcpys (was {})",
+                run_len,
+                num_layers * num_outer,
+                run_len * num_layers * num_outer,
+            );
+        }
+        i = j;
+    }
+    Ok(())
+}
+
 /// The executor-side strategy check for a copy: host-pointer devbar
 /// backings (Pinned/Mock) use H2D/D2H; the Vmm device-alias uses D2D
 /// (see `TransferContext::host_transfer_adjust`); raw-MMIO Bar/Bdf host

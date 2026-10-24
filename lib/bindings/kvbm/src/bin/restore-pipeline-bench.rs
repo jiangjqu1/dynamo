@@ -26,19 +26,19 @@ fn main() {
     let shapes = [
         (
             "fp4 (rescaled: 8u × 15.7K × 8 turns)",
-            22,       // blocks per turn-1 restore
-            784,      // tokens/block
-            4,        // groups
-            48,       // layers per group
-            205.0,    // MB per logical block
+            22,    // blocks per turn-1 restore
+            784,   // tokens/block
+            4,     // groups
+            48,    // layers per group
+            205.0, // MB per logical block
         ),
         (
             "Coder (24u × 12.3K × 16 turns)",
-            1090,     // blocks per turn-1 restore
-            16,       // tokens/block
-            1,        // groups
-            48,       // layers
-            1.5,      // MB per logical block
+            1090, // blocks per turn-1 restore
+            16,   // tokens/block
+            1,    // groups
+            48,   // layers
+            1.5,  // MB per logical block
         ),
     ];
 
@@ -59,10 +59,14 @@ fn main() {
         println!("═{}═", "═".repeat(name.len() + 4));
         println!("  {} ", name);
         println!("═{}═", "═".repeat(name.len() + 4));
-        println!("  blocks: {} × {} tokens = {} tokens ({:.0} MiB total)",
-            num_blocks, tokens_per_block, total_tokens, total_mib);
-        println!("  segments: {} blocks × {} layers × {} groups = {} memcpys of ~{:.0} KiB each",
-            num_blocks, layers, num_groups, total_segments, per_segment_kib);
+        println!(
+            "  blocks: {} × {} tokens = {} tokens ({:.0} MiB total)",
+            num_blocks, tokens_per_block, total_tokens, total_mib
+        );
+        println!(
+            "  segments: {} blocks × {} layers × {} groups = {} memcpys of ~{:.0} KiB each",
+            num_blocks, layers, num_groups, total_segments, per_segment_kib
+        );
         println!();
 
         // The per-turn restore cost at each tier:
@@ -78,10 +82,26 @@ fn main() {
         let eff_bar = total_mib / (time_bar_ms / 1000.0) / 1024.0;
 
         println!("  TODAY (per-segment):");
-        println!("    pinned: {:>7.1} ms  (raw: {:>5.1} ms — {:.0}% of raw bandwidth)",
-            time_pinned_ms, raw_pinned_ms, if raw_pinned_ms > 0.0 { 100.0 * eff_pinned / 25.0 } else { 0.0 });
-        println!("    bar-direct: {:>7.1} ms  (raw: {:>5.1} ms — {:.0}% of raw bandwidth)",
-            time_bar_ms, raw_bar_ms, if raw_bar_ms > 0.0 { 100.0 * eff_bar / 2.99 } else { 0.0 });
+        println!(
+            "    pinned: {:>7.1} ms  (raw: {:>5.1} ms — {:.0}% of raw bandwidth)",
+            time_pinned_ms,
+            raw_pinned_ms,
+            if raw_pinned_ms > 0.0 {
+                100.0 * eff_pinned / 25.0
+            } else {
+                0.0
+            }
+        );
+        println!(
+            "    bar-direct: {:>7.1} ms  (raw: {:>5.1} ms — {:.0}% of raw bandwidth)",
+            time_bar_ms,
+            raw_bar_ms,
+            if raw_bar_ms > 0.0 {
+                100.0 * eff_bar / 2.99
+            } else {
+                0.0
+            }
+        );
         println!();
 
         // The batching win (P1's span coalescing): contiguous blocks in both
@@ -91,30 +111,49 @@ fn main() {
         let coalesced_bytes_per_segment = total_mib * 1024.0 * 1024.0 / coalesced_segments;
         let coalesced_data_pinned_us = coalesced_bytes_per_segment / (25.0e9) * 1e6;
         let coalesced_data_bar_us = coalesced_bytes_per_segment / (2.99e9) * 1e6;
-        let coalesced_pinned_ms = coalesced_segments * (OVERHEAD_US + coalesced_data_pinned_us) / 1000.0;
+        let coalesced_pinned_ms =
+            coalesced_segments * (OVERHEAD_US + coalesced_data_pinned_us) / 1000.0;
         let coalesced_bar_ms = coalesced_segments * (OVERHEAD_US + coalesced_data_bar_us) / 1000.0;
         let coalesced_eff_pinned = total_mib / (coalesced_pinned_ms / 1000.0) / 1024.0;
         let coalesced_eff_bar = total_mib / (coalesced_bar_ms / 1000.0) / 1024.0;
 
-        println!("  WITH BATCHING (P1: {} coalesced segments instead of {}):",
-            coalesced_segments as usize, total_segments);
-        println!("    pinned: {:>7.1} ms  ({:.0}× faster, {:.1} GiB/s effective)",
-            coalesced_pinned_ms, time_pinned_ms / coalesced_pinned_ms, coalesced_eff_pinned);
-        println!("    bar-direct: {:>7.1} ms  ({:.0}× faster, {:.1} GiB/s effective)",
-            coalesced_bar_ms, time_bar_ms / coalesced_bar_ms, coalesced_eff_bar);
+        println!(
+            "  WITH BATCHING (P1: {} coalesced segments instead of {}):",
+            coalesced_segments as usize, total_segments
+        );
+        println!(
+            "    pinned: {:>7.1} ms  ({:.0}× faster, {:.1} GiB/s effective)",
+            coalesced_pinned_ms,
+            time_pinned_ms / coalesced_pinned_ms,
+            coalesced_eff_pinned
+        );
+        println!(
+            "    bar-direct: {:>7.1} ms  ({:.0}× faster, {:.1} GiB/s effective)",
+            coalesced_bar_ms,
+            time_bar_ms / coalesced_bar_ms,
+            coalesced_eff_bar
+        );
         println!();
 
         // The overhead attribution (the P0 deliverable):
         let overhead_pct_pinned = 100.0 * OVERHEAD_US / seg_cost_pinned;
         let overhead_pct_bar = 100.0 * OVERHEAD_US / seg_cost_bar;
-        println!("  OVERHEAD ATTRIBUTION (per {:.0}-KiB segment):", per_segment_kib);
-        println!("    fixed cost: {:.0}µs ({:.0}% of pinned total, {:.0}% of bar-direct total)",
-            OVERHEAD_US, overhead_pct_pinned, overhead_pct_bar);
+        println!(
+            "  OVERHEAD ATTRIBUTION (per {:.0}-KiB segment):",
+            per_segment_kib
+        );
+        println!(
+            "    fixed cost: {:.0}µs ({:.0}% of pinned total, {:.0}% of bar-direct total)",
+            OVERHEAD_US, overhead_pct_pinned, overhead_pct_bar
+        );
         println!("    data (pinned): {:.1}µs", data_pinned_us);
         println!("    data (bar-direct): {:.1}µs", data_bar_us);
         println!("    → the fixed cost dominates on BOTH tiers; the batching removes it.");
-        println!("    → per-turn capacity at the batched cost: pinned {:.0} turns/s, bar-direct {:.0} turns/s",
-            1000.0 / coalesced_pinned_ms, 1000.0 / coalesced_bar_ms);
+        println!(
+            "    → per-turn capacity at the batched cost: pinned {:.0} turns/s, bar-direct {:.0} turns/s",
+            1000.0 / coalesced_pinned_ms,
+            1000.0 / coalesced_bar_ms
+        );
         println!();
     }
 

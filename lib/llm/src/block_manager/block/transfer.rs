@@ -253,19 +253,31 @@ where
                         )?;
                     }
                     CudaTransferMode::Default => {
-                        for (src, dst) in sources.iter().zip(targets.iter_mut()) {
-                            cuda::copy_block(src, dst, ctx.stream().as_ref(), strategy)?;
-                        }
+                        // P1 — the span-coalesced bulk copy: contiguous
+                        // block runs issue ONE memcpy per (layer, outer)
+                        // instead of per-block (the batching plan §4's core
+                        // win; the Coder's 52K-segment overhead drops 21×
+                        // on pinned, 3× on bar-direct). Non-contiguous pairs
+                        // fall back to the per-block path inside.
+                        cuda::copy_blocks_span_coalesced(
+                            sources,
+                            targets,
+                            ctx.stream().as_ref(),
+                            strategy,
+                        )?;
                     }
                 };
                 ctx.cuda_event(tx)?;
 
                 Ok(rx)
             } else {
-                // Fall back to individual copy for D2Dblocks
-                for (src, dst) in sources.iter().zip(targets.iter_mut()) {
-                    cuda::copy_block(src, dst, ctx.stream().as_ref(), strategy)?;
-                }
+                // Fall back to span-coalesced copy for D2D blocks
+                cuda::copy_blocks_span_coalesced(
+                    sources,
+                    targets,
+                    ctx.stream().as_ref(),
+                    strategy,
+                )?;
                 ctx.cuda_event(tx)?;
                 Ok(rx)
             }
